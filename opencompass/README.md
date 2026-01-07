@@ -46,6 +46,30 @@ Some third-party features, like Humaneval and Llama, may require additional step
 <p align="right"><a href="#top">🔝Back to top</a></p>
 
 
+### 📍 Speciallized Installation for DLLMs Support
+
+For LLaDA2.0 series inference, you need to ensure:
+
+```bash
+transformers>=4.54.0
+```
+
+For SGLang inference support of LLaDA2.0, you need to install sglang as follows:
+
+```bash
+# Use the at least v0.5.7 branch
+git clone -b v0.5.7 https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Install the python packages
+pip install --upgrade pip
+pip install -e "python"
+```
+
+For more installation, please refer to [SGLang Docs](https://docs.sglang.io/get_started/install.html)
+
+
+
 ### 🗂️ Evaluation on Local Benchmark
 
 You can evaluate the local benchmark by running the script `scripts/eval_local_bench.sh`. Before that, you need to refer to `verl.utils.preprocess.preprocess` to organize the local benchmark into ```.parquet``` format. (In fact, the backend of the local evaluation essentially launches a training script, but with `val_only=True` specified)
