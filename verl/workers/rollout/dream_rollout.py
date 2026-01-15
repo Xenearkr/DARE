@@ -61,6 +61,7 @@ class DLLMRollout(BaseRollout):
         # rollout related parameters
         self.n_rollout = config["n"]  # How many responses to generate for each prompt
         self.temperature = config["temperature"]  # Temperature during training
+        self.do_sample = config["do_sample"]  # Whether to sample during training
         self.val_kwargs = config["val_kwargs"]  # Validation generation parameters
 
     # from .auto_line_tracker import auto_track_lines
@@ -100,6 +101,7 @@ class DLLMRollout(BaseRollout):
             "remasking": "low_confidence",
             "mask_id": self.MASK_TOKEN_ID,
             "mode": "train" if not is_validate else "eval",
+            "do_sample": self.val_kwargs.get("do_sample", self.do_sample) if is_validate else self.do_sample,
         }
         print(f"gen_kwargs: {gen_kwargs}")
 
