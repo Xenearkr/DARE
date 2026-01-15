@@ -136,7 +136,7 @@ esac
 
 # parameters setting
 n_gpus_per_node=$(echo $CUDA_VISIBLE_DEVICES | tr "," "\n" | wc -l)
-batch_size=16  # batch_size must be greater than the number of GPUs used
+batch_size=8  # batch_size must be greater than the number of GPUs used
 n_rollout=8
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1  # gradient accumulation = batch_size / ppo_micro_batch_size_per_gpu
