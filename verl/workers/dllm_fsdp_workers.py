@@ -954,10 +954,6 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        if self.config.model.name == 'dream':
-            if not self.generation_config.do_sample:
-                self.generation_config.do_sample = True
-
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
         dist.barrier()
 
