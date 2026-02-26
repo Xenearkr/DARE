@@ -24,7 +24,7 @@ We introduce **DARE** (**d**LLM **A**lignment and **R**einforcement **E**xecutor
 
 DARE is a work in progress, we plan to support more models and algorithm for training and evaluation. **We warmly welcome the research community to collaborations, give feedback and share suggestions.** Let's advance the diffusion large language models together !!!👊
 
-**Optimization Plan in RL Pipeline**
+<!-- **Optimization Plan in RL Pipeline**
 > [!TIP]
 > For MDLMs (LLaDA or Dream), we decouple the attention backend used during training from that used during rollout. Rollout uses `flash_attn_func` or `flash_attn_with_kvcache` for KV-cache, training adopts `flash_attn_varlen_func` to skip meaningless computation on padding tokens. The entire pipeline speed-up approximately ⚡️ **4×**.
 
@@ -37,11 +37,12 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 <p align="center">
   <img src="assets/optimization_plan_bdlm.png" style="width:85%; height:auto;">
-</p>
+</p> -->
 
 
 ## 📢 News
-- [2025-12-28]: **Important**❗️ Several errors/bugs/updates in dp_actor_algorithm have been fixed/adapted. If you encounter issues before updating, pull repo after the timestamp 12-28 first.
+- [2026-02-27]: Update llada cj-grpo and add dream cj-grpo.
+- [2025-12-28]: Several errors/bugs/updates in dp_actor_algorithm have been fixed/adapted.
 - [2025-12-24]: Support online rl (online weight update of rollout) for SDAR.
 - [2025-12-23]: Support vrpo (preference optimization) for Dream.
 - [2025-12-16]: Support vrpo (preference optimization) for LLaDA.
@@ -224,7 +225,10 @@ bash recipe/run_vrpo_dream_7b_instruct.sh --task ultrafeedback
 
 ## 📊 Evaluation
 
-### 🚀 Quick Start
+### 🚀 Convert FSDP Sharded Checkpoints to HuggingFace Safetensors
+
+
+### 🚀 Eval on OpenCompass's Bench Quick Start
 
 First, please follow [opencompass](https://github.com/open-compass/opencompass) for benchmark dataset preparation. Then, you need to specify the model path in `opencompass/opencompass/configs/models/dllm/*`. For example `llada_instruct_8b.py`:
 
@@ -255,7 +259,11 @@ Evaluation of SDAR-8B-Chat on mmlu with lmdeploy backend:
 bash scripts/eval_sdar_8b_chat.sh --task mmlu --engine lmdeploy
 ```
 
+### 🚀 Eval on Local Bench Quick Start
+
 If you want to add more benchmarks, models, or custom datasets, please refer to the [Evaluation Guideline](https://github.com/yjyddq/DARE/blob/main/opencompass/README.md).
+
+
 
 
 ## 📦 Supported Models
