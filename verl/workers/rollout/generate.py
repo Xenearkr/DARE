@@ -458,7 +458,7 @@ def generate_with_dual_cache(
 
 
 @torch.no_grad()
-def reversed_process(
+def reversed_process_llada(
     model,
     packed_sequence,
     cu_seqlens, 
@@ -472,7 +472,7 @@ def reversed_process(
     mask_id=126336,
     eos_id=126081,
     mode="eval",
-    step_merge=True,
+    step_merge=False,
 ):
     batch_size = len(cu_seqlens) - 1
 
@@ -492,10 +492,8 @@ def reversed_process(
     steps_per_block = max(1, steps // num_blocks)
     ### Record the trajectory changes of x ###
     if not step_merge:
-        reversed_traj = [x.clone()] # with initial x, one more than steps
         reversed_traj_unmask_positions = []
     if step_merge:
-        mereged_reversed_traj = [x.clone()]
         mereged_reversed_traj_unmask_positions = []
 
     for num_block in range(num_blocks):
@@ -567,24 +565,22 @@ def reversed_process(
             x[transfer_index] = x0[transfer_index]
             if not step_merge:
                 unmask_positions = (mask_index & (x != mask_id))
-                reversed_traj.append(x.clone())
                 reversed_traj_unmask_positions.append(unmask_positions)
             # if step merge, merge intermediate states and save the last state in a block
             if step_merge and i == (steps_per_block - 1):
                 unmask_positions = (mask_index_per_block & (x != mask_id))
-                mereged_reversed_traj.append(x.clone())
                 mereged_reversed_traj_unmask_positions.append(unmask_positions)
 
     # Replace remaining mask tokens with eos token
     x[x == mask_id] = eos_id
     if step_merge:
-        return x, torch.stack(mereged_reversed_traj, dim=1), torch.stack(mereged_reversed_traj_unmask_positions, dim=1)
+        return x, torch.stack(mereged_reversed_traj_unmask_positions, dim=1)
     else:
-        return x, torch.stack(reversed_traj, dim=1), torch.stack(reversed_traj_unmask_positions, dim=1)
+        return x, torch.stack(reversed_traj_unmask_positions, dim=1)
 
 
 @torch.no_grad()
-def fast_reversed_process(
+def fast_reversed_process_llada(
     model,
     prompt,
     steps=128,
@@ -594,7 +590,7 @@ def fast_reversed_process(
     remasking="low_confidence",
     mask_id=126336,
     attention_mask=None,
-    step_merge=True,
+    step_merge=False,
     threshold=None, 
     factor=None,
 ):
@@ -610,10 +606,8 @@ def fast_reversed_process(
 
     ### Record the trajectory changes of x ###
     if not step_merge:
-        reversed_traj = [x.clone()] # with initial x, one more than steps
         reversed_traj_unmask_positions = []
     else:
-        merged_reversed_traj = [x.clone()]
         merged_reversed_traj_unmask_positions = []
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
@@ -634,8 +628,7 @@ def fast_reversed_process(
         x[transfer_index] = x0[transfer_index]
 
         if not step_merge:
-            unmask_positions = (mask_index & (x != mask_id))[:, -gen_length:]
-            reversed_traj.append(x.clone())
+            unmask_positions = (mask_index & (x != mask_id))
             reversed_traj_unmask_positions.append(unmask_positions)
 
         new_past_key_values = []
@@ -665,24 +658,22 @@ def fast_reversed_process(
             x[:, current_block_start:][transfer_index] = x0[transfer_index]
             
             if not step_merge:
-                unmask_positions = (full_mask_index & (x != mask_id))[:, -gen_length:]
-                reversed_traj.append(x.clone())
+                unmask_positions = (full_mask_index & (x != mask_id))
                 reversed_traj_unmask_positions.append(unmask_positions)
             elif step_merge and i == (steps_per_block - 1):
-                merged_unmask_positions = (mask_index_per_block & (x != mask_id))[:, -gen_length:]
-                merged_reversed_traj.append(x.clone())
+                merged_unmask_positions = (mask_index_per_block & (x != mask_id))
                 merged_reversed_traj_unmask_positions.append(merged_unmask_positions)
 
             i += 1
         
     if step_merge:
-        return x, torch.stack(merged_reversed_traj, dim=1), torch.stack(merged_reversed_traj_unmask_positions, dim=1)
+        return x, torch.stack(merged_reversed_traj_unmask_positions, dim=1)
     else:
-        return x, torch.stack(reversed_traj, dim=1), torch.stack(reversed_traj_unmask_positions, dim=1)
+        return x, torch.stack(reversed_traj_unmask_positions, dim=1)
 
 
 @torch.no_grad()
-def fast_reversed_process_dual_cache(
+def fast_reversed_process_dual_cache_llada(
     model,
     prompt,
     steps=128,
@@ -710,10 +701,8 @@ def fast_reversed_process_dual_cache(
 
     ### Record the trajectory changes of x ###
     if not step_merge:
-        reversed_traj = [x.clone()] # with initial x, one more than steps
         reversed_traj_unmask_positions = []
     if step_merge:
-        mereged_reversed_traj = [x.clone()]
         mereged_reversed_traj_unmask_positions = []
 
     for nb in range(num_blocks):
@@ -783,15 +772,13 @@ def fast_reversed_process_dual_cache(
             
         if not step_merge:
             unmask_positions = (global_mask_index & (x != mask_id))[:, -gen_length:]
-            reversed_traj.append(x.clone())
             reversed_traj_unmask_positions.append(unmask_positions)
         # if step merge, merge intermediate states and save the last state in a block
         if step_merge and i == (steps - 1):
             unmask_positions = (mask_index_per_block & (x != mask_id))[:, -gen_length:]
-            mereged_reversed_traj.append(x.clone())
             mereged_reversed_traj_unmask_positions.append(unmask_positions)
         
     if step_merge:
-        return x, torch.stack(mereged_reversed_traj, dim=1), torch.stack(mereged_reversed_traj_unmask_positions, dim=1)
+        return x, torch.stack(mereged_reversed_traj_unmask_positions, dim=1)
     else:
-        return x, torch.stack(reversed_traj, dim=1), torch.stack(reversed_traj_unmask_positions, dim=1)
+        return x, torch.stack(reversed_traj_unmask_positions, dim=1)
