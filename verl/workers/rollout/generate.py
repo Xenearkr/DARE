@@ -18,11 +18,6 @@ from collections import defaultdict
 seed = 42
 random.seed(seed)
 
-
-MAX_MODEL_LENGTH = 16384
-MASK_TOKEN_ID = 126336
-
-
 def add_gumbel_noise(logits, temperature):
     """Add Gumbel noise to logits for sampling"""
     if temperature == 0.:
