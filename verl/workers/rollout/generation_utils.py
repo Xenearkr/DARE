@@ -363,6 +363,149 @@ class DreamGenerationMixin:
         )
         return result
 
+    @torch.no_grad()
+    def cj_diffusion_generate(
+        self,
+        inputs: torch.LongTensor,
+        generation_config: Optional[DreamGenerationConfig] = None,
+        *,
+        attention_mask: Optional[torch.LongTensor] = None,
+        step_merge: bool = False,
+        merge_interval: Optional[int] = None,
+        **kwargs,
+    ):
+        """
+        Run Dream diffusion generation while recording per-step unmask trajectory.
+
+        Returns:
+            sequences: LongTensor [B, max_length]
+            reversed_traj_unmask_positions: BoolTensor
+                - if step_merge is False: [B, steps, max_length]
+                - if step_merge is True : [B, ceil(steps/merge_interval), max_length]
+                  where each entry is OR-merged within a window of size merge_interval.
+        """
+        # 1) prepare config exactly like diffusion_generate
+        generation_config = self._prepare_generation_config(generation_config, **kwargs)
+        device = inputs.device
+        self._prepare_special_tokens(generation_config, device=device)
+
+        if generation_config.mask_token_id is None:
+            raise ValueError("generation_config.mask_token_id must be set to record unmask trajectory.")
+
+        input_ids = inputs
+        input_ids_length = input_ids.shape[-1]
+        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
+        generation_config = self._prepare_generated_length(
+            generation_config=generation_config,
+            has_default_max_length=has_default_max_length,
+            input_ids_length=input_ids_length,
+        )
+        self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
+
+        # expand for num_return_sequences (keep consistent with diffusion_generate)
+        input_ids, attention_mask = self._expand_inputs_for_generation(
+            expand_size=generation_config.num_return_sequences,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        steps = int(generation_config.steps)
+        if merge_interval is None:
+            merge_interval = steps  # merge all steps into 1 chunk if user didn't specify
+        merge_interval = max(1, int(merge_interval))
+
+        # trajectory buffers
+        per_step_traj = []  # list of [B, L] bool
+        merged_traj = []    # list of [B, L] bool
+        _merge_acc = None
+        _seen_steps = 0
+
+        # We want "newly unmasked positions per step":
+        # unmask = (prev_x == mask_id) & (new_x != mask_id)
+        # We'll compute it in the token hook, which sees x after the step update.
+        state = {"prev_x": None}
+        mask_id = generation_config.mask_token_id
+
+        def _record_tokens_hook(step, x, logits):
+            # step is None for initial pre-loop call in _sample; just initialize prev_x
+            if step is None:
+                state["prev_x"] = x.clone()
+                return x
+
+            prev_x = state["prev_x"]
+            # x is the post-update tokens for this step
+            newly_unmasked = (prev_x == mask_id) & (x != mask_id)
+
+            if not step_merge:
+                per_step_traj.append(newly_unmasked)
+            else:
+                nonlocal _merge_acc, _seen_steps
+                if _merge_acc is None:
+                    _merge_acc = newly_unmasked.clone()
+                    _seen_steps = 1
+                else:
+                    _merge_acc |= newly_unmasked
+                    _seen_steps += 1
+
+                if _seen_steps >= merge_interval:
+                    merged_traj.append(_merge_acc)
+                    _merge_acc = None
+                    _seen_steps = 0
+
+            state["prev_x"] = x.clone()
+            return x
+
+        # allow user to also pass custom hooks: wrap them
+        user_tokens_hook = kwargs.pop("generation_tokens_hook_func", None)
+        user_logits_hook = kwargs.pop("generation_logits_hook_func", None)
+
+        if user_tokens_hook is None:
+            generation_tokens_hook_func = _record_tokens_hook
+        else:
+            def generation_tokens_hook_func(step, x, logits):
+                x = user_tokens_hook(step, x, logits)
+                x = _record_tokens_hook(step, x, logits)
+                return x
+
+        if user_logits_hook is None:
+            generation_logits_hook_func = lambda step, x, logits: logits
+        else:
+            generation_logits_hook_func = user_logits_hook
+
+        threshold = kwargs.get("threshold", 0.9)
+
+        sequences = self._sample(
+            input_ids,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            generation_tokens_hook_func=generation_tokens_hook_func,
+            generation_logits_hook_func=generation_logits_hook_func,
+            threshold=threshold,
+        )
+
+        # flush remaining merged chunk if needed
+        if step_merge and _merge_acc is not None:
+            merged_traj.append(_merge_acc)
+
+        if not step_merge:
+            if len(per_step_traj) != steps:
+                # be tolerant if steps got mutated internally (e.g. confidence_threshold path)
+                # but still return what we recorded
+                pass
+            traj = torch.stack(per_step_traj, dim=1) if len(per_step_traj) > 0 else torch.empty(
+                (sequences.shape[0], 0, sequences.shape[1]),
+                device=sequences.device,
+                dtype=torch.bool,
+            )
+        else:
+            traj = torch.stack(merged_traj, dim=1) if len(merged_traj) > 0 else torch.empty(
+                (sequences.shape[0], 0, sequences.shape[1]),
+                device=sequences.device,
+                dtype=torch.bool,
+            )
+
+        return sequences, traj
+
     def _sample(
         self,
         input_ids: torch.LongTensor,

@@ -94,8 +94,8 @@ if [ $task == "math" ]; then
 elif [ $task == "code" ]; then
     train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
     val_files="['data/preprocessed/rl/test/mbpp_1.parquet','data/preprocessed/rl/test/humaneval_1.parquet','data/preprocessed/rl/test/humanevalplus_1.parquet']"
-    max_prompt_length=512
-    max_response_length=256
+    max_prompt_length=1024
+    max_response_length=512
     num_diffusion_steps=$max_response_length
     total_epoch=5
 elif [ $task == "countdown" ]; then
@@ -136,7 +136,7 @@ esac
 
 # parameters setting
 n_gpus_per_node=$(echo $CUDA_VISIBLE_DEVICES | tr "," "\n" | wc -l)
-batch_size=8  # batch_size must be greater than the number of GPUs used
+batch_size=16  # batch_size must be greater than the number of GPUs used
 n_rollout=8
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1  # gradient accumulation = batch_size / ppo_micro_batch_size_per_gpu
@@ -144,9 +144,10 @@ train_temperature=0.2
 
 # diffusion related parameters
 val_num_diffusion_steps=$max_response_length
-block_length=64
+block_length=32
 mc_num=1
 n_l=1
+step_merge=False
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
 project_name=$WANDB_PROJECT
@@ -219,6 +220,7 @@ python3 -m verl.trainer.dllm_main_ppo \
     +actor_rollout_ref.rollout.mc_num=$mc_num \
     +actor_rollout_ref.rollout.n_l=$n_l \
     +actor_rollout_ref.rollout.cfg_scale=0.0 \
+    +actor_rollout_ref.rollout.step_merge=$step_merge \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
@@ -229,14 +231,13 @@ python3 -m verl.trainer.dllm_main_ppo \
     trainer.n_gpus_per_node=$n_gpus_per_node \
     trainer.nnodes=1 \
     trainer.default_local_dir=$ckpt_dir \
-    trainer.save_freq=20 \
-    trainer.test_freq=20 \
+    trainer.save_freq=100 \
+    trainer.test_freq=10 \
     trainer.total_epochs=$total_epoch \
     custom_reward_function.path="verl/utils/reward_score/__init__.py" \
-    custom_reward_function.name="dllm_rm" 
-    # \
-    # >> ${log_dir}/${baseline}-${timestamp}.out \
-    # 2>> ${log_dir}/${baseline}-${timestamp}.err &
+    custom_reward_function.name="dllm_rm" \
+    >> ${log_dir}/${baseline}-${timestamp}.out \
+    2>> ${log_dir}/${baseline}-${timestamp}.err &
 
 # reward_model.reward_manager=dllm: used to select reward_manager in dllm_reward.load_reward_manager()
 # llada does not support gradient_checkpointing

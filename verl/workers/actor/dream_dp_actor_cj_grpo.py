@@ -54,7 +54,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
-    def _get_logits(self, model, packed_input, cu_seqlens, max_seqlen, prompt_len, cfg_scale=0.0, MASK_TOKEN_ID=126336):
+    def _get_logits(self, model, packed_input, cu_seqlens, max_seqlen, prompt_len, cfg_scale=0.0, MASK_TOKEN_ID=151666):
         """
         packed_input: (1, total_seqlen)
         cu_seqlens: (batch_size+1,)

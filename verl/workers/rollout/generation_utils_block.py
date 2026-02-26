@@ -35,6 +35,7 @@ from transformers.utils import (
 
 logger = logging.get_logger(__name__)
 
+
 def get_num_transfer_tokens(mask_index, steps):
     '''
     In the reverse process, the interval [0, 1] is uniformly discretized into steps intervals.
@@ -69,6 +70,7 @@ def top_p_logits(logits, top_p=None):
     logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
     return logits
 
+
 def top_k_logits(logits, top_k=None):
     top_k = min(top_k, logits.size(-1))  # Safety check
     # Remove all tokens with a probability less than the last token of the top-k
@@ -95,20 +97,18 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
             confidence, x0 = probs.max(dim=-1)
     else:
         confidence, x0 = probs.max(dim=-1)
-    
+
     if margin_confidence:
         sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
-        # Extract top1 and top2 probabilities
-        top1_probs = sorted_probs[:, 0] 
-        top2_probs = sorted_probs[:, 1] 
-        # Calculate confidence as top1 - top2
-        confidence = top1_probs - top2_probs 
-    
+        top1_probs = sorted_probs[:, 0]
+        top2_probs = sorted_probs[:, 1]
+        confidence = top1_probs - top2_probs
+
     if neg_entropy:
         epsilon = 1e-10
         log_probs = torch.log(probs + epsilon)
         confidence = torch.sum(probs * log_probs, dim=-1)
-    
+
     return confidence, x0
 
 
@@ -145,16 +145,11 @@ class DreamGenerationConfig(GenerationConfig):
         # Wild card
         self.generation_kwargs = kwargs.pop("generation_kwargs", {})
 
-        # The remaining attributes do not parametrize `.generate()`, but are informative and/or used by the hub
-        # interface.
         self._from_model_config = kwargs.pop("_from_model_config", False)
         self._commit_hash = kwargs.pop("_commit_hash", None)
         self.transformers_version = kwargs.pop("transformers_version", __version__)
 
-        # Additional attributes without default values
         if not self._from_model_config:
-            # we don't want to copy values from the model config if we're initializing a `GenerationConfig` from a
-            # model's default configuration file
             for key, value in kwargs.items():
                 try:
                     setattr(self, key, value)
@@ -162,11 +157,11 @@ class DreamGenerationConfig(GenerationConfig):
                     logger.error(f"Can't set {key} with value {value} for {self}")
                     raise err
 
-        # Validate the values of the attributes
         self.validate(is_init=True)
 
     def validate(self, is_init=False):
         pass
+
 
 class DreamGenerationMixin:
     @staticmethod
@@ -176,8 +171,6 @@ class DreamGenerationMixin:
         attention_mask: Optional[torch.LongTensor] = None
     ) -> Tuple[torch.LongTensor, Dict[str, Any]]:
         """Expands tensors from [batch_size, ...] to [batch_size * expand_size, ...]"""
-        # Do not call torch.repeat_interleave if expand_size is 1 because it clones
-        # the input tensor and thus requires more memory although no change is applied
         if expand_size == 1:
             return input_ids, attention_mask
         if input_ids is not None:
@@ -188,14 +181,10 @@ class DreamGenerationMixin:
 
     def _validate_generated_length(self, generation_config, input_ids_length, has_default_max_length):
         """Performs validation related to the resulting generated length"""
-
-        # Can't throw warnings/exceptions during compilation
         if is_torchdynamo_compiling():
             return
 
-        # 1. Max length warnings related to poor parameterization
         if has_default_max_length and generation_config.max_new_tokens is None and generation_config.max_length == 20:
-            # 20 is the default max_length of the generation config
             warnings.warn(
                 f"Using the model-agnostic default `max_length` (={generation_config.max_length}) to control the "
                 "generation length. We recommend setting `max_new_tokens` to control the maximum length of the "
@@ -217,7 +206,6 @@ class DreamGenerationMixin:
         input_ids_length,
     ):
         """Prepared max and min length in generation configs to avoid clashes between similar attributes"""
-
         if generation_config.max_new_tokens is not None:
             if not has_default_max_length and generation_config.max_length is not None:
                 logger.warning(
@@ -240,23 +228,14 @@ class DreamGenerationMixin:
     def _prepare_generation_config(
         self, generation_config: Optional[DreamGenerationConfig], **kwargs: Dict
     ) -> DreamGenerationConfig:
-        """
-        Prepares the base generation config, then applies any generation configuration options from kwargs. This
-        function handles retrocompatibility with respect to configuration files.
-        """
-        # priority: `generation_config` argument > `model.generation_config` (the default generation config)
         using_model_generation_config = False
         if generation_config is None:
             generation_config = DreamGenerationConfig.from_model_config(self.config)
             using_model_generation_config = True
 
-        # `torch.compile` can't compile `copy.deepcopy`, arguments in `kwargs` that are part of `generation_config`
-        # will mutate the object with `.update`. As such, passing these arguments through `kwargs` is disabled -- an
-        # exception will be raised in `_validate_model_kwargs`
         if not is_torchdynamo_compiling():
             generation_config = copy.deepcopy(generation_config)
             _kwargs = generation_config.update(**kwargs)
-            # If `generation_config` is provided, let's fallback ALL special tokens to the default values for the model
             if not using_model_generation_config:
                 if generation_config.bos_token_id is None:
                     generation_config.bos_token_id = self.generation_config.bos_token_id
@@ -274,19 +253,9 @@ class DreamGenerationMixin:
         generation_config: DreamGenerationConfig,
         device: Optional[Union[torch.device, str]] = None,
     ):
-        """
-        Prepares the special tokens for generation, overwriting the generation config with their processed versions
-        converted to tensor.
-        Note that `generation_config` is changed in place and stops being serializable after this method is called.
-        That is no problem if called within `generate` (`generation_config` is a local copy that doesn't leave the
-        function). However, if called outside `generate`, consider creating a copy of `generation_config` first.
-        """
-
-        # Convert special tokens to tensors
         def _tensor_or_none(token, device=None):
             if token is None:
                 return token
-
             device = device if device is not None else self.device
             if isinstance(token, torch.Tensor):
                 return token.to(device)
@@ -297,19 +266,13 @@ class DreamGenerationMixin:
         pad_token_tensor = _tensor_or_none(generation_config.pad_token_id, device=device)
         mask_token_tensor = _tensor_or_none(generation_config.mask_token_id, device=device)
 
-        # We can have more than one eos token. Always treat it as a 1D tensor (when it exists).
         if eos_token_tensor is not None and eos_token_tensor.ndim == 0:
             eos_token_tensor = eos_token_tensor.unsqueeze(0)
 
-        # Set pad token if unset (and there are conditions to do so)
         if pad_token_tensor is None and eos_token_tensor is not None:
             pad_token_tensor = eos_token_tensor[0]
             logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{pad_token_tensor} for open-end generation.")
 
-        # Update generation config with the updated special tokens tensors
-        # NOTE: this must be written into a different attribute name than the one holding the original special tokens
-        # (in their non-tensor form), in order to enable end-to-end compilation. See
-        # https://pytorch.org/docs/stable/torch.compiler_cudagraph_trees.html#limitations
         generation_config._bos_token_tensor = bos_token_tensor
         generation_config._eos_token_tensor = eos_token_tensor
         generation_config._pad_token_tensor = pad_token_tensor
@@ -322,8 +285,10 @@ class DreamGenerationMixin:
         generation_config: Optional[DreamGenerationConfig] = None,
         **kwargs,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
-        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
+        # 1. Handle `generation_config` and kwargs that might update it
         generation_config = self._prepare_generation_config(generation_config, **kwargs)
+        generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
+        generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
 
         # 2. Define model inputs
         assert inputs is not None
@@ -340,9 +305,8 @@ class DreamGenerationMixin:
             has_default_max_length=has_default_max_length,
             input_ids_length=input_ids_length,
         )
-
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
-        
+
         # 4. Check input_ids
         if not is_torchdynamo_compiling() and self.device.type != input_ids.device.type:
             warnings.warn(
@@ -356,7 +320,7 @@ class DreamGenerationMixin:
             )
         if (
             hasattr(generation_config, "pad_token_id") and
-            torch.any(input_ids == generation_config.pad_token_id) and 
+            torch.any(input_ids == generation_config.pad_token_id) and
             attention_mask is None
         ):
             warnings.warn(
@@ -368,7 +332,7 @@ class DreamGenerationMixin:
         input_ids, attention_mask = self._expand_inputs_for_generation(
             expand_size=generation_config.num_return_sequences,
             input_ids=input_ids,
-            attention_mask=attention_mask 
+            attention_mask=attention_mask,
         )
         threshold = kwargs.get("threshold", 0.9)
         block_length = kwargs.get("block_length", 32)
@@ -378,23 +342,190 @@ class DreamGenerationMixin:
             input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
+            generation_tokens_hook_func=generation_tokens_hook_func,
+            generation_logits_hook_func=generation_logits_hook_func,
             threshold=threshold,
             block_length=block_length,
-            dual_cache=dual_cache
+            dual_cache=dual_cache,
         )
         return result
+
+    @torch.no_grad()
+    def cj_diffusion_generate(
+        self,
+        inputs: torch.LongTensor,
+        generation_config: Optional[DreamGenerationConfig] = None,
+        *,
+        attention_mask: Optional[torch.LongTensor] = None,
+        step_merge: bool = False,
+        merge_interval: Optional[int] = None,
+        **kwargs,
+    ):
+        """
+        Block-version Dream diffusion generation that also returns per-step
+        "newly unmasked positions" trajectory.
+
+        Each inner step (steps_per_block iterations per block) counts as one
+        trajectory step.
+
+        Trajectory definition (bool):
+            newly_unmasked = (prev_x == mask_id) & (new_x != mask_id)
+
+        Returns:
+            sequences: LongTensor [B, max_length]
+            traj: BoolTensor
+                - step_merge=False: [B, total_steps, max_length]
+                - step_merge=True : [B, ceil(total_steps/merge_interval), max_length]
+                  OR-merged within each window.
+        """
+        # 1) prepare config exactly like diffusion_generate
+        generation_config = self._prepare_generation_config(generation_config, **kwargs)
+        device = inputs.device
+        self._prepare_special_tokens(generation_config, device=device)
+
+        if generation_config.mask_token_id is None:
+            raise ValueError(
+                "generation_config.mask_token_id must be set to record unmask trajectory."
+            )
+
+        input_ids = inputs
+        input_ids_length = input_ids.shape[-1]
+        has_default_max_length = (
+            kwargs.get("max_length") is None and generation_config.max_length is not None
+        )
+        generation_config = self._prepare_generated_length(
+            generation_config=generation_config,
+            has_default_max_length=has_default_max_length,
+            input_ids_length=input_ids_length,
+        )
+        self._validate_generated_length(
+            generation_config, input_ids_length, has_default_max_length
+        )
+
+        # expand for num_return_sequences
+        input_ids, attention_mask = self._expand_inputs_for_generation(
+            expand_size=generation_config.num_return_sequences,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        threshold = kwargs.get("threshold", 0.9)
+        block_length = kwargs.get("block_length", 32)
+        dual_cache = kwargs.get("dual_cache", False)
+
+        steps = int(generation_config.steps)
+        mask_id = generation_config.mask_token_id
+
+        if merge_interval is None:
+            merge_interval = steps
+        merge_interval = max(1, int(merge_interval))
+
+        # ---- trajectory recording state ----
+        per_step_traj: list = []
+        merged_traj: list = []
+        _merge_acc = None
+        _seen_steps = 0
+        state = {"prev_x": None}
+
+        def _record_tokens_hook(step, x, logits):
+            """
+            Token hook that records newly unmasked positions at each step.
+            step=None means initial state (just save prev_x, don't produce traj).
+            """
+            nonlocal _merge_acc, _seen_steps
+
+            if step is None:
+                state["prev_x"] = x.clone()
+                return x
+
+            prev_x = state["prev_x"]
+            newly_unmasked = (prev_x == mask_id) & (x != mask_id)
+
+            if not step_merge:
+                per_step_traj.append(newly_unmasked)
+            else:
+                if _merge_acc is None:
+                    _merge_acc = newly_unmasked.clone()
+                    _seen_steps = 1
+                else:
+                    _merge_acc |= newly_unmasked
+                    _seen_steps += 1
+
+                if _seen_steps >= merge_interval:
+                    merged_traj.append(_merge_acc)
+                    _merge_acc = None
+                    _seen_steps = 0
+
+            state["prev_x"] = x.clone()
+            return x
+
+        # allow user to also pass custom hooks: wrap them
+        user_tokens_hook = kwargs.pop("generation_tokens_hook_func", None)
+        user_logits_hook = kwargs.pop("generation_logits_hook_func", None)
+
+        if user_tokens_hook is None:
+            generation_tokens_hook_func = _record_tokens_hook
+        else:
+            def generation_tokens_hook_func(step, x, logits):
+                x = user_tokens_hook(step, x, logits)
+                x = _record_tokens_hook(step, x, logits)
+                return x
+
+        if user_logits_hook is None:
+            generation_logits_hook_func = lambda step, x, logits: logits
+        else:
+            generation_logits_hook_func = user_logits_hook
+
+        # ---- call _sample with hooks ----
+        sequences = self._sample(
+            input_ids,
+            attention_mask=attention_mask,
+            generation_config=generation_config,
+            generation_tokens_hook_func=generation_tokens_hook_func,
+            generation_logits_hook_func=generation_logits_hook_func,
+            threshold=threshold,
+            block_length=block_length,
+            dual_cache=dual_cache,
+        )
+
+        # flush remaining merge buffer
+        if step_merge and _merge_acc is not None:
+            merged_traj.append(_merge_acc)
+
+        # stack trajectory
+        if not step_merge:
+            if len(per_step_traj) > 0:
+                traj = torch.stack(per_step_traj, dim=1)
+            else:
+                traj = torch.empty(
+                    (sequences.shape[0], 0, sequences.shape[1]),
+                    device=sequences.device,
+                    dtype=torch.bool,
+                )
+        else:
+            if len(merged_traj) > 0:
+                traj = torch.stack(merged_traj, dim=1)
+            else:
+                traj = torch.empty(
+                    (sequences.shape[0], 0, sequences.shape[1]),
+                    device=sequences.device,
+                    dtype=torch.bool,
+                )
+
+        return sequences, traj
 
     def _sample(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor],
         generation_config: DreamGenerationConfig,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
         threshold: Optional[float] = 0.9,
         block_length: Optional[int] = 32,
         dual_cache: bool = False,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
-        
         output_history = generation_config.output_history
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
@@ -411,25 +542,22 @@ class DreamGenerationMixin:
         # pad input_ids to max_length
         x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
         gen_length = max_length - input_ids.shape[1]
-        
+
         # Handle block configuration
         if block_length is None:
-            block_length = gen_length  # Default: single block (original behavior)
-        
+            block_length = gen_length
+
         assert gen_length % block_length == 0, f"gen_length ({gen_length}) must be divisible by block_length ({block_length})"
         num_blocks = gen_length // block_length
-        
+
         assert steps % num_blocks == 0, f"steps ({steps}) must be divisible by num_blocks ({num_blocks})"
         steps_per_block = steps // num_blocks
         timesteps = torch.linspace(1, generation_config.eps, steps_per_block + 1, device=x.device)
 
         if attention_mask is not None and torch.any(attention_mask == 0.0):
-            # we do not mask the [MASK] tokens so value = 1.0
             attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
             tok_idx = attention_mask.long().cumsum(-1) - 1
             tok_idx.masked_fill_(attention_mask == 0, 1)
-            # attention_mask is of shape [B, N]
-            # broadcast to [B, 1, N, N]
             attention_mask = torch.logical_and(
                 attention_mask.unsqueeze(1).unsqueeze(-2),
                 attention_mask.unsqueeze(1).unsqueeze(-1),
@@ -438,12 +566,17 @@ class DreamGenerationMixin:
             tok_idx = None
             attention_mask = "full"
 
-        # Initialize cache for the prompt
         past_key_values = None
+
+        # Record initial state (all-mask for generation region)
+        x = generation_tokens_hook_func(None, x, None)
+
+        # global step counter for hook
+        global_step = 0
 
         # Process each block
         for num_block in range(num_blocks):
-            
+
             current_block_start = input_ids.shape[1] + num_block * block_length
             current_block_end = current_block_start + block_length
 
@@ -451,10 +584,21 @@ class DreamGenerationMixin:
             model_output = self(x, attention_mask, tok_idx, use_cache=True)
             past_key_values = model_output.past_key_values
             logits = model_output.logits
-            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+            # allow user-defined logits control
+            logits = generation_logits_hook_func(global_step, x, logits)
+
             confidence, x0 = sample_tokens(logits, temperature=temperature, top_p=top_p, top_k=top_k)
             x[:, current_block_start] = x0[:, current_block_start]
-            
+
+            # Record after first token of this block is placed
+            x = generation_tokens_hook_func(global_step, x, logits)
+            global_step += 1
+
+            if histories is not None:
+                histories.append(x.clone())
+
             # Extract only previous block cache
             if not dual_cache:
                 new_past_key_values = []
@@ -466,53 +610,59 @@ class DreamGenerationMixin:
             else:
                 replace_position = torch.zeros_like(x, dtype=torch.bool)
                 replace_position[:, current_block_start:current_block_end] = 1
-                
+
             i = 1
             while True:
-                # Use cache for generation
                 if dual_cache:
                     mask_index = (x[:, current_block_start:current_block_end] == mask_token_id)
                 else:
                     mask_index = (x[:, current_block_start:] == mask_token_id)
-                
-                # Prepare attention mask for cached generation
+
                 if attention_mask != "full":
-                    # Adjust attention mask for current position
                     current_attention_mask = attention_mask[:, :, current_block_start:, :]
                 else:
                     current_attention_mask = attention_mask
-                
+
                 if dual_cache:
-                    model_output = self(x[:, current_block_start:current_block_end], current_attention_mask, 
-                                    tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None, 
-                                    past_key_values=past_key_values, use_cache=True, dual_cache=dual_cache, replace_position=replace_position)
+                    model_output = self(
+                        x[:, current_block_start:current_block_end], current_attention_mask,
+                        tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None,
+                        past_key_values=past_key_values, use_cache=True,
+                        dual_cache=dual_cache, replace_position=replace_position,
+                    )
                 else:
-                    model_output = self(x[:, current_block_start:], current_attention_mask, 
-                                    tok_idx[:, current_block_start:] if tok_idx is not None else None, 
-                                    past_key_values=past_key_values, use_cache=True)
+                    model_output = self(
+                        x[:, current_block_start:], current_attention_mask,
+                        tok_idx[:, current_block_start:] if tok_idx is not None else None,
+                        past_key_values=past_key_values, use_cache=True,
+                    )
                 logits = model_output.logits
-                logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+                logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+
+                # allow user-defined logits control
+                logits = generation_logits_hook_func(global_step, x, logits)
+
                 if alg == 'confidence_threshold':
                     mask_logits = logits[mask_index]
-                
+
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
-                    
+
                     if dual_cache:
                         x_ = torch.zeros_like(x[:, current_block_start:current_block_end], device=self.device, dtype=torch.long) + mask_token_id
                         full_confidence = torch.full_like(x[:, current_block_start:current_block_end], -torch.inf, device=self.device, dtype=logits.dtype)
                     else:
                         x_ = torch.zeros_like(x[:, current_block_start:], device=self.device, dtype=torch.long) + mask_token_id
                         full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
-                    
+
                     x_[mask_index] = x0.clone()
                     full_confidence[mask_index] = confidence
                     full_confidence[:, block_length:] = -torch.inf
-                    
+
                     current_transfer_tokens = (x[:, current_block_start:current_block_end] == mask_token_id).sum()
-                    
+
                     selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
                     transfer_index = torch.zeros_like(x_, device=x.device, dtype=torch.bool)
-                    
+
                     select_index = select_index.to(x.device)
                     transfer_index[0, select_index[0]] = True
                     for k in range(1, current_transfer_tokens):
@@ -522,6 +672,14 @@ class DreamGenerationMixin:
                         x[:, current_block_start:current_block_end][transfer_index] = x_[transfer_index]
                     else:
                         x[:, current_block_start:][transfer_index] = x_[transfer_index]
+
+                    # Record after confidence_threshold update
+                    x = generation_tokens_hook_func(global_step, x, logits)
+                    global_step += 1
+
+                    if histories is not None:
+                        histories.append(x.clone())
+
                 else:
                     if i == steps_per_block:
                         break
@@ -538,7 +696,7 @@ class DreamGenerationMixin:
                         full_confidence = torch.full_like(x[:, current_block_start:], -torch.inf, device=self.device, dtype=logits.dtype)
                     full_confidence[mask_index] = confidence
                     full_confidence[:, block_length:] = -torch.inf
-                    
+
                     if number_transfer_tokens > 0:
                         if alg_temp is None or alg_temp == 0:
                             _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
@@ -553,15 +711,22 @@ class DreamGenerationMixin:
                         x_[mask_index] = x0.clone()
                         row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
                         if dual_cache:
-                            x[:, current_block_start:current_block_end][row_indices,transfer_index] = x_[row_indices,transfer_index]
+                            x[:, current_block_start:current_block_end][row_indices, transfer_index] = x_[row_indices, transfer_index]
                         else:
-                            x[:, current_block_start:][row_indices,transfer_index] = x_[row_indices,transfer_index]
+                            x[:, current_block_start:][row_indices, transfer_index] = x_[row_indices, transfer_index]
+
+                    # Record after origin/other alg update
+                    x = generation_tokens_hook_func(global_step, x, logits)
+                    global_step += 1
+
+                    if histories is not None:
+                        histories.append(x.clone())
+
                     i += 1
 
                 if (x[:, current_block_start:current_block_end] == mask_token_id).sum() == 0:
                     break
 
-        
         if return_dict_in_generate:
             return DreamModelOutput(
                 sequences=x,

@@ -818,6 +818,292 @@ def execute_fastdream_generation(
     return responses, full_input_ids, attention_mask, answers
 
 
+def process_cjdream_generation_outputs(
+    outputs: torch.Tensor,
+    reversed_traj_unmask_positions: torch.Tensor,
+    idx_repeat: torch.Tensor,
+    attention_mask_repeat: torch.Tensor,
+    response_length: int,
+    tokenizer,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[List[str]]]:
+    """
+    Process Dream CJ generation outputs, extract responses, attention_masks and answers
+
+    Args:
+        outputs: Model generation outputs (sequences)
+        reversed_traj_unmask_positions: Unmasked position trajectory (may be None for Dream)
+        idx_repeat: Repeated input sequences
+        attention_mask_repeat: Repeated attention masks
+        response_length: Response length
+        tokenizer: Tokenizer
+        device: Device
+
+    Returns:
+        batch_responses: Batch responses (batch, response_length)
+        batch_reversed_traj_unmask_positions: Unmasked position trajectory or None
+        batch_full_input_ids: Full input sequences (batch, seq_len)
+        batch_attention_masks: Batch attention masks (batch, seq_len)
+        batch_answers: Batch answer lists
+    """
+    batch_size = outputs.size(0)
+    prompt_length = idx_repeat.size(1)
+
+    # 1. Extract Responses
+    # outputs structure is [Prompt, Response]
+    # We slice from prompt_length to end to get responses
+    batch_responses = outputs[:, prompt_length:]
+
+    # 2. Full Input IDs
+    # The outputs are already full sequences
+    batch_full_input_ids = outputs
+
+    # 3. Attention Masks
+    # Concatenate original prompt mask with all-ones mask for response
+    response_mask = torch.ones((batch_size, response_length), device=device, dtype=attention_mask_repeat.dtype)
+    batch_attention_masks = torch.cat([attention_mask_repeat, response_mask], dim=1)
+
+    # 4. Extract Answers
+    batch_answers = []
+
+    # Use batch_decode for efficiency
+    decoded_responses = tokenizer.batch_decode(batch_responses, skip_special_tokens=True)
+    for response_str in decoded_responses:
+        boxed_matches = re.findall(r"\\boxed{([^{}]*(?:\{[^{}]*\}[^{}]*)*)}", response_str, re.DOTALL)
+        answer_matches = re.findall(r"<answer>(.*?)</answer>", response_str, re.DOTALL)
+
+        answers = list(set(boxed_matches + answer_matches))  # Merge and deduplicate
+        batch_answers.append(answers)
+
+    batch_reversed_traj_unmask_positions = reversed_traj_unmask_positions
+
+    return batch_responses, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
+
+
+def execute_cjdream_generation(
+    module: torch.nn.Module,
+    gen_kwargs: Dict[str, Any],
+    idx_repeat: torch.Tensor,
+    attention_mask_repeat: torch.Tensor,
+    response_length: int,
+    tokenizer,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[List[str]]]:
+    """
+    Execute Dream CJ generation, return generation results
+
+    Args:
+        module: Model
+        gen_kwargs: Generation parameters
+        idx_repeat: Repeated input sequences
+        attention_mask_repeat: Repeated attention masks
+        response_length: Response length
+        tokenizer: Tokenizer
+
+    Returns:
+        batch_responses: Batch responses (batch, response_length)
+        batch_reversed_traj_unmask_positions: Unmasked position trajectory
+        batch_full_input_ids: Full input sequences (batch, seq_len)
+        batch_attention_masks: Batch attention masks (batch, seq_len)
+        batch_answers: Batch answer lists
+    """
+    import types
+    from .generation_utils import DreamGenerationMixin
+    module.cj_diffusion_generate = types.MethodType(DreamGenerationMixin.cj_diffusion_generate, module)
+    module._sample = types.MethodType(DreamGenerationMixin._sample, module)
+
+    steps = gen_kwargs.get("steps", 128)
+    gen_length = gen_kwargs.get("gen_length", 128)
+    block_length = gen_kwargs.get("block_length", 32)
+    temperature = gen_kwargs.get("temperature", 0.0)
+    remasking = gen_kwargs.get("remasking", "low_confidence")
+    mask_id = gen_kwargs.get("mask_id", 151666)
+    cfg_scale = gen_kwargs.get("cfg_scale", 0.0)
+    mode = gen_kwargs.get("mode", "eval")
+    step_merge = gen_kwargs.get("step_merge", False)
+
+    batch_start_time = time.time()
+
+    # Use Dream's reversed process which returns trajectory
+    outputs, reversed_traj_unmask_positions = module.cj_diffusion_generate(
+        inputs=idx_repeat,
+        attention_mask=attention_mask_repeat,
+        max_new_tokens=gen_length,
+        output_history=False,
+        return_dict_in_generate=False,
+        steps=steps,
+        temperature=temperature,
+        top_p=0.95 if temperature > 0 else 1.0,
+        alg="entropy",
+        alg_temp=0.0,
+        mask_token_id=mask_id,
+        do_sample=gen_kwargs.get("do_sample", True),
+        step_merge=step_merge,
+        merge_interval=steps if step_merge else None,
+    )
+
+    try:
+        rank = dist.get_rank()
+    except Exception:
+        rank = 0
+    print(f"[RANK{rank}] Dream CJ generation for {idx_repeat.size(0)} samples cost: {(time.time() - batch_start_time):.2f}s")
+
+    # Process generation outputs - now with actual trajectory
+    responses, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers = process_cjdream_generation_outputs(
+        outputs=outputs,
+        reversed_traj_unmask_positions=reversed_traj_unmask_positions,
+        idx_repeat=idx_repeat,
+        attention_mask_repeat=attention_mask_repeat,
+        response_length=response_length,
+        tokenizer=tokenizer,
+        device=module.device,
+    )
+
+    return responses, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers
+
+
+def process_fast_cjdream_generation_outputs(
+    outputs: torch.Tensor,
+    reversed_traj_unmask_positions: torch.Tensor,
+    idx_repeat: torch.Tensor,
+    attention_mask_repeat: torch.Tensor,
+    response_length: int,
+    tokenizer,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[List[str]]]:
+    """
+    Process Dream CJ generation outputs, extract responses, attention_masks and answers
+
+    Args:
+        outputs: Model generation outputs (sequences)
+        reversed_traj_unmask_positions: Unmasked position trajectory (may be None for Dream)
+        idx_repeat: Repeated input sequences
+        attention_mask_repeat: Repeated attention masks
+        response_length: Response length
+        tokenizer: Tokenizer
+        device: Device
+
+    Returns:
+        batch_responses: Batch responses (batch, response_length)
+        batch_reversed_traj_unmask_positions: Unmasked position trajectory or None
+        batch_full_input_ids: Full input sequences (batch, seq_len)
+        batch_attention_masks: Batch attention masks (batch, seq_len)
+        batch_answers: Batch answer lists
+    """
+    batch_size = outputs.size(0)
+    prompt_length = idx_repeat.size(1)
+
+    # 1. Extract Responses
+    # outputs structure is [Prompt, Response]
+    # We slice from prompt_length to end to get responses
+    batch_responses = outputs[:, prompt_length:]
+
+    # 2. Full Input IDs
+    # The outputs are already full sequences
+    batch_full_input_ids = outputs
+
+    # 3. Attention Masks
+    # Concatenate original prompt mask with all-ones mask for response
+    response_mask = torch.ones((batch_size, response_length), device=device, dtype=attention_mask_repeat.dtype)
+    batch_attention_masks = torch.cat([attention_mask_repeat, response_mask], dim=1)
+
+    # 4. Extract Answers
+    batch_answers = []
+
+    # Use batch_decode for efficiency
+    decoded_responses = tokenizer.batch_decode(batch_responses, skip_special_tokens=True)
+    for response_str in decoded_responses:
+        boxed_matches = re.findall(r"\\boxed{([^{}]*(?:\{[^{}]*\}[^{}]*)*)}", response_str, re.DOTALL)
+        answer_matches = re.findall(r"<answer>(.*?)</answer>", response_str, re.DOTALL)
+
+        answers = list(set(boxed_matches + answer_matches))  # Merge and deduplicate
+        batch_answers.append(answers)
+
+    batch_reversed_traj_unmask_positions = reversed_traj_unmask_positions
+
+    return batch_responses, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
+
+
+def execute_fastcjdream_generation(
+    module: torch.nn.Module,
+    gen_kwargs: Dict[str, Any],
+    idx_repeat: torch.Tensor,
+    attention_mask_repeat: torch.Tensor,
+    response_length: int,
+    tokenizer,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[List[str]]]:
+    """
+    Execute Fast Dream CJ generation, return generation results
+
+    Args:
+        module: Model
+        gen_kwargs: Generation parameters
+        idx_repeat: Repeated input sequences
+        attention_mask_repeat: Repeated attention masks
+        response_length: Response length
+        tokenizer: Tokenizer
+
+    Returns:
+        batch_responses: Batch responses (batch, response_length)
+        batch_reversed_traj_unmask_positions: Unmasked position trajectory
+        batch_full_input_ids: Full input sequences (batch, seq_len)
+        batch_attention_masks: Batch attention masks (batch, seq_len)
+        batch_answers: Batch answer lists
+    """
+    import types
+    from .generation_utils_block import DreamGenerationMixin
+    module.cj_diffusion_generate = types.MethodType(DreamGenerationMixin.cj_diffusion_generate, module)
+    module._sample = types.MethodType(DreamGenerationMixin._sample, module)
+
+    steps = gen_kwargs.get("steps", 128)
+    gen_length = gen_kwargs.get("gen_length", 128)
+    block_length = gen_kwargs.get("block_length", 32)
+    temperature = gen_kwargs.get("temperature", 0.0)
+    remasking = gen_kwargs.get("remasking", "low_confidence")
+    mask_id = gen_kwargs.get("mask_id", 151666)
+    step_merge = gen_kwargs.get("step_merge", False)
+
+    batch_start_time = time.time()
+
+    # Use Dream's cj_diffusion_generate method with cache which returns trajectory
+    outputs, reversed_traj_unmask_positions = module.cj_diffusion_generate(
+        inputs=idx_repeat,
+        attention_mask=attention_mask_repeat,
+        max_new_tokens=gen_length,
+        output_history=False,
+        return_dict_in_generate=False,
+        steps=steps,
+        block_length=block_length,
+        temperature=temperature,
+        top_p=0.95 if temperature > 0 else 1.0,
+        alg="entropy",
+        alg_temp=0.0,
+        mask_token_id=mask_id,
+        do_sample=gen_kwargs.get("do_sample", True),
+        step_merge=step_merge,
+        merge_interval=steps if step_merge else None,
+    )
+
+    try:
+        rank = dist.get_rank()
+    except Exception:
+        rank = 0
+    print(f"[RANK{rank}] Fast Dream CJ generation for {idx_repeat.size(0)} samples cost: {(time.time() - batch_start_time):.2f}s")
+
+    # Process generation outputs - now with actual trajectory
+    responses, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers = process_cjdream_generation_outputs(
+        outputs=outputs,
+        reversed_traj_unmask_positions=reversed_traj_unmask_positions,
+        idx_repeat=idx_repeat,
+        attention_mask_repeat=attention_mask_repeat,
+        response_length=response_length,
+        tokenizer=tokenizer,
+        device=module.device,
+    )
+
+    return responses, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers
+
+
+### sdar rollout utils ###
 def process_sdar_generation_outputs(
     outputs: torch.Tensor,
     idx_repeat: torch.Tensor,
@@ -845,3 +1131,4 @@ def process_sdar_generation_outputs(
     
     
     return batch_answers
+
