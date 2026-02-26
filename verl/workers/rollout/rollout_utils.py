@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import time
 from typing import List, Dict, Any, Tuple
-from .generate import generate, generate_with_prefix_cache, generate_with_dual_cache, reversed_process, fast_reversed_process, fast_reversed_process_dual_cache
+from .generate import generate, generate_with_prefix_cache, generate_with_dual_cache, reversed_process_llada, fast_reversed_process_llada, fast_reversed_process_dual_cache_llada
 
 ### pack sequences ###
 def pack_sequences(
@@ -355,7 +355,6 @@ def execute_fastllada_generation(
 def process_cjllada_generation_outputs(
     pack: Dict[str, Any],
     outputs: torch.Tensor,
-    reversed_traj: List[torch.Tensor], 
     reversed_traj_unmask_positions: List[torch.Tensor], 
     idx_repeat: torch.Tensor,
     attention_mask_repeat: torch.Tensor,
@@ -369,7 +368,6 @@ def process_cjllada_generation_outputs(
     Args:
         pack: Pack info dict
         outputs: Model generation outputs
-        reversed_traj: Reversed trajectory of outputs
         reversed_traj_unmask_positions: Unmasked position reversed trajectory
         idx_repeat: Repeated input sequences
         attention_mask_repeat: Repeated attention masks
@@ -389,11 +387,10 @@ def process_cjllada_generation_outputs(
         # directly create placeholder for dummy data
         batch_full_input_ids = torch.full((1, pack["prompt_lengths"][0] + response_length), fill_value=tokenizer.pad_token_id, device=device, dtype=torch.long)
         batch_attention_masks = torch.ones((1, pack["prompt_lengths"][0] + response_length), device=device, dtype=torch.long)
-        return None, None, None, batch_full_input_ids, batch_attention_masks, [["dummy"]]
+        return None, None, batch_full_input_ids, batch_attention_masks, [["dummy"]]
 
     # Process real data
     batch_responses = []
-    batch_reversed_traj = []
     batch_reversed_traj_unmask_positions = []
     batch_answers = []
     batch_attention_masks = []
@@ -405,14 +402,12 @@ def process_cjllada_generation_outputs(
         seq_start = cu_seqlens[j]
         valid_prompt_len = prompt_lengths[j]
         response = outputs[0, seq_start + valid_prompt_len:seq_start + valid_prompt_len + response_length].unsqueeze(0)  # (1, response_length)
-        response_traj_i = reversed_traj[0, :, seq_start + valid_prompt_len:seq_start + valid_prompt_len + response_length].unsqueeze(0)  # (1, steps+1, response_length)
-        reversed_traj_i = torch.cat([idx_repeat[j:j+1].unsqueeze(1).repeat(1, reversed_traj.size(1), 1), response_traj_i], dim=-1)  # (1, steps+1, sequence_length)
-        reversed_traj_unmask_positions_i = reversed_traj_unmask_positions[0, :, seq_start + valid_prompt_len:seq_start + valid_prompt_len + response_length].unsqueeze(0)  # (1, steps, response_length)
+        reversed_traj_unmask_positions_i = reversed_traj_unmask_positions[0, :, seq_start + valid_prompt_len:seq_start + valid_prompt_len + response_length].unsqueeze(0)  # (1, steps, sequence_length)
+        reversed_traj_unmask_positions_i = torch.cat((torch.zeros((1, reversed_traj_unmask_positions_i.size(1), idx_repeat.size(1)), device=device, dtype=reversed_traj_unmask_positions_i.dtype), reversed_traj_unmask_positions_i), dim=2)  # Pad unmask positions for prompt part
         response_mask = torch.ones((1, response_length), device=device)  # response part is all 1
         batch_responses.append(response)
-        batch_reversed_traj.append(reversed_traj_i)
         batch_reversed_traj_unmask_positions.append(reversed_traj_unmask_positions_i)
-        batch_attention_masks.append(torch.cat([attention_mask_repeat[batch_start_idx + j].unsqueeze(0), response_mask], dim=1).long())  # (1, seq_length)
+        batch_attention_masks.append(torch.cat([attention_mask_repeat[batch_start_idx + j].unsqueeze(0), response_mask], dim=1).long())  # (1, sequence_length)
         
         # Extract answers
         response_str = tokenizer.batch_decode(response, skip_special_tokens=True)[0]
@@ -424,12 +419,11 @@ def process_cjllada_generation_outputs(
         batch_answers.append(answers)
 
     batch_responses = torch.cat(batch_responses, dim=0)  # (batch, response_length)
-    batch_reversed_traj = torch.cat(batch_reversed_traj, dim=0)  # (batch, steps, sequence_length)
     batch_reversed_traj_unmask_positions = torch.cat(batch_reversed_traj_unmask_positions, dim=0)  # (batch, steps, sequence_length)
-    batch_full_input_ids = torch.cat([idx_repeat[batch_start_idx:batch_start_idx + pack["num_sequences"]], batch_responses], dim=1)  # (batch, seq_len)
+    batch_full_input_ids = torch.cat([idx_repeat[batch_start_idx:batch_start_idx + pack["num_sequences"]], batch_responses], dim=1)  # (batch, sequence_length)
     batch_attention_masks = torch.cat(batch_attention_masks, dim=0)
     
-    return batch_responses, batch_reversed_traj, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
+    return batch_responses, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
 
 
 def execute_cjllada_generation(
@@ -460,7 +454,7 @@ def execute_cjllada_generation(
         batch_answers: Batch answer lists
     """
     batch_start_time = time.time()
-    outputs, reversed_traj, reversed_traj_unmask_positions = reversed_process(
+    outputs, reversed_traj_unmask_positions = reversed_process_llada(
         module,
         pack["packed_input"],
         cu_seqlens=pack["cu_seqlens"],
@@ -470,16 +464,15 @@ def execute_cjllada_generation(
     print(f"[RANK{dist.get_rank()}] {pack['batch_start_idx']}~{pack['batch_start_idx']+pack['num_sequences']} samples cost: {(time.time() - batch_start_time):.2f}s")
 
     # Process generation outputs
-    batch_responses, batch_reversed_traj, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers = process_cjllada_generation_outputs(
-        pack, outputs, reversed_traj, reversed_traj_unmask_positions, idx_repeat, attention_mask_repeat, response_length, tokenizer, module.device
+    batch_responses, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers = process_cjllada_generation_outputs(
+        pack, outputs, reversed_traj_unmask_positions, idx_repeat, attention_mask_repeat, response_length, tokenizer, module.device
     )
     
-    return batch_responses, batch_reversed_traj, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
+    return batch_responses, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
 
 
 def process_fastcjllada_generation_outputs(
     outputs: torch.Tensor,
-    reversed_traj, 
     reversed_traj_unmask_positions,
     idx_repeat: torch.Tensor,
     attention_mask_repeat: torch.Tensor,
@@ -520,7 +513,7 @@ def process_fastcjllada_generation_outputs(
         batch_answers.append(answers)
     
     
-    return batch_responses, reversed_traj, reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
+    return batch_responses, reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers
 
 
 def execute_fastcjllada_generation(
@@ -556,10 +549,11 @@ def execute_fastcjllada_generation(
     remasking = gen_kwargs["remasking"]
     mask_id = gen_kwargs["mask_id"]
     dual_cache = gen_kwargs["dual_cache"]
+    step_merge = gen_kwargs["step_merge"]
 
     batch_start_time = time.time()
     if not dual_cache:
-        outputs, reversed_traj, reversed_traj_unmask_positions = fast_reversed_process(
+        outputs, reversed_traj_unmask_positions = fast_reversed_process_llada(
             model=module,
             prompt=idx_repeat,
             steps=steps,
@@ -569,9 +563,10 @@ def execute_fastcjllada_generation(
             remasking=remasking, 
             mask_id=mask_id,
             attention_mask=attention_mask_repeat,
+            step_merge=step_merge,
         )
     else:
-        outputs, reversed_traj, reversed_traj_unmask_positions = fast_reversed_process_dual_cache(
+        outputs, reversed_traj_unmask_positions = fast_reversed_process_dual_cache_llada(
             model=module,
             prompt=idx_repeat,
             steps=steps,
@@ -581,6 +576,7 @@ def execute_fastcjllada_generation(
             remasking=remasking, 
             mask_id=mask_id,
             attention_mask=attention_mask_repeat,
+            step_merge=step_merge,
         )
 
     try:
@@ -590,11 +586,11 @@ def execute_fastcjllada_generation(
     print(f"[RANK{rank}] FastDLLM generation for {idx_repeat.size(0)} samples cost: {(time.time() - batch_start_time):.2f}s")
 
     # Process generation outputs
-    responses, reversed_traj, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers = process_fastcjllada_generation_outputs(
-        outputs, reversed_traj, reversed_traj_unmask_positions, idx_repeat, attention_mask_repeat, response_length, tokenizer, module.device
+    responses, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers = process_fastcjllada_generation_outputs(
+        outputs, reversed_traj_unmask_positions, idx_repeat, attention_mask_repeat, response_length, tokenizer, module.device
     )
     
-    return responses, reversed_traj, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers
+    return responses, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers
 
 
 ### dream rollout utils ###

@@ -55,6 +55,7 @@ class DLLMRollout(BaseRollout):
         self.mc_num = config["mc_num"]  # Number of Monte Carlo samples
         self.n_l = config["n_l"]  # Number of random masks
         self.cfg_scale = config["cfg_scale"]  # Whether to use CFG
+        self.step_merge = config["step_merge"]  # Whether to use CFG
 
         # rollout related parameters
         self.n_rollout = config["n"]  # How many responses to generate for each prompt
@@ -96,6 +97,7 @@ class DLLMRollout(BaseRollout):
             "cfg_scale": self.cfg_scale,
             "remasking": "low_confidence",
             "mask_id": self.MASK_TOKEN_ID,
+            "step_merge": self.step_merge,
             "mode": "train" if not is_validate else "eval",
         }
         print(f"gen_kwargs: {gen_kwargs}")
@@ -104,7 +106,6 @@ class DLLMRollout(BaseRollout):
 
         all_responses = []
         all_attention_masks = []
-        all_reversed_traj = []
         all_reversed_traj_unmask_positions = []
 
         idx_repeat = idx.repeat_interleave(n_rollout, dim=0)
@@ -133,7 +134,7 @@ class DLLMRollout(BaseRollout):
 
         # Execute generation for each pack
         for pack_idx, pack in enumerate(packs):
-            batch_responses, batch_reversed_traj, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers = execute_cjllada_generation(
+            batch_responses, batch_reversed_traj_unmask_positions, batch_full_input_ids, batch_attention_masks, batch_answers = execute_cjllada_generation(
                 pack=pack,
                 module=self.module,
                 gen_kwargs=gen_kwargs,
@@ -146,7 +147,6 @@ class DLLMRollout(BaseRollout):
             if not pack["is_dummy"]:  # Store results for real data
                 all_responses.append(batch_responses)   
                 all_attention_masks.append(batch_attention_masks)
-                all_reversed_traj.append(batch_reversed_traj)
                 all_reversed_traj_unmask_positions.append(batch_reversed_traj_unmask_positions)
 
             # All packs (including dummy) need to call get_logprobs to keep synchronized
@@ -162,7 +162,6 @@ class DLLMRollout(BaseRollout):
 
         responses_cat = torch.cat(all_responses, dim=0)  # (batch_size * n_rollout, response_length)
         input_ids_cat = torch.cat([idx_repeat, responses_cat], dim=1)
-        reversed_traj_cat = torch.cat(all_reversed_traj, dim=0)  # (batch_size * n_rollout, steps, sequence_length)
         reversed_traj_unmask_positions_cat = torch.cat(all_reversed_traj_unmask_positions, dim=0)  # (batch_size * n_rollout, steps, sequence_length)
 
         batch = TensorDict(
@@ -174,7 +173,6 @@ class DLLMRollout(BaseRollout):
                 "position_ids": torch.cat([position_ids.repeat_interleave(n_rollout, dim=0), 
                                          position_ids[:, -1:].repeat_interleave(n_rollout, dim=0) + 
                                          torch.arange(1, self.response_length+1, device=position_ids.device)], dim=1),  # Complete position_ids, prompt is left-padded, response is right-padded
-                "reversed_traj": reversed_traj_cat,
                 "reversed_traj_unmask_positions": reversed_traj_unmask_positions_cat,
             },
             batch_size=total_batch_size,

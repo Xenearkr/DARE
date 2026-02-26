@@ -54,6 +54,8 @@ class FASTDLLMRollout(BaseRollout):
         self.mc_num = config["mc_num"]  # Number of Monte Carlo samples
         self.n_l = config["n_l"]  # Number of random masks
         self.cfg_scale = config["cfg_scale"]  # Whether to use CFG
+        self.step_merge = config["step_merge"]  # Whether to use CFG
+
         # cache in fastdllm
         self.use_cache = config["use_cache"]  # Number of random masks
         self.dual_cache = config["dual_cache"]  # Whether to use CFG
@@ -99,6 +101,7 @@ class FASTDLLMRollout(BaseRollout):
             "dual_cache": self.dual_cache,
             "remasking": "low_confidence",
             "mask_id": self.MASK_TOKEN_ID,
+            "step_merge": self.step_merge,
             "mode": "train" if not is_validate else "eval",
         }
         print(f"gen_kwargs: {gen_kwargs}")
@@ -109,7 +112,7 @@ class FASTDLLMRollout(BaseRollout):
         MAX_MODEL_LENGTH = self.config.max_num_batched_tokens  # Maximum length of packed sequences
         total_batch_size = batch_size * n_rollout
 
-        responses, reversed_traj, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers = execute_fastcjllada_generation(
+        responses, reversed_traj_unmask_positions, full_input_ids, attention_mask, answers = execute_fastcjllada_generation(
             idx_repeat=idx_repeat,
             module=self.module,
             attention_mask_repeat=attention_mask_repeat,
@@ -135,7 +138,6 @@ class FASTDLLMRollout(BaseRollout):
                 "position_ids": torch.cat([position_ids.repeat_interleave(n_rollout, dim=0), 
                                          position_ids[:, -1:].repeat_interleave(n_rollout, dim=0) + 
                                          torch.arange(1, self.response_length+1, device=position_ids.device)], dim=1),  # Complete position_ids, prompt is left-padded, response is right-padded
-                "reversed_traj": reversed_traj,
                 "reversed_traj_unmask_positions": reversed_traj_unmask_positions,
             },
             batch_size=total_batch_size,

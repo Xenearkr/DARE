@@ -63,6 +63,84 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         self.n_l = config["n_l"]  # Number of random masks
         self.cfg_scale = config["cfg_scale"]  # Whether to use CFG
         
+    def _step_forward_micro_batch(self, micro_batch, step_idx, temperature, calculate_entropy=False, call_fn_name="") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Calculate log_probs and entropy for micro_batch
+        Returns:
+            entropy: # (bs, response_len)
+            log_probs: # (bs, response_len)
+            loss_per_sample: # (bs, mc_num)
+        """
+        batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
+        seq = micro_batch["input_ids"]
+        response_length = micro_batch["responses"].size(-1)
+        prompt_length = seq_length - response_length
+        device = micro_batch["input_ids"].device
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch:
+            # If there are multi-modal inputs, concatenate the content of each key
+            for key in micro_batch["multi_modal_inputs"][0].keys():
+                multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
+
+        init_perturbed_seq = torch.full((batch_size, seq_length), self.MASK_TOKEN_ID, dtype=torch.long).to(device)
+        init_perturbed_seq[:, :prompt_length] = seq[:, :prompt_length] # intial masked seq (fully masked for response)
+
+        # Calculate log_probs
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            reversed_traj_unmask_positions = micro_batch["reversed_traj_unmask_positions"]  # (bs, steps, seq_len)
+            seq = micro_batch["input_ids"]  # (bs, seq_len)
+            attention_mask = micro_batch["attention_mask"]  # (bs, seq_len)
+
+            if step_idx == 0:
+                cur_perturbed_seq = init_perturbed_seq # intial masked seq (fully masked for response)
+            else:
+                cumulative_unmask_positions = reversed_traj_unmask_positions[:, :step_idx, :].any(dim=1)
+                cur_perturbed_seq = torch.where(cumulative_unmask_positions, seq, init_perturbed_seq) # (batch_size, seq_len)
+
+            reversed_traj_logps = torch.zeros((batch_size, response_length), device=device)
+            loss_per_sample = torch.zeros((batch_size, ), device=device)
+            next_perturbed_seq = torch.where(reversed_traj_unmask_positions[:, step_idx, :], seq, cur_perturbed_seq) # (batch_size, seq_len)
+            cur_mask_indices = reversed_traj_unmask_positions[:, step_idx, :]  # (batch_size, seq_len)
+
+            packed_perturbed_seq = []
+            cu_seqlens = [0]
+            max_seqlen = 0
+            for b in range(batch_size):
+                valid_tokens = cur_perturbed_seq[b][attention_mask[b] == 1]
+                packed_perturbed_seq.append(valid_tokens)
+                cu_seqlens.append(cu_seqlens[-1] + len(valid_tokens))
+                max_seqlen = max(max_seqlen, len(valid_tokens))
+            packed_perturbed_seq = torch.cat(packed_perturbed_seq, dim=0).unsqueeze(0)  # (1, total_seqlen)
+            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+            
+            logits = self._get_logits(model=self.actor_module, packed_input=packed_perturbed_seq, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, prompt_len=attention_mask[:, :prompt_length].sum(dim=1), cfg_scale=0.0, MASK_TOKEN_ID=self.MASK_TOKEN_ID)
+            
+            # Restore logits for each sample
+            for b in range(batch_size):
+                start, end = cu_seqlens[b], cu_seqlens[b + 1]
+                
+                logits_b = torch.zeros(seq_length, logits.size(-1), device=device, dtype=logits.dtype)
+                logits_b[attention_mask[b] == 1] = logits[0, start:end]
+                
+                mask = cur_mask_indices[b]  # (response_length,)
+
+                log_prob_b =  - F.cross_entropy(logits_b[-response_length:], next_perturbed_seq[b][-response_length:], reduction="none") # (response_length,)
+                reversed_traj_logps[b, :] = log_prob_b  # only keep response part
+                loss_per_sample[b] = (F.cross_entropy(logits_b[mask], next_perturbed_seq[b][mask], reduction="none")).sum()  
+            
+            cur_perturbed_seq = next_perturbed_seq
+
+            log_prob = reversed_traj_logps  # (batch_size, response_length)
+            loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, response_length).contiguous() # (batch_size, response_length)
+
+        
+        entropy = None
+        if calculate_entropy:
+            prob = log_prob.exp()
+            entropy = -prob * log_prob  # (bs, response_length) entropy of each token
+            
+        return entropy, log_prob, loss_per_sample
+
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False, call_fn_name="") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Calculate log_probs and entropy for micro_batch
@@ -72,6 +150,7 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
             loss_per_sample: # (bs, mc_num)
         """
         batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
+        seq = micro_batch["input_ids"]
         response_length = micro_batch["responses"].size(-1)
         prompt_length = seq_length - response_length
         device = micro_batch["input_ids"].device
@@ -82,20 +161,20 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                 multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
 
         steps = micro_batch["reversed_traj_unmask_positions"].size(1)
+
+        cur_perturbed_seq = torch.full((batch_size, seq_length), self.MASK_TOKEN_ID, dtype=torch.long).to(device)
+        cur_perturbed_seq[:, :prompt_length] = seq[:, :prompt_length] # intial masked seq (fully masked for response)
         # Calculate log_probs
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            reversed_traj = micro_batch["reversed_traj"]  # (bs, steps+1, seq_len)
             reversed_traj_unmask_positions = micro_batch["reversed_traj_unmask_positions"]  # (bs, steps, seq_len)
             seq = micro_batch["input_ids"]  # (bs, seq_len)
             attention_mask = micro_batch["attention_mask"]  # (bs, seq_len)
 
-            # reversed_traj_logps = []
             reversed_traj_logps = torch.zeros((batch_size, steps, response_length), device=device)
             loss_per_sample = torch.zeros((batch_size, steps), device=device)
             for i in range(steps):
-                cur_perturbed_seq = reversed_traj[:, i, :]  # (batch_size, seq_len)
-                next_perturbed_seq = reversed_traj[:, i+1, :]  # (batch_size, seq_len)
-                cur_mask_indices = reversed_traj_unmask_positions[:, i, :]  # (batch_size, response_length)
+                next_perturbed_seq = torch.where(reversed_traj_unmask_positions[:, i, :], seq, cur_perturbed_seq) # (batch_size, seq_len)
+                cur_mask_indices = reversed_traj_unmask_positions[:, i, :]  # (batch_size, seq_len)
 
                 packed_perturbed_seq = []
                 cu_seqlens = [0]
@@ -119,9 +198,11 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                     
                     mask = cur_mask_indices[b]  # (response_length,)
 
-                    log_probs =  - F.cross_entropy(logits_b[-response_length:], next_perturbed_seq[b][-response_length:], reduction="none") # (response_length,)
-                    reversed_traj_logps[b, i, :] = log_probs  # only keep response part
-                    loss_per_sample[b, i] = - (F.cross_entropy(logits_b[-response_length:][mask], next_perturbed_seq[b][-response_length:][mask], reduction="none")).sum()  
+                    log_prob_b =  - F.cross_entropy(logits_b[-response_length:], next_perturbed_seq[b][-response_length:], reduction="none") # (response_length,)
+                    reversed_traj_logps[b, i, :] = log_prob_b  # only keep response part
+                    loss_per_sample[b, i] = (F.cross_entropy(logits_b[mask], next_perturbed_seq[b][mask], reduction="none")).sum()  
+                
+                cur_perturbed_seq = next_perturbed_seq
 
             log_prob = reversed_traj_logps  # (batch_size, steps, response_length)
             loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, -1, response_length).contiguous() # (batch_size, steps, response_length)
@@ -182,7 +263,7 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "reversed_traj", "reversed_traj_unmask_positions"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "reversed_traj_unmask_positions"]
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -231,7 +312,7 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "reversed_traj", "reversed_traj_unmask_positions"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "reversed_traj_unmask_positions"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -303,19 +384,24 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                     accumulated_pg_clipfrac_lower = 0.0
 
                     response_mask = data["reversed_traj_unmask_positions"]
-                    steps = response_mask.shape[1]  # (bsz, steps, response_length)
-                    
-                    entropy, log_probs, loss_per_sample = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy, call_fn_name="update_policy")
-                    print(f"\nloss_per_sample: {loss_per_sample[0, 0, 0]}")
+                    steps = response_mask.shape[1]  # (bsz, steps, sequence_length)
 
-                    total_loss = torch.tensor(0.0, device=log_probs.device)
+                    # total_loss = torch.tensor(0.0, device=log_probs.device)
                     # Compute policy loss
                     for i in range(steps):
+                        entropy, log_probs, loss_per_sample = self._step_forward_micro_batch(
+                            micro_batch=data, 
+                            step_idx=i, 
+                            temperature=temperature, 
+                            calculate_entropy=calculate_entropy, call_fn_name="update_policy"
+                        )
+                        print(f"\nloss_per_sample: {loss_per_sample[0, 0]}")
+
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                             old_l_theta=old_log_probs[:, i, :],  # (bsz, response_length)
-                            l_theta=log_probs[:, i, :],  # (bsz, response_length)
+                            l_theta=log_probs,  # (bsz, response_length)
                             advantages=advantages,  
-                            response_mask=response_mask[:, i, :],  # (bsz, response_length)
+                            response_mask=response_mask[:, i, -log_probs.shape[-1]:],  # (bsz, response_length)
                             cliprange=clip_ratio,
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,
@@ -324,7 +410,7 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                         )
 
                         if entropy_coeff != 0:
-                            entropy_loss = agg_loss(loss_mat=entropy[:, i, :], loss_mask=response_mask[:, i, :], loss_agg_mode=loss_agg_mode)
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask[:, i, -log_probs.shape[-1]:], loss_agg_mode=loss_agg_mode)
 
                             # compute policy loss
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -334,8 +420,8 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                         if self.config.use_kl_loss:  # NOTE: Currently not considering KL
                             ref_log_probs = data["ref_log_probs"]
                             # compute kl loss
-                            kld = kl_penalty(l_theta=log_probs[:, i, :], ref_l_theta=ref_log_probs[:, i, :], kl_penalty=self.config.kl_loss_type, advantages=advantages)
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask[:, i, :], loss_agg_mode=loss_agg_mode)
+                            kld = kl_penalty(l_theta=log_probs, ref_l_theta=ref_log_probs[:, i, :], kl_penalty=self.config.kl_loss_type, advantages=advantages)
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask[:, i, -log_probs.shape[-1]:], loss_agg_mode=loss_agg_mode)
 
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                             metrics["actor/kl_loss"] = kl_loss.detach().item()
@@ -346,16 +432,19 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                             loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                         else:
                             loss = policy_loss / self.gradient_accumulation
-                        total_loss += loss / steps
+
+                        loss = loss / steps
                         print(f"loss: {loss}\n")
-                        
+                        loss.backward()
+
                         accumulated_pg_loss += pg_loss.detach().item()
                         accumulated_pg_clipfrac += pg_clipfrac.detach().item()
                         accumulated_ppo_kl += ppo_kl.detach().item()
                         accumulated_pg_clipfrac_lower += pg_clipfrac_lower.detach().item()
-                    
-                    total_loss.backward()  # Gradient is accumulated in model parameters, but will not be updated now
 
+                        del loss, policy_loss, pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+                        torch.cuda.empty_cache() # Gradient is accumulated in model parameters, but will not be updated now
+                    
                     data = {
                         "actor/pg_loss": accumulated_pg_loss / steps,
                         "actor/pg_clipfrac": accumulated_pg_clipfrac / steps,
