@@ -347,7 +347,7 @@ def block_attn_mask(num_tokens, block_size, device):
     return masks
 
 
-@torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+# @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(query, key, value, attention_mask, **kwargs):
     return flex_attention(query, key, value, block_mask=attention_mask, **kwargs)
 
