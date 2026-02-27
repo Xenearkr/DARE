@@ -36,17 +36,19 @@ engine=${engine:-hf}
 
 if [ -z "${task}" ]; then
   echo "Usage: bash eval.sh ${task}"
-  echo "Optional task: mmlu, mmlupro, hellaswag, arcc, gsm8k_confidence math_confidence gpqa_confidence humaneval_logits mbpp_confidence gsm8k_short math_short olympiadbench"
+  echo "Optional task: mmlu, mmlupro, hellaswag, arcc, gsm8k_confidence math_confidence gpqa_confidence humaneval_logits mbpp_confidence gsm8k_short math_short"
   exit 1
 fi
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
 exp_name="eval_${model}_${task}"
-log_dir=logs/EVAL/${exp_name}
+log_dir=./logs/EVAL/${exp_name}
 mkdir -p ${log_dir}
 
 if [ "${engine}" = "lmdeploy" ]; then
   prefix="lmdeploy_"
+elif [ "${engine}" = "sglang" ]; then
+  prefix="sglang_"
 else
   prefix=""
 fi
@@ -54,52 +56,52 @@ fi
 # task Execution Map
 case "${task}" in
   mmlu)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_mmlu_length128.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_mmlu_length128
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_mmlu_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_mmlu_length4096
     ;;
   mmlupro)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_mmlupro_length128.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_mmlupro_length128
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_mmlupro_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_mmlupro_length4096
     ;;
   hellaswag)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_hellaswag_length128.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_hellaswag_length128
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_hellaswag_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_hellaswag_length4096
     ;;
   arcc)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_arcc_length512.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_arcc_length512
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_arcc_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_arcc_length4096
     ;;
   gpqa)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_gpqa_length128.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_gpqa_length128
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_gpqa_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_gpqa_length4096
     ;;
   humaneval)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_humaneval_length512.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_humaneval_length512
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_humaneval_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_humaneval_length4096
     ;;
   mbpp)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_mbpp_length512.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_mbpp_length512
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_mbpp_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_mbpp_length4096
     ;;
   gsm8k)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_gsm8k_length256.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_gsm8k_length256
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_gsm8k_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_gsm8k_length4096
     ;;
   math)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_math_length512.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_math_length512
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_math_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_math_length4096
     ;;
-  olympiad)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_olympiadbench_length2048.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_olympiadbench_length2048
+  olympiadbench)
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_olympiadbench_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_olympiadbench_length4096
     ;;
   aime2024)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_aime2024_length2048.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_aime2024_length2048
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_aime2024_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_aime2024_length4096
     ;;
   aime2025)
-    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_aime2025_length2048.py
-    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_aime2025_length2048
+    py_script=sdar_examples/${prefix}sdar_1dot7b_chat_gen_aime2025_length4096.py
+    work_dir=outputs/${prefix}sdar_1dot7b_chat_gen_aime2025_length4096
     ;;
   *)
     echo "Unknown task: ${task}"
