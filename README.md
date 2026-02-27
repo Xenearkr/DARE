@@ -297,7 +297,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 
 **Evaluation Result Reproduction**
 
-| Bench\Model | LLaDA-8B | LLaDA-8B + Fast-dLLM | Dream-7B | SDAR-8B | SDAR-8B lmdeploy | SDAR-8B SGLang |
+| Bench\Model | LLaDA-8B | LLaDA-8B + Fast-dLLM | Dream-7B | SDAR-8B | SDAR-8B + lmdeploy | SDAR-8B + SGLang |
 |-------|------------|------------------------|-------|------------|--------------------|----------------|
 | **MMLU** | 65.24 | 65.17 | 66.83 | 76.66 | 73.66 | 77.23 |
 | **MMLU-Pro** | 36.82 | 34.58 | 31.89 | 56.49 | 47.39 | 55.38 |
