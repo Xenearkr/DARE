@@ -41,7 +41,8 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
-- [2026-02-27]: Update llada cj-grpo and add dream cj-grpo.
+- [2026-02-27]: Support evaluation of SDAR with SGLang.
+- [2026-02-26]: Update llada cj-grpo and add dream cj-grpo.
 - [2025-12-28]: Several errors/bugs/updates in dp_actor_algorithm have been fixed/adapted.
 - [2025-12-24]: Support online rl (online weight update of rollout) for SDAR.
 - [2025-12-23]: Support vrpo (preference optimization) for Dream.
@@ -296,20 +297,20 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 
 **Evaluation Result Reproduction**
 
-| Bench\Model | LLaDA-8B-Instruct | LLaDA-8B-Instruct + Fast-dLLM | Dream-7B-Instruct | SDAR-8B-Chat | SDAR-8B-Chat + lmdeploy |
-|-------|------------|------------------------|-------|------------|------------------------|
-| **MMLU** | 65.24 | 65.17 | 66.83 | 76.66 | 73.66 |
-| **MMLU-Pro** | 36.82 | 34.58 | 31.89 | 56.49 | 47.39 |
-| **Hellaswag** | 75.30 | 74.41 | 63.23 | 84.07 | 87.59 |
-| **ARC-C** | 87.80 | 87.80 | 81.36 | 75.59 | 86.78 |
-| **GSM8k** | 79.68 | 78.39 | 83.24 | 91.36 | 91.21 |
-| **MATH** | 41.08 | 40.58 | 48.02 | 78.40 | 61.80 |
-| **GPQA** | 30.81 | 31.82 | 26.77 | 33.33 | 41.40 |
-| **AIME24** | 0.83 | 2.08 | 0.83 | 8.75 | 6.67 |
-| **AIME25** | 0.42 | 0.00 | 0.00 | 12.50 | 6.67 |
-| **Olympiad** | 8.95 | 9.70 | 12.22 | 24.93 | 17.35 |
-| **HumanEval** | 46.34 | 43.29 | 78.05 | 79.88 | 75.61 |
-| **MBPP** | 38.80 | 20.00 | 56.40 | 66.20 | 67.32 |
+| Bench\Model | LLaDA-8B | LLaDA-8B + Fast-dLLM | Dream-7B | SDAR-8B | SDAR-8B lmdeploy | SDAR-8B SGLang |
+|-------|------------|------------------------|-------|------------|--------------------|----------------|
+| **MMLU** | 65.24 | 65.17 | 66.83 | 76.66 | 73.66 | 77.23 |
+| **MMLU-Pro** | 36.82 | 34.58 | 31.89 | 56.49 | 47.39 | 55.38 |
+| **Hellaswag** | 75.30 | 74.41 | 63.23 | 84.07 | 87.59 | 81.78 |
+| **ARC-C** | 87.80 | 87.80 | 81.36 | 75.59 | 86.78 | 76.95 |
+| **GSM8k** | 79.68 | 78.39 | 83.24 | 91.36 | 91.21 | 90.83 |
+| **MATH** | 41.08 | 40.58 | 48.02 | 78.40 | 61.80 | 77.00 |
+| **GPQA** | 30.81 | 31.82 | 26.77 | 33.33 | 41.40 | 29.80 |
+| **AIME24** | 0.83 | 2.08 | 0.83 | 8.75 | 6.67 | 13.33 |
+| **AIME25** | 0.42 | 0.00 | 0.00 | 12.50 | 6.67 | 16.67 |
+| **Olympiad** | 8.95 | 9.70 | 12.22 | 24.93 | 17.35 | 23.88 |
+| **HumanEval** | 46.34 | 43.29 | 78.05 | 79.88 | 75.61 | 75.00 |
+| **MBPP** | 38.80 | 20.00 | 56.40 | 66.20 | 67.32 | 71.60 |
 
 
 ## 📧 Contact
