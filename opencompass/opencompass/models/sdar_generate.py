@@ -35,14 +35,21 @@ def sample_with_temperature_topk_topp(logits, temperature=1.0, top_k=0, top_p=1.
 
     if temperature != 1.0:
         logits = logits / temperature
+
+    # Compute true confidence from logits before top-k/top-p truncation
+    original_probs = F.softmax(logits, dim=-1)  # [batch*block, vocab]
+
+    # Apply top-k/top-p filtering only for sampling
+    filtered_logits = logits
     if top_k > 0:
-        logits = top_k_logits(logits, top_k)
+        filtered_logits = top_k_logits(filtered_logits, top_k)
     if top_p < 1.0:
-        logits = top_p_logits(logits, top_p)
-    probs = F.softmax(logits, dim=-1)  # shape: [batch*block, vocab]
-    assert probs.dim() == 2
-    token = torch.multinomial(probs, num_samples=1)  # [batch*block, 1]
-    token_prob = torch.gather(probs, -1, token)     # [batch*block, 1]
+        filtered_logits = top_p_logits(filtered_logits, top_p)
+    filtered_probs = F.softmax(filtered_logits, dim=-1)  # [batch*block, vocab]
+
+    assert filtered_probs.dim() == 2
+    token = torch.multinomial(filtered_probs, num_samples=1)  # [batch*block, 1]
+    token_prob = torch.gather(original_probs, -1, token)      # [batch*block, 1]
 
     return token.view(*orig_shape), token_prob.view(*orig_shape)
 
