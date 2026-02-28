@@ -73,7 +73,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 - **Acceleration Inference/Rollout for dLLMs**
   - Block cache ([Fast-dLLM](https://github.com/NVlabs/Fast-dLLM)) for LLaDAs and Dreams 2.2x faster rollout
-  - Inference engine ([lmdeploy](https://github.com/InternLM/lmdeploy)) for SDARs 2-4× faster rollout
+  - Inference engine ([lmdeploy](https://github.com/InternLM/lmdeploy), [sglang](https://github.com/sgl-project/sglang)) for SDARs 2-4× faster rollout
 - **Parallelism for dLLMs**
   - Support sequence parallel
 - **Attention Backend**
@@ -83,11 +83,11 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 - **Model Diversity**
   - dLLM that trained from scratch (e.g., LLaDA)
   - dLLM that continuous trained from AR, i.e., AR-to-Diffusion (e.g., Dream, SDAR)
-  - Masked diffusion language models (e.g., LLaDA/Dream), block diffusion language model (e.g., SDAR)
+  - Masked diffusion language models (e.g., LLaDA/Dream), block diffusion language model (e.g., SDAR/LLaDA2.0)
 - **Comprehensive Evaluation for dLLMs**
-  - Integrate  faster dLLM evaluation in [opencompass](https://github.com/open-compass/opencompass)
+  - Integrate faster dLLM evaluation in [opencompass](https://github.com/open-compass/opencompass)
 - **Upcoming Features**
-  - Support [sglang](https://github.com/sgl-project/sglang) inference engine, MoE, Multi-Modal, Omni, etc.
+  - Support MoE, Multi-Modal, Omni, etc.
 
 
 ## 🛠️ Installation and Setup
