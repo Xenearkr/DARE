@@ -49,7 +49,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 - [2025-12-23]: Support vrpo (preference optimization) for Dream.
 - [2025-12-16]: Support vrpo (preference optimization) for LLaDA.
 - [2025-12-12]: Support sft/peft of SDAR.
-- [2025-12-11]: Support evaluation of LLaDAMoE and LLaDA2.0-mini.
+- [2025-12-11]: Support evaluation of LLaDAMoE and LLaDA2.0-mini with SGLang.
 - [2025-12-08]: Support coupled-grpo, cj-grpo and spg algorithm.
 - [2025-12-03]: Support sequence parallel to enable longer generation ability for dLLMs.
 - [2025-12-01]: We initialize the codebase of DARE (dLLM Alignment and Reinforcement Executor), including faster sft/peft/rl (d1, bgpo) training (LLaDA/Dream) and evaluation (LLaDA/Dream/SDAR).
