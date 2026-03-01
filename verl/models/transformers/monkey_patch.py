@@ -225,6 +225,20 @@ def apply_monkey_patch(
 
         return
 
+    elif model.config.model_type == "llada":
+        if use_remove_padding or ulysses_sp_size > 1:
+            from verl.models.transformers.llada import apply_llada_ulysses_patch
+
+            apply_llada_ulysses_patch(model)
+        return
+
+    elif model.config.model_type == "Dream":
+        if use_remove_padding or ulysses_sp_size > 1:
+            from verl.models.transformers.dream import apply_dream_ulysses_patch
+
+            apply_dream_ulysses_patch(model)
+        return
+
     # transformers<=4.47.1
     if use_remove_padding or ulysses_sp_size > 1:
         if hasattr(module, "_flash_attention_forward"):

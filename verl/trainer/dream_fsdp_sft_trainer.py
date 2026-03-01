@@ -459,19 +459,10 @@ class FSDPdLLMSFTTrainer:
                 # Remove padding for loss mask
                 loss_mask_rmpad, _, *_ = unpad_input(loss_mask.unsqueeze(-1), attention_mask)
                 loss_mask_rmpad = loss_mask_rmpad.transpose(0, 1)  # (1, total_nnz)
-                # # Pad and slice inputs for sequence parallelism
                 loss_mask_rmpad_rolled = torch.roll(loss_mask_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
-                # loss_mask_rmpad_sliced, _, _ = ulysses_pad_and_slice_inputs(
-                #     loss_mask_rmpad, None, sp_size=get_ulysses_sequence_parallel_world_size()
-                # ) # (1, total_nnz // sp) 
                
-                chunk_size = batch_size // self.config.ulysses_sequence_parallel_size
-                sp_rank = torch.distributed.get_rank() % self.config.ulysses_sequence_parallel_size
-                
-                # Get the cu_seqlens in corresponding SP rank
-                start_idx = sp_rank * chunk_size
-                end_idx = (sp_rank + 1) * chunk_size
-                seq_lens = attention_mask[start_idx:end_idx].sum(dim=-1).to(torch.int32)  # (batch_size // sp,)
+                # Compute cu_seqlens from ALL sequences (all SP ranks share the same data)
+                seq_lens = attention_mask.sum(dim=-1).to(torch.int32)
                 cu_seqlens = torch.cat([
                     torch.zeros(1, device=seq_lens.device, dtype=torch.int32),
                     seq_lens.cumsum(dim=0).to(torch.int32)
@@ -489,13 +480,11 @@ class FSDPdLLMSFTTrainer:
 
                 # Compute loss locally then gather and unpad for sequence parallelism
                 logits_rmpad_sliced = output.logits # (1, total_nnz // sp, vocab_size)
-
-                # For computing loss, need to shift
-                # labels_rmpad_sliced_rolled = torch.roll(labels_rmpad_sliced, shifts=-1, dims=1)  # (1, total_nnz)
-                # loss_mask_rmpad_rolled = torch.roll(loss_mask_rmpad_sliced, shifts=-1, dims=1)  # (1, total_nnz)
-
-                loss_rmpad_sliced = loss_fct(logits_rmpad_sliced.squeeze(0), labels_rmpad_sliced.squeeze(0)) #* loss_mask_rmpad_rolled.squeeze(0)  # (total_nnz // sp,)
-                loss_rmpad_gathered = gather_outpus_and_unpad(loss_rmpad_sliced, gather_dim=0, unpad_dim=0, padding_size=pad_size)  # (total_nnz,)
+                loss_rmpad_sliced = loss_fct(logits_rmpad_sliced.squeeze(0), labels_rmpad_sliced.squeeze(0))  # (total_nnz // sp,)
+                loss_rmpad_gathered = gather_outpus_and_unpad(
+                    loss_rmpad_sliced, gather_dim=0, unpad_dim=0, padding_size=pad_size,
+                    grad_scaler=False
+                )  # (total_nnz,)
 
                 # This is the loss collected from all ulysses ranks
                 unsclaed_full_loss = pad_input(
@@ -519,8 +508,13 @@ class FSDPdLLMSFTTrainer:
             valid_token_this_rank = torch.sum(loss_mask)
 
             if self.config.data.balance_dp_token:
-                torch.distributed.all_reduce(valid_token_this_rank)
-                dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
+                if use_sp:
+                    dp_group = self.ulysses_device_mesh["dp"].get_group()
+                    torch.distributed.all_reduce(valid_token_this_rank, group=dp_group)
+                    dp_size = self.ulysses_device_mesh.size("dp")
+                else:
+                    torch.distributed.all_reduce(valid_token_this_rank)
+                    dp_size = torch.distributed.get_world_size()
             else:
                 dp_size = 1
 
