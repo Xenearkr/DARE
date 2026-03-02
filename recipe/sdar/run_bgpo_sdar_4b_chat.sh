@@ -4,12 +4,14 @@ set -x
 
 # clean residual processes
 cleanup() {
-    # kil lmdeploy residual processes
+    # kill lmdeploy residual processes
     if [ ! -z "${LMDEPLOY_PID+x}" ] && ps -p $LMDEPLOY_PID > /dev/null 2>&1; then
         echo "[INFO] kill lmdeploy process (PID: $LMDEPLOY_PID)..."
         kill -9 $LMDEPLOY_PID 2>/dev/null || true
         sleep 2
     fi
+
+ echo "[INFO] Using engine: ${engine}"
     
     # clean up 23333 port
     local port_pids=$(lsof -ti:23333 2>/dev/null || ss -tlnp | grep :23333 | awk '{print $NF}' | cut -d',' -f2 | sort -u)
@@ -19,6 +21,8 @@ cleanup() {
         done
         sleep 1
     fi
+
+ echo "[INFO] Using engine: ${engine}"
     
     # clean up old ray
     ray stop --force || true
@@ -71,42 +75,55 @@ ray start --head \
   --num-gpus=8 \
   --num-cpus=128
 
-# start up lmdeploy server
-echo "[INFO] Starting lmdeploy server on GPU 0..."
-# lmdeploy setting
-MODEL_PATH=${model_path:-models/SDAR-4B-Chat}
-SERVER_PORT=23333
-LMDEPLOY_EXECUTOR_BACKEND="ray"
-LMDEPLOY_ENGINE_BACKEND="pytorch"
-CACHE_MAX_ENTRY_COUNT=0.5
-SESSION_LEN=2048
-BLOCK_LENGTH=4
-UNMASKING_STRATEGY="low_confidence_dynamic"
-DENOISING_STEPS=4
-CONFIDENCE_THRESHOLD=0.9
-export CUDA_VISIBLE_DEVICES=0
-export LMDEPLOY_EXECUTOR_BACKEND=${LMDEPLOY_EXECUTOR_BACKEND}
+# start up lmdeploy server (only for lmdeploy engine)
+if [ "$engine" = "lmdeploy" ]; then
+    echo "[INFO] Starting lmdeploy server on GPU 0..."
+    # lmdeploy setting
+    MODEL_PATH=${model_path:-models/SDAR-4B-Chat}
+    SERVER_PORT=23333
+    LMDEPLOY_EXECUTOR_BACKEND="ray"
+    LMDEPLOY_ENGINE_BACKEND="pytorch"
+    CACHE_MAX_ENTRY_COUNT=0.5
+    SESSION_LEN=2048
+    BLOCK_LENGTH=4
+    UNMASKING_STRATEGY="low_confidence_dynamic"
+    DENOISING_STEPS=4
+    CONFIDENCE_THRESHOLD=0.9
+    export CUDA_VISIBLE_DEVICES=0
+    export LMDEPLOY_EXECUTOR_BACKEND=${LMDEPLOY_EXECUTOR_BACKEND}
 
-lmdeploy serve api_server "${MODEL_PATH}" \
-  --backend ${LMDEPLOY_ENGINE_BACKEND} \
-  --server-port ${SERVER_PORT} \
-  --cache-max-entry-count ${CACHE_MAX_ENTRY_COUNT} \
-  --session-len ${SESSION_LEN} \
-  --dllm-block-length ${BLOCK_LENGTH} \
-  --dllm-unmasking-strategy "${UNMASKING_STRATEGY}" \
-  --dllm-denoising-steps ${DENOISING_STEPS} \
-  --dllm-confidence-threshold ${CONFIDENCE_THRESHOLD} &
+    lmdeploy serve api_server "${MODEL_PATH}" \
+      --backend ${LMDEPLOY_ENGINE_BACKEND} \
+      --server-port ${SERVER_PORT} \
+      --cache-max-entry-count ${CACHE_MAX_ENTRY_COUNT} \
+      --session-len ${SESSION_LEN} \
+      --dllm-block-length ${BLOCK_LENGTH} \
+      --dllm-unmasking-strategy "${UNMASKING_STRATEGY}" \
+      --dllm-denoising-steps ${DENOISING_STEPS} \
+      --dllm-confidence-threshold ${CONFIDENCE_THRESHOLD} &
 
-LMDEPLOY_PID=$!
-echo "[INFO] lmdeploy PID: ${LMDEPLOY_PID}"
+    LMDEPLOY_PID=$!
+    echo "[INFO] lmdeploy PID: ${LMDEPLOY_PID}"
 
-# wait lmdeploy server to be ready
-sleep 5
+    # wait lmdeploy server to be ready
+    sleep 5
+elif [ "$engine" = "sglang" ]; then
+    echo "[INFO] Using SGLang engine (embedded in rollout worker, no separate server needed)"
+fi
 
 # env variables for ppo training
 export HYDRA_FULL_ERROR=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Add memory fragmentation optimization
-export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+
+# Set CUDA_VISIBLE_DEVICES based on engine
+if [ "$engine" = "lmdeploy" ]; then
+    # GPU 0 for lmdeploy, GPUs 1-7 for training
+    export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
+elif [ "$engine" = "sglang" ] || [ "$engine" = "hf" ]; then
+    # All GPUs available for training
+    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+fi
+
 export WANDB_PROJECT="DARE"
 export WANDB_API_KEY=
 export WANDB_RESUME="allow"
@@ -129,6 +146,8 @@ if [[ ! " ${valid_tasks[@]} " =~ " ${task} " ]]; then
     exit 1
 fi
 
+ echo "[INFO] Using engine: ${engine}"
+
 # validate model
 valid_models=("llada" "dream" "sdar")
 if [[ ! " ${valid_models[@]} " =~ " ${model} " ]]; then
@@ -137,6 +156,16 @@ if [[ ! " ${valid_models[@]} " =~ " ${model} " ]]; then
     exit 1
 fi
 
+# validate engine
+valid_engines=("hf" "lmdeploy" "sglang")
+if [[ ! " ${valid_engines[@]} " =~ " ${engine} " ]]; then
+    echo "Error: Invalid engine '$engine'"
+    echo "Supported engines: ${valid_engines[*]}"
+    exit 1
+fi
+
+echo "[INFO] Using engine: ${engine}"
+
 # validate algorithm
 valid_algorithms=("d1" "coupled-grpo" "mdpo" "cj-grpo" "spg" "bgpo")
 if [[ ! " ${valid_algorithms[@]} " =~ " ${algorithm} " ]]; then
@@ -144,14 +173,13 @@ if [[ ! " ${valid_algorithms[@]} " =~ " ${algorithm} " ]]; then
     echo "Supported algorithms: ${valid_algorithms[*]}"
     exit 1
 fi
-
-# validate engine
-valid_engines=("hf" "lmdeploy")
 if [[ ! " ${valid_engines[@]} " =~ " ${engine} " ]]; then
     echo "Error: Invalid engine '$engine'"
     echo "Supported engines: ${valid_engines[*]}"
     exit 1
 fi
+
+ echo "[INFO] Using engine: ${engine}"
 
 baseline="${model}-${task}-${algorithm}-${engine}"
 
@@ -180,6 +208,8 @@ elif [ $task == "sudoku" ]; then
     max_response_length=256
     total_epoch=1
 fi
+
+ echo "[INFO] Using engine: ${engine}"
 
 # Set token IDs based on model
 case $model in
@@ -270,11 +300,16 @@ python3 -m verl.trainer.dllm_main_ppo \
     +actor_rollout_ref.actor.cfg_scale=0.0 \
     +actor_rollout_ref.actor.baseline=$baseline \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.name=lmdeploy \
+    actor_rollout_ref.rollout.name=$engine \
     +actor_rollout_ref.rollout.max_new_tokens=$max_response_length \
     +actor_rollout_ref.rollout.use_cache=False \
     +actor_rollout_ref.rollout.dual_cache=False \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    +actor_rollout_ref.rollout.mask_token_id=$mask_token_id \
+    +actor_rollout_ref.rollout.dllm_algorithm=LowConfidence \
+    +actor_rollout_ref.rollout.attention_backend=flashinfer \
+    +actor_rollout_ref.rollout.mem_fraction_static=0.6 \
+    +actor_rollout_ref.rollout.max_running_requests=1 \
     actor_rollout_ref.rollout.n=$n_rollout \
     actor_rollout_ref.rollout.temperature=$train_temperature \
     actor_rollout_ref.rollout.top_k=50 \
@@ -304,8 +339,8 @@ python3 -m verl.trainer.dllm_main_ppo \
     trainer.n_gpus_per_node=$n_gpus_per_node \
     trainer.nnodes=1 \
     trainer.default_local_dir=$ckpt_dir \
-    trainer.save_freq=20 \
-    trainer.test_freq=20 \
+    trainer.save_freq=100 \
+    trainer.test_freq=10 \
     trainer.total_epochs=$total_epoch \
     custom_reward_function.path="verl/utils/reward_score/__init__.py" \
     custom_reward_function.name="dllm_rm" 

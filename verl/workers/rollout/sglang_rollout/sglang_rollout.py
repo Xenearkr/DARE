@@ -31,9 +31,11 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.openai_api.protocol import Tool
+try:
+    from sglang.srt.openai_api.protocol import Tool
+except ImportError:
+    from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import get_ip, get_open_port
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.nn.utils.rnn import pad_sequence
@@ -49,7 +51,8 @@ from verl.tools.schemas import (
 )
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.net_utils import is_ipv6
+# is_ipv6 is now imported from local utils to avoid dependency on verl.utils.net_utils
+# from verl.utils.net_utils import is_ipv6
 from verl.utils.torch_functional import (
     get_response_mask,
     pad_sequence_to_length,
@@ -61,7 +64,7 @@ from verl.workers.rollout.schemas import (
     FinishReasonTypeEnum,
     Message,
 )
-from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
+from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj, get_ip, get_open_port, is_ipv6
 try:
     from sglang.srt.function_call.function_call_parser import FunctionCallParser
 except ImportError:

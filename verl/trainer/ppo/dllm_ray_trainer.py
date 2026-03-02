@@ -389,76 +389,246 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 )
                     
                     elif self.config.algorithm.name == "mdpo":
-                        pass
-                    
-                    else:
-                        NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name}")
+                        # MDPO: compute per-step rewards, step-wise advantages, select top-K steps
+                        with _timer("mdpo_step_rewards", timing_raw):
+                            all_steps_completion_ids = batch.batch["all_steps_completion_ids"]  # (batch_size, steps, response_len)
+                            prompts_ids = batch.batch["prompts"]  # (batch_size, prompt_len)
+                            mdpo_batch_size, num_diffusion_steps, response_len = all_steps_completion_ids.shape
 
-                    if self.use_reference_policy:
-                        # compute reference log_prob
-                        with _timer("ref", timing_raw):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            # Compute reward at each diffusion step
+                            all_step_rewards = []
+                            for t in range(num_diffusion_steps):
+                                t_completion_ids = all_steps_completion_ids[:, t, :]  # (batch_size, response_len)
+                                t_input_ids = torch.cat([prompts_ids, t_completion_ids], dim=1)
+
+                                # Create a temporary batch for reward computation
+                                t_batch = DataProto.from_dict(
+                                    tensors={
+                                        "input_ids": t_input_ids,
+                                        "responses": t_completion_ids,
+                                        "prompts": prompts_ids,
+                                        "attention_mask": batch.batch["attention_mask"],
+                                        "position_ids": batch.batch["position_ids"],
+                                    },
+                                    non_tensor_batch=batch.non_tensor_batch,
+                                )
+                                reward_t, _ = compute_reward(t_batch, self.reward_fn)
+                                step_reward = reward_t.sum(dim=-1)  # (batch_size,)
+                                all_step_rewards.append(step_reward)
+
+                            all_step_rewards_tensor = torch.stack(all_step_rewards, dim=-1)  # (batch_size, steps)
+
+                        with _timer("mdpo_advantages", timing_raw):
+                            # Compute step-wise advantages
+                            num_generations = self.config.actor_rollout_ref.rollout.n
+                            step_advantages = compute_step_wise_advantage(
+                                all_step_rewards_tensor, num_generations
+                            )  # (batch_size, steps)
+
+                            # Select top-K steps for training
+                            sample_train_steps = self.config.actor_rollout_ref.actor.get("sample_train_steps", 16)
+                            top_k_indices = select_top_k_steps(step_advantages, k=sample_train_steps)
+                            print(f"MDPO: selected {len(top_k_indices)} steps for training: {top_k_indices.tolist()}")
+
+                            # Compute final-step reward for standard metrics
+                            reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
+                            batch.batch["token_level_rewards"] = reward_tensor
+
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                            # Log MDPO-specific metrics
+                            metrics["mdpo/mean_step_reward"] = all_step_rewards_tensor.mean().item()
+                            metrics["mdpo/final_step_reward"] = all_step_rewards_tensor[:, -1].mean().item()
+                            metrics["mdpo/mean_advantage"] = step_advantages.mean().item()
+                            metrics["mdpo/num_train_steps"] = len(top_k_indices)
+
+                        # For each selected step, pack data for actor update
+                        with _timer("mdpo_pack_steps", timing_raw):
+                            all_steps_input_ids = batch.batch["all_steps_input_ids"]  # (batch, steps, response_len)
+                            all_confidence = batch.batch["all_confidence"]  # (batch, steps, response_len)
+                            attention_mask = batch.batch["attention_mask"]  # (batch, seq_len)
+
+                            # Get mask_token_id from rollout meta_info (set by MDPO rollout)
+                            mask_token_id = batch.meta_info.get("mask_token_id", None)
+
+                            # Build packed MDPO training data across all selected steps
+                            mdpo_step_input_ids_list = []
+                            mdpo_step_target_ids_list = []
+                            mdpo_advantages_list = []
+                            mdpo_confidence_list = []
+                            mdpo_completion_mask_list = []
+                            mdpo_attention_mask_list = []
+
+                            for step_idx in top_k_indices:
+                                step_idx = step_idx.item()
+                                # Build full input_ids: prompt + corrupted completion at this step
+                                step_input = torch.cat([prompts_ids, all_steps_input_ids[:, step_idx, :]], dim=1)
+                                # Build full target_ids: prompt + denoised completion at this step
+                                step_target = torch.cat([prompts_ids, all_steps_completion_ids[:, step_idx, :]], dim=1)
+                                step_adv = step_advantages[:, step_idx]  # (batch_size,)
+                                step_conf = all_confidence[:, step_idx, :]  # (batch_size, response_len)
+
+                                # Completion mask: where the step input is masked (needs prediction)
+                                if mask_token_id is not None:
+                                    completion_mask = (all_steps_input_ids[:, step_idx, :] == mask_token_id).float()
+                                else:
+                                    # Fallback: use response mask from attention mask
+                                    resp_attn = attention_mask[:, -response_len:]
+                                    completion_mask = resp_attn.float()
+                                # Ensure at least some tokens are masked for meaningful gradient
+                                if completion_mask.sum() == 0:
+                                    completion_mask = attention_mask[:, -response_len:].float()
+
+                                mdpo_step_input_ids_list.append(step_input)
+                                mdpo_step_target_ids_list.append(step_target)
+                                mdpo_advantages_list.append(step_adv)
+                                mdpo_confidence_list.append(step_conf)
+                                mdpo_completion_mask_list.append(completion_mask)
+                                mdpo_attention_mask_list.append(attention_mask)
+
+                            # Concatenate all steps into one big batch
+                            mdpo_step_input_ids = torch.cat(mdpo_step_input_ids_list, dim=0)
+                            mdpo_step_target_ids = torch.cat(mdpo_step_target_ids_list, dim=0)
+                            mdpo_advantages = torch.cat(mdpo_advantages_list, dim=0)
+                            mdpo_confidence = torch.cat(mdpo_confidence_list, dim=0)
+                            mdpo_completion_mask = torch.cat(mdpo_completion_mask_list, dim=0)
+                            mdpo_attention_mask = torch.cat(mdpo_attention_mask_list, dim=0)
+
+                        # Compute old log probs for all packed steps
+                        with _timer("mdpo_old_log_prob", timing_raw):
+                            mdpo_data = DataProto.from_dict(
+                                tensors={
+                                    "mdpo_step_input_ids": mdpo_step_input_ids,
+                                    "mdpo_step_target_ids": mdpo_step_target_ids,
+                                    "attention_mask": mdpo_attention_mask,
+                                    "completion_mask": mdpo_completion_mask,
+                                },
+                            )
+                            mdpo_data.meta_info["micro_batch_size"] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                            mdpo_data.meta_info["max_token_len"] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+                            mdpo_data.meta_info["use_dynamic_bsz"] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+                            mdpo_data.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+                            old_log_prob_output = self.actor_rollout_wg.compute_log_prob(mdpo_data)
+                            old_per_token_logps = old_log_prob_output.batch["old_log_probs"]
+
+                        # Build the final batch for actor update
+                        # Repeat non_tensor_batch to match the concatenated step dimension
+                        num_repeats = len(top_k_indices)
+                        mdpo_non_tensor_batch = {}
+                        for k, v in batch.non_tensor_batch.items():
+                            if isinstance(v, np.ndarray):
+                                mdpo_non_tensor_batch[k] = np.repeat(v, num_repeats, axis=0)
+                            elif isinstance(v, list):
+                                mdpo_non_tensor_batch[k] = v * num_repeats
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                                mdpo_non_tensor_batch[k] = v
 
-                    # compute values
-                    if self.use_critic:
-                        with _timer("values", timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with _timer("adv", timing_raw):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        print(f"{list(reward_extra_infos_dict.keys())=}")
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages, executed on the driver process
-
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            use_pf_ppo=self.config.algorithm.use_pf_ppo,
-                            pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
-                            pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
+                        batch = DataProto.from_dict(
+                            tensors={
+                                "mdpo_step_input_ids": mdpo_step_input_ids,
+                                "mdpo_step_target_ids": mdpo_step_target_ids,
+                                "attention_mask": mdpo_attention_mask,
+                                "completion_mask": mdpo_completion_mask,
+                                "advantages": mdpo_advantages,
+                                "confidence": mdpo_confidence,
+                                "old_per_token_logps": old_per_token_logps,
+                                # Keep these for metrics/logging
+                                "prompts": prompts_ids.repeat(num_repeats, 1),
+                                "responses": all_steps_completion_ids[:, -1, :].repeat(num_repeats, 1),
+                                "token_level_scores": reward_tensor.repeat(num_repeats, 1),
+                                "token_level_rewards": reward_tensor.repeat(num_repeats, 1),
+                            },
+                            non_tensor_batch=mdpo_non_tensor_batch,
                         )
+                        batch.batch["response_mask"] = mdpo_completion_mask
+                        # Set global_token_num for throughput metrics
+                        batch.meta_info["global_token_num"] = torch.sum(mdpo_attention_mask, dim=-1).tolist()
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer("update_critic", timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                        # Skip standard forward_process, compute_log_prob, compute_advantage
+                        # Go directly to actor update
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            with _timer("update_actor", timing_raw):
+                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer("update_actor", timing_raw):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                    else:
+                        raise NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name}")
+
+                    if self.config.algorithm.name != "mdpo":
+                        # Standard flow for non-MDPO algorithms
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with _timer("ref", timing_raw):
+                                if not self.ref_in_actor:
+                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                else:
+                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+
+                        # compute values
+                        if self.use_critic:
+                            with _timer("values", timing_raw):
+                                values = self.critic_wg.compute_values(batch)
+                                batch = batch.union(values)
+
+                        with _timer("adv", timing_raw):
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
+
+                            print(f"{list(reward_extra_infos_dict.keys())=}")
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            # compute advantages, executed on the driver process
+
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                use_pf_ppo=self.config.algorithm.use_pf_ppo,
+                                pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
+                                pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
+                            )
+
+                        # update critic
+                        if self.use_critic:
+                            with _timer("update_critic", timing_raw):
+                                critic_output = self.critic_wg.update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+
+                        # implement critic warmup
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            # update actor
+                            with _timer("update_actor", timing_raw):
+                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -496,7 +666,8 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if self.config.algorithm.name != "mdpo":
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

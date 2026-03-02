@@ -365,14 +365,20 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
 
             elif self.config.model.name == 'dream':
                 if not use_cache:
-                    from verl.workers.rollout.dream_rollout import DLLMRollout
+                    if self.config.algorithm.name == "cj-grpo":
+                        from verl.workers.rollout.cj_dream_rollout import DLLMRollout
+                    else:
+                        from verl.workers.rollout.dream_rollout import DLLMRollout
                     from verl.workers.sharding_manager.base import BaseShardingManager
 
                     rollout = DLLMRollout(module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer)
                     rollout_sharding_manager = BaseShardingManager()
                     # TODO: a sharding manager that do nothing?
                 else:
-                    from verl.workers.rollout.fast_dream_rollout import FASTDLLMRollout
+                    if self.config.algorithm.name == "cj-grpo":
+                        from verl.workers.rollout.fast_cj_dream_rollout import FASTDLLMRollout
+                    else:
+                        from verl.workers.rollout.fast_dream_rollout import FASTDLLMRollout
                     from verl.workers.sharding_manager.base import BaseShardingManager
 
                     rollout = FASTDLLMRollout(module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer)
@@ -495,6 +501,35 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
+        elif rollout_name == "sglang" and self.config.model.name == 'sdar':
+            from verl.workers.rollout.sglang_rollout.sglang_sdar_rollout import SGLangSDARRollout
+            from verl.workers.sharding_manager.fsdp_sglang_sdar import FSDPSGLangSDARShardingManager
+
+            log_gpu_memory_usage(f"Before building {rollout_name} rollout for SDAR", logger=logger)
+            local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get('use_shm', False))
+            print(f"Initializing SGLang engine for SDAR with model_path={local_path}")
+
+            rollout = SGLangSDARRollout(
+                actor_module=local_path,
+                config=self.config.rollout,
+                tokenizer=self.tokenizer,
+                model_hf_config=self.actor_model_config,
+                trust_remote_code=trust_remote_code,
+                device_mesh=rollout_device_mesh,
+            )
+
+            log_gpu_memory_usage(f"After building {rollout_name} rollout for SDAR", logger=logger)
+
+            rollout_sharding_manager = FSDPSGLangSDARShardingManager(
+                module=self.actor_module_fsdp,
+                inference_engine=None,  # SGLang handles weight sync internally via update_weights
+                model_config=self.actor_model_config,
+                full_params="hf" in self.config.rollout.load_format,
+                device_mesh=rollout_device_mesh,
+                offload_param=self._is_offload_param,
+            )
+            log_gpu_memory_usage("After building SDAR sharding manager", logger=logger)
+
         return rollout, rollout_sharding_manager
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -514,7 +549,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_vrpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
-            
+
         elif self.config.model.name == 'dream':
             if self.config.algorithm.name == 'spg':
                 from verl.workers.actor.dream_dp_actor_spg import DLLMDataParallelPPOActor
@@ -530,7 +565,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.dream_dp_actor_vrpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
-            
+
         elif self.config.model.name == 'sdar':
             if self.config.algorithm.name == 'bgpo':
                 from verl.workers.actor.sdar_dp_actor_bgpo import DLLMDataParallelPPOActor

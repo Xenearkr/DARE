@@ -12,5 +12,6 @@
 # See the License for the specific language governing permissions and
 
 from .sglang_rollout import SGLangRollout
+from .sglang_sdar_rollout import SGLangSDARRollout
 
-__all__ = ["SGLangRollout"]
+__all__ = ["SGLangRollout", "SGLangSDARRollout"]
