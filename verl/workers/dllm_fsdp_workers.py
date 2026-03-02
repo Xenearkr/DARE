@@ -430,7 +430,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
-        elif rollout_name in ["sglang", "sglang_async"]:    # !!! We have not yet adapted dLLM to sglang !!!
+        elif rollout_name in ["sglang", "sglang_async"]:
             if rollout_name == "sglang_async":
                 warnings.warn(
                     "'sglang_async' has been deprecated and merged into 'sglang'. "
