@@ -342,7 +342,12 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         use_cache = self.config.rollout.use_cache
         if rollout_name == "hf":
             if self.config.model.name == 'llada':
-                if not use_cache:
+                if self.config.algorithm.name == "mdpo":
+                    from verl.workers.rollout.mdpo_llada_rollout import MDPORollout
+                    from verl.workers.sharding_manager.base import BaseShardingManager
+                    rollout = MDPORollout(module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer)
+                    rollout_sharding_manager = BaseShardingManager()
+                elif not use_cache:
                     if self.config.algorithm.name == "cj-grpo":
                         from verl.workers.rollout.cj_llada_rollout import DLLMRollout
                     else:
@@ -364,7 +369,12 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                     # TODO: a sharding manager that do nothing?
 
             elif self.config.model.name == 'dream':
-                if not use_cache:
+                if self.config.algorithm.name == "mdpo":
+                    from verl.workers.rollout.mdpo_dream_rollout import MDPORollout
+                    from verl.workers.sharding_manager.base import BaseShardingManager
+                    rollout = MDPORollout(module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer)
+                    rollout_sharding_manager = BaseShardingManager()
+                elif not use_cache:
                     if self.config.algorithm.name == "cj-grpo":
                         from verl.workers.rollout.cj_dream_rollout import DLLMRollout
                     else:
@@ -547,6 +557,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_d1 import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'vrpo':
                 from verl.workers.actor.llada_dp_actor_vrpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'mdpo':
+                from verl.workers.actor.llada_dp_actor_mdpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 
@@ -563,6 +575,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.dream_dp_actor_d1 import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'vrpo':
                 from verl.workers.actor.dream_dp_actor_vrpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'mdpo':
+                from verl.workers.actor.dream_dp_actor_mdpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 
@@ -862,8 +876,10 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 mask_indices = torch.stack(all_mask_indices, dim=0)  # (batch_size, num_iterations,  mc_num, seq_len)
                 p_mask = torch.stack(all_p_mask, dim=0)  # (batch_size, num_iterations, mc_num, seq_len)
         
+        elif self.config.algorithm.name == "mdpo":
+            raise RuntimeError("MDPO does not use forward_process. The diffusion trajectory is collected during rollout.")
         else:
-            NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name} for forward process in DLLMActorRolloutRefWorker")
+            raise NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name} for forward process in DLLMActorRolloutRefWorker")
         batch = TensorDict(
             {
                 "prompts": idx_repeat,

@@ -1,8 +1,10 @@
+import numpy as np
 from verl.trainer.ppo.ray_trainer import *
 from verl.trainer.ppo.ray_trainer import _timer
 from verl.trainer.ppo.dllm_metric_utils import (
     process_validation_metrics,
 )
+from verl.trainer.ppo.mdpo_algos import compute_step_wise_advantage, select_top_k_steps
 
 
 class DLLMRayPPOTrainer(RayPPOTrainer):
@@ -356,7 +358,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                         with _timer("old_log_prob", timing_raw):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch["old_entropys"]
-                            response_masks = batch.batch["reversed_traj_unmask_positions"]
+                            response_masks = batch.batch["reversed_traj_unmask_positions"][:, :, -entropys.shape[-1]:]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                             entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                             old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
@@ -387,7 +389,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                         "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                     }
                                 )
-                    
+
                     elif self.config.algorithm.name == "mdpo":
                         # MDPO: compute per-step rewards, step-wise advantages, select top-K steps
                         with _timer("mdpo_step_rewards", timing_raw):
@@ -410,7 +412,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                         "attention_mask": batch.batch["attention_mask"],
                                         "position_ids": batch.batch["position_ids"],
                                     },
-                                    non_tensor_batch=batch.non_tensor_batch,
+                                    non_tensors=batch.non_tensor_batch,
                                 )
                                 reward_t, _ = compute_reward(t_batch, self.reward_fn)
                                 step_reward = reward_t.sum(dim=-1)  # (batch_size,)
@@ -430,7 +432,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             top_k_indices = select_top_k_steps(step_advantages, k=sample_train_steps)
                             print(f"MDPO: selected {len(top_k_indices)} steps for training: {top_k_indices.tolist()}")
 
-                            # Compute final-step reward for standard metrics
+                            # Also compute final-step reward for standard metrics
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
                                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
@@ -441,19 +443,19 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                             # Log MDPO-specific metrics
-                            metrics["mdpo/mean_step_reward"] = all_step_rewards_tensor.mean().item()
-                            metrics["mdpo/final_step_reward"] = all_step_rewards_tensor[:, -1].mean().item()
-                            metrics["mdpo/mean_advantage"] = step_advantages.mean().item()
-                            metrics["mdpo/num_train_steps"] = len(top_k_indices)
+                            mdpo_metrics = {
+                                "mdpo_mean_step_reward": all_step_rewards_tensor.mean().item(),
+                                "mdpo_final_step_reward": all_step_rewards_tensor[:, -1].mean().item(),
+                                "mdpo_mean_advantage": step_advantages.mean().item(),
+                                "mdpo_num_train_steps": len(top_k_indices),
+                            }
+                            metrics.update(mdpo_metrics)
 
                         # For each selected step, pack data for actor update
                         with _timer("mdpo_pack_steps", timing_raw):
                             all_steps_input_ids = batch.batch["all_steps_input_ids"]  # (batch, steps, response_len)
                             all_confidence = batch.batch["all_confidence"]  # (batch, steps, response_len)
                             attention_mask = batch.batch["attention_mask"]  # (batch, seq_len)
-
-                            # Get mask_token_id from rollout meta_info (set by MDPO rollout)
-                            mask_token_id = batch.meta_info.get("mask_token_id", None)
 
                             # Build packed MDPO training data across all selected steps
                             mdpo_step_input_ids_list = []
@@ -473,12 +475,13 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 step_conf = all_confidence[:, step_idx, :]  # (batch_size, response_len)
 
                                 # Completion mask: where the step input is masked (needs prediction)
-                                if mask_token_id is not None:
-                                    completion_mask = (all_steps_input_ids[:, step_idx, :] == mask_token_id).float()
-                                else:
-                                    # Fallback: use response mask from attention mask
+                                mask_token_id = self.tokenizer.convert_tokens_to_ids("[MASK]") if hasattr(self.tokenizer, 'convert_tokens_to_ids') else None
+                                if mask_token_id is None:
+                                    # Use response mask from attention mask
                                     resp_attn = attention_mask[:, -response_len:]
                                     completion_mask = resp_attn.float()
+                                else:
+                                    completion_mask = (all_steps_input_ids[:, step_idx, :] == mask_token_id).float()
                                 # Ensure at least some tokens are masked for meaningful gradient
                                 if completion_mask.sum() == 0:
                                     completion_mask = attention_mask[:, -response_len:].float()
@@ -516,51 +519,73 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             old_log_prob_output = self.actor_rollout_wg.compute_log_prob(mdpo_data)
                             old_per_token_logps = old_log_prob_output.batch["old_log_probs"]
 
-                        # Build the final batch for actor update
-                        # Repeat non_tensor_batch to match the concatenated step dimension
-                        num_repeats = len(top_k_indices)
-                        mdpo_non_tensor_batch = {}
-                        for k, v in batch.non_tensor_batch.items():
-                            if isinstance(v, np.ndarray):
-                                mdpo_non_tensor_batch[k] = np.repeat(v, num_repeats, axis=0)
-                            elif isinstance(v, list):
-                                mdpo_non_tensor_batch[k] = v * num_repeats
-                            else:
-                                mdpo_non_tensor_batch[k] = v
+                        # Build the final batch for actor update by updating the existing batch
+                        # This preserves the existing meta_info from line 228
 
-                        batch = DataProto.from_dict(
-                            tensors={
-                                "mdpo_step_input_ids": mdpo_step_input_ids,
-                                "mdpo_step_target_ids": mdpo_step_target_ids,
-                                "attention_mask": mdpo_attention_mask,
-                                "completion_mask": mdpo_completion_mask,
-                                "advantages": mdpo_advantages,
-                                "confidence": mdpo_confidence,
-                                "old_per_token_logps": old_per_token_logps,
-                                # Keep these for metrics/logging
-                                "prompts": prompts_ids.repeat(num_repeats, 1),
-                                "responses": all_steps_completion_ids[:, -1, :].repeat(num_repeats, 1),
-                                "token_level_scores": reward_tensor.repeat(num_repeats, 1),
-                                "token_level_rewards": reward_tensor.repeat(num_repeats, 1),
-                            },
-                            non_tensor_batch=mdpo_non_tensor_batch,
-                        )
-                        batch.batch["response_mask"] = mdpo_completion_mask
-                        # Set global_token_num for throughput metrics
+                        # For MDPO, compute returns from final step rewards for metrics
+                        # MDPO doesn't use standard returns, but compute_data_metrics expects this key
+                        final_rewards = all_step_rewards_tensor[:, -1]  # (batch_size,)
+                        # Expand final_rewards to match top-K repeated batch size
+                        final_rewards_expanded = final_rewards.repeat(len(top_k_indices))  # (batch_size * k,)
+
+                        # For MDPO, advantages are per-sample scalars.
+                        # Expand to per-token advantages with dim=1 = response_length (not seq_len!)
+                        # This matches standard algorithms where advantages shape is (batch_size, response_length)
+                        response_length = mdpo_completion_mask.size(-1)  # Length of response portion only
+
+                        # Expand advantages and returns to (batch_size, response_length)
+                        # Both need to be 2D for compatibility with metrics and response_mask
+                        mdpo_advantages_expanded = mdpo_advantages.unsqueeze(-1).expand(-1, response_length)
+                        mdpo_returns_expanded = final_rewards_expanded.unsqueeze(-1).expand(-1, response_length)
+
+                        # Create new tensor dict for MDPO
+                        mdpo_tensors = {
+                            "mdpo_step_input_ids": mdpo_step_input_ids,
+                            "mdpo_step_target_ids": mdpo_step_target_ids,
+                            "attention_mask": mdpo_attention_mask,
+                            "completion_mask": mdpo_completion_mask,
+                            "response_mask": mdpo_completion_mask,
+                            "advantages": mdpo_advantages_expanded,  # (batch_size, response_length)
+                            "returns": mdpo_returns_expanded,  # (batch_size, response_length)
+                            "confidence": mdpo_confidence,
+                            "old_per_token_logps": old_per_token_logps,
+                            # Keep these for metrics computation
+                            "prompts": prompts_ids.repeat(len(top_k_indices), 1),
+                            "responses": all_steps_completion_ids[:, -1, :].repeat(len(top_k_indices), 1),
+                            "token_level_scores": reward_tensor.repeat(len(top_k_indices), 1),
+                            "token_level_rewards": reward_tensor.repeat(len(top_k_indices), 1),
+                        }
+
+                        # Replace the batch tensors (keeps existing meta_info!)
+                        from tensordict import TensorDict
+                        new_batch_size = mdpo_step_input_ids.shape[0]
+                        batch.batch = TensorDict(source=mdpo_tensors, batch_size=(new_batch_size,), device=mdpo_step_input_ids.device)
+
+                        # Expand non_tensor_batch to match the repeated batch size
+                        if batch.non_tensor_batch is not None:
+                            for key, val in batch.non_tensor_batch.items():
+                                if isinstance(val, np.ndarray):
+                                    # Repeat array along batch dimension to match new batch size
+                                    batch.non_tensor_batch[key] = np.repeat(val, len(top_k_indices), axis=0)
+
+                        # Update only the meta_info keys that are different for MDPO
                         batch.meta_info["global_token_num"] = torch.sum(mdpo_attention_mask, dim=-1).tolist()
+                        batch.meta_info["micro_batch_size"] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                        batch.meta_info["max_token_len"] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+                        batch.meta_info["use_dynamic_bsz"] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+                        batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                        batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                         # Skip standard forward_process, compute_log_prob, compute_advantage
                         # Go directly to actor update
                         if self.config.trainer.critic_warmup <= self.global_steps:
                             with _timer("update_actor", timing_raw):
-                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                             metrics.update(actor_output_metrics)
 
                     else:
-                        raise NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name}")
+                        NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name}")
 
                     if self.config.algorithm.name != "mdpo":
                         # Standard flow for non-MDPO algorithms
@@ -666,8 +691,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                     }
                 )
                 # collect metrics
-                if self.config.algorithm.name != "mdpo":
-                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
