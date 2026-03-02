@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
+- [2026-03-02]: Support SGLang for SDAR rl rollout.
 - [2026-02-28]: Several errors/bugs/updates for LLaDA/Dream sequence parallel have been fixed/adapted.
 - [2026-02-27]: Support evaluation of SDAR with SGLang.
 - [2026-02-26]: Update llada cj-grpo and add dream cj-grpo.
