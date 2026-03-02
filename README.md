@@ -41,10 +41,11 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
+- [2026-03-03]: Support MDPO for LLaDA/Dream.
 - [2026-03-02]: Support SGLang for SDAR rl rollout.
 - [2026-02-28]: Several errors/bugs/updates for LLaDA/Dream sequence parallel have been fixed/adapted.
 - [2026-02-27]: Support evaluation of SDAR with SGLang.
-- [2026-02-26]: Update llada cj-grpo and add dream cj-grpo.
+- [2026-02-26]: Update LLaDA cj-grpo and add Dream cj-grpo.
 - [2025-12-28]: Several errors/bugs/updates in dp_actor_algorithm have been fixed/adapted.
 - [2025-12-24]: Support online rl (online weight update of rollout) for SDAR.
 - [2025-12-23]: Support vrpo (preference optimization) for Dream.
@@ -83,9 +84,8 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
   - Support flash_attn_varlen backend
   - Support flash_attn_with_kvcache backend
 - **Model Diversity**
-  - dLLM that trained from scratch (e.g., LLaDA)
-  - dLLM that continuous trained from AR, i.e., AR-to-Diffusion (e.g., Dream, SDAR)
-  - Masked diffusion language models (e.g., LLaDA/Dream), block diffusion language model (e.g., SDAR/LLaDA2.0)
+  - Masked diffusion language models (e.g., LLaDA/Dream)
+  - Block diffusion language model (e.g., SDAR/LLaDA2.0)
 - **Comprehensive Evaluation for dLLMs**
   - Integrate faster dLLM evaluation in [opencompass](https://github.com/open-compass/opencompass)
 - **Upcoming Features**
@@ -289,7 +289,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **d1** | [2504.12216](https://arxiv.org/pdf/2504.12216) | [dllm-reasoning/d1](https://github.com/dllm-reasoning/d1) |
 | **vrpo** | [2505.19223](https://arxiv.org/abs/2505.19223) | [ML-GSAI/LLaDA-1.5](https://github.com/ML-GSAI/LLaDA-1.5) (closed source) |
 | **coupled-grpo** | [2506.20639](https://arxiv.org/pdf/2506.20639) | [apple/ml-diffucoder](https://github.com/apple/ml-diffucoder) |
-| **mdpo** (todo) | [2508.13148](https://arxiv.org/pdf/2508.13148) | [autonomousvision/mdpo](https://github.com/autonomousvision/mdpo) |
+| **mdpo** | [2508.13148](https://arxiv.org/pdf/2508.13148) | [autonomousvision/mdpo](https://github.com/autonomousvision/mdpo) |
 | **cj-grpo** | [2509.23924](https://arxiv.org/pdf/2509.23924) | [yjyddq/EOSER-ASS-RL](https://github.com/yjyddq/EOSER-ASS-RL) |
 | **spg** | [2510.09541](https://arxiv.org/pdf/2510.09541) | [facebookresearch/SPG](https://github.com/facebookresearch/SPG) |
 | **bgpo** | [2510.11683](https://arxiv.org/pdf/2510.11683) | [THU-KEG/BGPO](https://github.com/THU-KEG/BGPO) |
