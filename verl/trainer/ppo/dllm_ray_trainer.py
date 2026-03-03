@@ -444,10 +444,10 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
 
                             # Log MDPO-specific metrics
                             mdpo_metrics = {
-                                "mdpo_mean_step_reward": all_step_rewards_tensor.mean().item(),
-                                "mdpo_final_step_reward": all_step_rewards_tensor[:, -1].mean().item(),
-                                "mdpo_mean_advantage": step_advantages.mean().item(),
-                                "mdpo_num_train_steps": len(top_k_indices),
+                                "mdpo/mean_step_reward": all_step_rewards_tensor.mean().item(),
+                                "mdpo/final_step_reward": all_step_rewards_tensor[:, -1].mean().item(),
+                                "mdpo/mean_advantage": step_advantages.mean().item(),
+                                "mdpo/num_train_steps": len(top_k_indices),
                             }
                             metrics.update(mdpo_metrics)
 
