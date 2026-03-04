@@ -314,6 +314,30 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **HumanEval** | 46.34 | 43.29 | 78.05 | 79.88 | 75.61 | 75.00 |
 | **MBPP** | 38.80 | 20.00 | 56.40 | 66.20 | 67.32 | 71.60 |
 
+**Algorithm Comparison (Same Block Decoding Strategy)**
+
+| Bench\Algo | Baseline (LLaDA-8B-Instruct) | d1 | Coupled-GRPO | VRPO | CJ-GRPO | SPG | BGPO |
+|------------|----------|-----|-------------|------|---------|-----|-----|
+|           |      | **Mathematics** |      |      |         |     |    |
+| **GSM8k** | 76.5 | 83.7 | 85.3 | 81.9 | 85.6 | 83.5 | 82.3 |
+| **MATH** | 34.6 | 40.6 | 41.0 | 35.8 | 39.2 | 40.6 | 40.0 |
+|           |      | **Coding** |      |      |         |     |    |
+| **HumanEval** | 46.9 | 47.6 | 45.1 | 52.4 | 45.1 | 48.8 | 45.1 |
+| **MBPP** | 37.9 | 39.1 | 38.1 | 42.8 | 40.9 | 41.9 | 40.3 |
+|           |      | **Planning** |      |      |         |     |    |
+| **Countdown** | 16.8 | 10.7 | 77.9 | 21.5 | 41.1 | 10.1 | 10.0 |
+| **Sudoku** | 26.2 | 31.8 | 21.3 | 29.0 | 25.0 | 27.9 | 42.6 |
+
+
+| Bench\Algo | Baseline (Dream-7B-Instruct) | d1 | Coupled-GRPO | CJ-GRPO | SPG | BGPO |
+|------------|----------|-----|-------------|---------|-----|-----|
+|           |      | **Mathematics** |      |      |        |     |
+| **GSM8k** | 77.2 | 82.5 | 80.3 | 85.7 | 59.4 | 83.9 |
+| **MATH** | 39.6 | 49.7 | 40.4 | 50.7 | 25.2 | 48.9 |
+|           |      | **Coding** |      |         |      |      |
+| **HumanEval** | 57.9 | 60.7 | 61.6 | 58.5 | 17.7 | 56.7 |
+| **MBPP** | 56.2 | 56.5 | 60.3 | 57.5 | 54.4 | 58.7 |
+
 
 ## 📧 Contact
 
