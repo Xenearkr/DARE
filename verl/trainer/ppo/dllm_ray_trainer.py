@@ -421,10 +421,12 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             all_step_rewards_tensor = torch.stack(all_step_rewards, dim=-1)  # (batch_size, steps)
 
                         with _timer("mdpo_advantages", timing_raw):
-                            # Compute step-wise advantages
-                            num_generations = self.config.actor_rollout_ref.rollout.n
+                            # Compute step-wise advantages (GRPO normalization via UID grouping)
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
                             step_advantages = compute_step_wise_advantage(
-                                all_step_rewards_tensor, num_generations
+                                all_step_rewards_tensor,
+                                index=batch.non_tensor_batch["uid"],
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             )  # (batch_size, steps)
 
                             # Select top-K steps for training
@@ -475,16 +477,8 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 step_conf = all_confidence[:, step_idx, :]  # (batch_size, response_len)
 
                                 # Completion mask: where the step input is masked (needs prediction)
-                                mask_token_id = self.tokenizer.convert_tokens_to_ids("[MASK]") if hasattr(self.tokenizer, 'convert_tokens_to_ids') else None
-                                if mask_token_id is None:
-                                    # Use response mask from attention mask
-                                    resp_attn = attention_mask[:, -response_len:]
-                                    completion_mask = resp_attn.float()
-                                else:
-                                    completion_mask = (all_steps_input_ids[:, step_idx, :] == mask_token_id).float()
-                                # Ensure at least some tokens are masked for meaningful gradient
-                                if completion_mask.sum() == 0:
-                                    completion_mask = attention_mask[:, -response_len:].float()
+                                mask_token_id = batch.meta_info["mask_token_id"]
+                                completion_mask = (all_steps_input_ids[:, step_idx, :] == mask_token_id).float()
 
                                 mdpo_step_input_ids_list.append(step_input)
                                 mdpo_step_target_ids_list.append(step_target)

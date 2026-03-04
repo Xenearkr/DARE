@@ -16,6 +16,9 @@
 MDPO (Masked Diffusion Policy Optimization) algorithm functions.
 """
 
+from collections import defaultdict
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -87,13 +90,21 @@ def compute_mdpo_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl
 
 
-def compute_step_wise_advantage(all_step_rewards, num_generations):
+def compute_step_wise_advantage(
+    all_step_rewards: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+):
     """
-    Compute step-wise advantages from per-step rewards following MDPO paper (adv-v3 + adv-v4).
+    Compute step-wise advantages from per-step rewards following MDPO paper (adv-v3 + adv-v4),
+    with GRPO normalization using UID-based grouping (consistent with core_algos.compute_grpo_outcome_advantage).
 
     Args:
         all_step_rewards (Tensor): (batch_size, diffusion_steps) Rewards at each diffusion step.
-        num_generations (int): Number of generations per prompt (for GRPO normalization).
+        index (np.ndarray): (batch_size,) UID array for grouping generations of the same prompt.
+        epsilon (float): Small constant for numerical stability.
+        norm_adv_by_std_in_grpo (bool): Whether to normalize by std (True=GRPO, False=Dr.GRPO).
 
     Returns:
         Tensor: (batch_size, diffusion_steps) Step-wise advantages, GRPO-normalized.
@@ -110,7 +121,6 @@ def compute_step_wise_advantage(all_step_rewards, num_generations):
     # adv-v4: add cumulative future rewards
     if steps > 1:
         future_rewards = all_step_rewards[:, 1:]  # (batch_size, steps-1)
-        # Cumulative future reward: average of remaining rewards from each step
         flipped = future_rewards.flip(-1)
         cumsum = flipped.cumsum(-1)
         denom = torch.arange(1, steps, device=device).float()
@@ -119,18 +129,33 @@ def compute_step_wise_advantage(all_step_rewards, num_generations):
     else:
         cumulative = all_step_rewards
 
-    advantages = reward_diffs + cumulative
+    scores = reward_diffs + cumulative  # (batch_size, steps)
 
-    # GRPO normalization across generations
-    if num_generations > 1 and batch_size >= num_generations:
-        num_groups = batch_size // num_generations
-        grouped = advantages.view(num_groups, num_generations, steps)
-        mean = grouped.mean(dim=1, keepdim=True)
-        std = grouped.std(dim=1, keepdim=True)
-        grouped = (grouped - mean) / (std + 1e-4)
-        advantages = grouped.view(batch_size, steps)
+    # GRPO normalization using UID-based grouping
+    with torch.no_grad():
+        id2scores = defaultdict(list)
+        id2mean = {}
+        id2std = {}
 
-    return advantages
+        for i in range(batch_size):
+            id2scores[index[i]].append(scores[i])  # each is (steps,)
+
+        for uid in id2scores:
+            stacked = torch.stack(id2scores[uid])  # (num_gen, steps)
+            if len(id2scores[uid]) == 1:
+                id2mean[uid] = torch.zeros(steps, device=device)
+                id2std[uid] = torch.ones(steps, device=device)
+            else:
+                id2mean[uid] = stacked.mean(dim=0)  # (steps,)
+                id2std[uid] = stacked.std(dim=0)     # (steps,)
+
+        for i in range(batch_size):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+
+    return scores
 
 
 def select_top_k_steps(advantages, k):
