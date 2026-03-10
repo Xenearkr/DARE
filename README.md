@@ -41,20 +41,22 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
-- [2026-03-03]: Support mdpo for LLaDA/Dream.
+- [2026-03-10]: Support evaluation of SDAR-30B-A3B-Chat with SGLang and lmdeploy.
+- [2026-03-09]: Support evaluation of LLaDA2.1-mini with SGLang.
+- [2026-03-03]: Support mdpo for LLaDA and Dream.
 - [2026-03-02]: Support SGLang for SDAR rl rollout.
-- [2026-02-28]: Several errors/bugs/updates for LLaDA/Dream sequence parallel have been fixed/adapted.
+- [2026-02-28]: Several errors/bugs/updates for LLaDA and Dream sequence parallel have been fixed/adapted.
 - [2026-02-27]: Support evaluation of SDAR with SGLang.
 - [2026-02-26]: Update LLaDA cj-grpo and add Dream cj-grpo.
 - [2025-12-28]: Several errors/bugs/updates in dp_actor_algorithm have been fixed/adapted.
 - [2025-12-24]: Support online rl (online weight update of rollout) for SDAR.
 - [2025-12-23]: Support vrpo (preference optimization) for Dream.
 - [2025-12-16]: Support vrpo (preference optimization) for LLaDA.
-- [2025-12-12]: Support sft/peft of SDAR.
+- [2025-12-12]: Support sft and peft of SDAR.
 - [2025-12-11]: Support evaluation of LLaDAMoE and LLaDA2.0-mini with SGLang.
 - [2025-12-08]: Support coupled-grpo, cj-grpo and spg algorithm.
 - [2025-12-03]: Support sequence parallel to enable longer generation ability for dLLMs.
-- [2025-12-01]: We initialize the codebase of DARE (dLLM Alignment and Reinforcement Executor), including faster sft/peft/rl (d1, bgpo) training (LLaDA/Dream) and evaluation (LLaDA/Dream/SDAR).
+- [2025-12-01]: We initialize the codebase of DARE (dLLM Alignment and Reinforcement Executor), including training (sft, peft, and rl) and faster evaluation.
 
 
 ## 🔍 Catalogue
@@ -78,18 +80,16 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
   - Block cache ([Fast-dLLM](https://github.com/NVlabs/Fast-dLLM)) for LLaDAs and Dreams 2.2x faster rollout
   - Inference engine ([lmdeploy](https://github.com/InternLM/lmdeploy), [sglang](https://github.com/sgl-project/sglang)) for SDARs 2-4× faster rollout
 - **Parallelism for dLLMs**
-  - Support sequence parallel
+  - Support sequence parallel for LLaDA and Dream
 - **Attention Backend**
-  - Support flash_attn backend
-  - Support flash_attn_varlen backend
-  - Support flash_attn_with_kvcache backend
+  - Support flash_attn, flash_attn_varlen, and flash_attn_with_kvcache backend for LLaDA
 - **Model Diversity**
-  - Masked diffusion language models (e.g., LLaDA/Dream)
-  - Block diffusion language model (e.g., SDAR/LLaDA2.0)
+  - Masked diffusion language models (e.g., LLaDA and Dream)
+  - Block diffusion language model (e.g., SDAR and LLaDA2.0)
 - **Comprehensive Evaluation for dLLMs**
   - Integrate faster dLLM evaluation in [opencompass](https://github.com/open-compass/opencompass)
 - **Upcoming Features**
-  - Support MoE, Multi-Modal, Omni, etc.
+  - Support Multi-Modal, Omni, etc.
 
 
 ## 🛠️ Installation and Setup
@@ -280,6 +280,8 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **SDAR-1.7B-Chat** | 1.7B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
 | **SDAR-4B-Chat** | 4B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
 | **SDAR-8B-Chat** | 8B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
+| **LLaDA2.0-mini** | 16BA1B | sft | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
+| **LLaDA2.1-mini** | 16BA1B | sft | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
 
 
 ## 🌱 Supported RL Algorithms
@@ -299,20 +301,20 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 
 **Evaluation Result Reproduction**
 
-| Bench/Model | LLaDA-8B | LLaDA-8B + Fast-dLLM | Dream-7B | SDAR-8B | SDAR-8B + lmdeploy | SDAR-8B + SGLang |
-|-------|------------|------------------------|-------|------------|--------------------|----------------|
-| **MMLU** | 65.24 | 65.17 | 66.83 | 76.66 | 73.66 | 77.23 |
-| **MMLU-Pro** | 36.82 | 34.58 | 31.89 | 56.49 | 47.39 | 55.38 |
-| **Hellaswag** | 75.30 | 74.41 | 63.23 | 84.07 | 87.59 | 81.78 |
-| **ARC-C** | 87.80 | 87.80 | 81.36 | 75.59 | 86.78 | 76.95 |
-| **GSM8k** | 79.68 | 78.39 | 83.24 | 91.36 | 91.21 | 90.83 |
-| **MATH** | 41.08 | 40.58 | 48.02 | 78.40 | 61.80 | 77.00 |
-| **GPQA** | 30.81 | 31.82 | 26.77 | 33.33 | 41.40 | 29.80 |
-| **AIME24** | 0.83 | 2.08 | 0.83 | 8.75 | 6.67 | 13.33 |
-| **AIME25** | 0.42 | 0.00 | 0.00 | 12.50 | 6.67 | 16.67 |
-| **Olympiad** | 8.95 | 9.70 | 12.22 | 24.93 | 17.35 | 23.88 |
-| **HumanEval** | 46.34 | 43.29 | 78.05 | 79.88 | 75.61 | 75.00 |
-| **MBPP** | 38.80 | 20.00 | 56.40 | 66.20 | 67.32 | 71.60 |
+|   Bench/Model   | LLaDA-8B | Dream-7B | SDAR-8B-Chat | SDAR-30B-A3B | LLaDA2.0-mini | LLaDA2.1-mini |
+|-----------------|----------|----------|--------------|--------------|---------------|---------------|
+|     **MMLU**    | 65.24 | 66.83 | 77.23 |  | 72.54 | 69.91 |
+|   **MMLU-Pro**  | 36.82 | 31.89 | 56.49 |  | 57.10 | 57.52 |
+|  **Hellaswag**  | 75.30 | 63.23 | 87.59 |  | 82.35 | 78.00 |
+|    **ARC-C**    | 87.80 | 81.36 | 86.78 |  | 85.76 | 83.39 |
+|    **GSM8k**    | 79.68 | 83.24 | 91.36 |  | 88.48 | 86.13 |
+|     **MATH**    | 41.08 | 48.02 | 78.40 |  | 81.50 | 84.56 |
+|     **GPQA**    | 31.82 | 26.77 | 41.40 |  | 34.34 | 34.34 |
+|    **AIME24**   | 2.08  | 0.83  | 13.33 |  | 16.67 | 26.67 |
+|    **AIME25**   | 0.42  | 0.00  | 16.67 |  | 23.33 | 26.67 |
+|**OlympiadBench**| 9.70  | 12.22 | 24.93 |  | 38.82 | 40.31 |
+|  **HumanEval**  | 46.34 | 78.05 | 79.88 |  | 81.10 | 81.10 |
+|     **MBPP**    | 38.80 | 56.40 | 71.60 |  | 64.80 | 62.60 |
 
 **Algorithm Comparison (LLaDA-8B-Instruct)**
 
