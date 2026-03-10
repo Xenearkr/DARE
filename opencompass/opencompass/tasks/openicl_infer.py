@@ -45,7 +45,7 @@ class OpenICLInferTask(BaseTask):
         """
         sys.path.append(os.getcwd())
         script_path = __file__
-        backend_keys = ['VLLM', 'Lmdeploy']
+        backend_keys = ['VLLM', 'Lmdeploy', 'SGLang', 'TurboMind']
         use_backend = any(
             key in str(self.model_cfgs[0].get('type', ''))
             or key in str(self.model_cfgs[0].get('llm', {}).get('type', ''))
