@@ -1,15 +1,64 @@
-from typing import Dict, List, Optional
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+# Add parent directory to path to ensure DARE's opencompass is used
+sglang_root = Path(__file__).resolve().parents[2]  # go up to opencompass directory
+dare_root = sglang_root.parent  # DARE directory
+if str(dare_root) not in sys.path:
+    sys.path.insert(0, str(dare_root))
+
+from collections.abc import Mapping, Sequence
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 
-from opencompass.models.base import BaseModel
-from opencompass.utils import get_logger
+from opencompass.models.base import BaseModel, LMTemplateParser
+from opencompass.models.base_api import APITemplateParser
+from opencompass.registry import MODELS
+from opencompass.utils.logging import get_logger
+from opencompass.utils.prompt import PromptList
 
-import sglang as sgl
+try:
+    import sglang as sgl
+    SGLANG_AVAILABLE = True
+except ImportError:
+    SGLANG_AVAILABLE = False
+
+PromptType = Union[PromptList, str]
+
+
+def _get_meta_template(meta_template):
+    default_meta_template = dict(
+        round=[
+            dict(role='HUMAN', api_role='HUMAN'),
+            # XXX: all system roles are mapped to human in purpose
+            # dict(role='SYSTEM', api_role='HUMAN'),
+            dict(role='BOT', api_role='BOT', generate=True),
+        ],
+        reserved_roles=[dict(role='SYSTEM', api_role='SYSTEM')]
+    )
+    return APITemplateParser(meta_template or default_meta_template)
+
 
 DEFAULT_MODEL_KWARGS = dict(trust_remote_code=True)
+DEFAULT_ENGINE_LIMITS = dict(
+    max_running_requests=1,
+    mem_fraction_static=0.8,
+    cuda_graph_max_bs=32,
+)
+UNSUPPORTED_SAMPLING_KWARGS = {
+    "block_length",
+    "eos_early_stop",
+    "gen_length",
+    "minimal_topk",
+    "steps",
+    "threshold",
+}
 
 
+@MODELS.register_module()
 class SGLangModel(BaseModel):
     """Model Wrapper for SGLang (Offline Engine API)."""
 
@@ -20,7 +69,7 @@ class SGLangModel(BaseModel):
         model_kwargs: dict = None,
         generation_kwargs: dict = dict(temperature=0.0, max_new_tokens=1024),  # defalut generation params
         dllm_algorithm: str = "LowConfidence",   # default dllm algorithm
-        dllm_algorithm_config: dict = None,  # not used
+        dllm_algorithm_config: Union[dict, str, None] = None,
         meta_template: Optional[Dict] = None,
         use_fastchat_template: bool = False,  # keep the same signature; unused here
         lora_path: str = None,
@@ -29,18 +78,24 @@ class SGLangModel(BaseModel):
     ):
         super().__init__(path=path, max_seq_len=max_seq_len, meta_template=meta_template)
 
-        assert sgl is not None, (
+        assert SGLANG_AVAILABLE, (
+            "SGLang is not installed. "
             "Please follow sglang official docs to install sglang"
         )
 
         self.logger = get_logger()
         self.dllm_algorithm = dllm_algorithm
         self.dllm_algorithm_config = dllm_algorithm_config or {}
-        self.model_kwargs = model_kwargs
+        self._dllm_algorithm_config_path = self._prepare_dllm_algorithm_config(
+            dllm_algorithm_config)
+        self.model_kwargs = model_kwargs or {}
         self.model_kwargs.update({
             "dllm_algorithm": self.dllm_algorithm,
         })
-        
+        if self._dllm_algorithm_config_path is not None:
+            self.model_kwargs["dllm_algorithm_config"] = \
+                self._dllm_algorithm_config_path
+
         self._load_model(path, self.model_kwargs)
 
         self.tokenizer = None
@@ -48,7 +103,7 @@ class SGLangModel(BaseModel):
             from transformers import AutoTokenizer
 
             tok_path = tokenizer_path or path
-            trc = (model_kwargs or {}).get("trust_remote_code", True)
+            trc = self.model_kwargs.get("trust_remote_code", True)
             self.tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=trc)
         except Exception as e:
             self.logger.warning(
@@ -65,16 +120,46 @@ class SGLangModel(BaseModel):
         self.stop_words = stop_words or []
         self.lora_path = lora_path
 
+    def _prepare_dllm_algorithm_config(
+        self, dllm_algorithm_config: Union[dict, str, None]
+    ) -> Optional[str]:
+        if dllm_algorithm_config is None:
+            return None
+        if isinstance(dllm_algorithm_config, str):
+            return dllm_algorithm_config
+        if not isinstance(dllm_algorithm_config, Mapping):
+            raise TypeError(
+                "dllm_algorithm_config must be a dict, YAML path, or None.")
+
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ImportError(
+                "PyYAML is required to pass dllm_algorithm_config as a dict."
+            ) from exc
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False, encoding="utf-8"
+        ) as fp:
+            yaml.safe_dump(
+                _to_builtin_yaml_obj(dllm_algorithm_config),
+                fp,
+                sort_keys=False)
+            return fp.name
+
     def _load_model(self, path: str, add_model_kwargs: dict = None, num_retry: int = 3):
         model_kwargs = DEFAULT_MODEL_KWARGS.copy()
+        model_kwargs.update(DEFAULT_ENGINE_LIMITS)
         if add_model_kwargs is not None:
             model_kwargs.update(add_model_kwargs)
+        # Merge with instance model_kwargs
+        if self.model_kwargs:
+            model_kwargs.update(self.model_kwargs)
+
         # SGLang Offline Engine:
         # Some models may need impl="transformers" and trust_remote_code=True, etc.
         self.model = sgl.Engine(
-            model_path=path, 
-            max_running_requests=1,          # OpenCompass single batch
-            mem_fraction_static=0.8,          # avoid gpu oom                    
+            model_path=path,
             **model_kwargs)
 
     def generate(
@@ -88,12 +173,14 @@ class SGLangModel(BaseModel):
 
         messages = _convert_chat_messages(inputs)
         prompts = [self.tokenizer.apply_chat_template(m_i, add_generation_prompt=True, tokenize=False) for m_i in messages]
-        
+
         generation_kwargs = {}
         generation_kwargs.update(self.generation_kwargs)
         generation_kwargs.update(kwargs)
+        for key in UNSUPPORTED_SAMPLING_KWARGS:
+            generation_kwargs.pop(key, None)
         print(f"[SGLang] generation_kwargs: {generation_kwargs}")
-        print(f"[SGLang] dllm kwargs: Algorothm: {self.dllm_algorithm}")
+        print(f"[SGLang] dllm kwargs: Algorithm: {self.dllm_algorithm}")
 
         # SGLang sampling params use `max_new_tokens` (not max_tokens).
         sampling_params = dict(generation_kwargs)
@@ -126,7 +213,7 @@ class SGLangModel(BaseModel):
         if self.tokenizer is None:
             raise RuntimeError("[SGLang] get_ppl needs tokenizer")
 
-        # We want input token logprobs; SGLang /generate supports return_logprob and logprob_start_len. :contentReference[oaicite:7]{index=7}
+        # We want input token logprobs; SGLang /generate supports return_logprob and logprob_start_len.
         # Try to request logprobs for prompt tokens.
         sampling_params = dict(self.generation_kwargs)
         sampling_params["max_new_tokens"] = 1  # keep it minimal; focus on prompt
@@ -211,17 +298,30 @@ def _convert_chat_messages(inputs, merge_role=True, skip_empty_prompt=True):
         outputs.append(messages)
     return outputs
 
+
+def _to_builtin_yaml_obj(value):
+    if isinstance(value, Mapping):
+        return {
+            str(k): _to_builtin_yaml_obj(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_to_builtin_yaml_obj(item) for item in value]
+    return value
+
+
 if __name__ == "__main__":
     import sglang as sgl
     ###### Basic sglang dllm inference test
-    model_path = "####
+    model_path = ""
     llm = sgl.Engine(
         model_path=model_path,
         dllm_algorithm="LowConfidence",
         max_running_requests=1,
-        mem_fraction_static=0.8,    
+        mem_fraction_static=0.8,
+        cuda_graph_max_bs=32,
         trust_remote_code=True,
-        
+
     )
     dialogues = [
         [
@@ -231,10 +331,10 @@ if __name__ == "__main__":
             {"role": "user", "content": "Write a brief introduction of the great wall"},
         ]
     ]
-    
+
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    
+
     prompts = []
     for dialogue in dialogues:
         prompt = tokenizer.apply_chat_template(

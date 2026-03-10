@@ -14,10 +14,7 @@ from opencompass.models.base_api import APITemplateParser
 from opencompass.registry import MODELS
 from opencompass.utils.logging import get_logger
 from opencompass.utils.prompt import PromptList
-##use llada generate
-from .generate import generate as LLaDA_generate
-from .generate import generate_with_prefix_cache as LLaDA_generate_with_prefix_cache
-from .generate import generate_with_dual_cache as LLaDA_generate_with_dual_cache
+
 import torch.nn.functional as F
 import numpy as np
 PromptType = Union[PromptList, str]
@@ -36,7 +33,7 @@ def _get_meta_template(meta_template):
 
 
 @MODELS.register_module()
-class LLaDA2Model(BaseModel):
+class LLaDA2MoEModel(BaseModel):
     """Model wrapper around LLaDA model.
 
     Args:
@@ -349,38 +346,39 @@ class LLaDA2Model(BaseModel):
         """Generate results given a list of inputs. """
         messages = _convert_chat_messages(inputs)
         prompt = [self.tokenizer.apply_chat_template(m_i, add_generation_prompt=True, tokenize=False) for m_i in messages]
-        print('steps:', self.gen_steps, 'length:', self.gen_length, 'blocksize:', self.gen_blocksize)
-        # print('temperature:', self.temperature, 'cfg:', self.cfg, 'remasking:', self.remasking)
+        gen_length = min(max_out_len, self.gen_length)
+        print('steps:', self.gen_steps, 'length:', gen_length, 'blocksize:', self.gen_blocksize)
         print('temperature:', self.temperature, 'cfg:', self.cfg)
-        # print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
+        print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
         # print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
         print('final prompt:', prompt)
-        self.tokenizer.padding_side = "left" 
-        prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')
-        input_ids = prompt['input_ids'].to(self.model.device)
-        
-        
-        x = self.model.generate(
-            inputs=input_ids,
-            eos_early_stop=self.eos_early_stop,
-            gen_length=self.gen_length,
-            block_length=self.batch_size,
-            steps=self.gen_steps,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-            minimal_topk=self.minimal_topk,
-            threshold=self.threshold,
-            eos_id=self.padding_id,
-            mask_id=self.mask_id,
-        )
-        
         responses = []
-        batch_size = len(x)
-        for i in range(batch_size):
-            responses.append(self.tokenizer.decode(x[i, -self.gen_length:], skip_special_tokens=True))
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            for single_prompt in prompt:
+                tokenized = self.tokenizer(single_prompt, return_tensors='pt')
+                input_ids = tokenized['input_ids'].to(self.model.device)
+
+                generated = self.model.generate(
+                    inputs=input_ids,
+                    temperature=self.temperature,
+                    block_length=self.gen_blocksize,
+                    steps=self.gen_steps,
+                    gen_length=gen_length,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                    eos_early_stop=self.eos_early_stop,
+                    minimal_topk=self.minimal_topk,
+                    threshold=self.threshold,
+                    eos_id=self.padding_id,
+                    mask_id=self.mask_id,
+                )
+                responses.append(self.tokenizer.decode(generated[0], skip_special_tokens=True))
+        finally:
+            self.tokenizer.padding_side = original_padding_side
         print('--------------------')
-        for i in range(batch_size):
+        for i in range(len(responses)):
             print(f'Response {i}:', responses[i])
             print('====================')
         print('--------------------')
@@ -465,3 +463,57 @@ def  _convert_base_messages(inputs):
                 messages.append(item['prompt'])
             outputs.append(''.join(messages))
     return outputs
+
+
+class LLaDA2MoEBaseModel(LLaDA2MoEModel):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.template_parser = LMTemplateParser()
+    def generate(self, inputs: List[str], max_out_len: int) -> List[str]:
+        """Generate results given a list of inputs. """
+        messages = _convert_base_messages(inputs)
+        prompt = messages
+        print('steps:', self.gen_steps, 'length:', self.gen_length, 'blocksize:', self.gen_blocksize)
+        print('temperature:', self.temperature, 'cfg:', self.cfg, 'remasking:', self.remasking)
+        print('mask_id:', self.mask_id, 'padding_id:', self.padding_id)
+        print('diff_confidence_eos_eot_inf:', self.diff_confidence_eos_eot_inf, 'diff_logits_eos_inf:', self.diff_logits_eos_inf)
+        print('final prompt:', prompt)
+        self.tokenizer.padding_side = "left" 
+        prompt = self.tokenizer.batch_encode_plus(prompt, padding = True, return_tensors='pt')['input_ids']
+        x = self.model.generate(
+            model = self.model,
+            prompt = prompt.to(self.model.device),
+            steps = self.gen_steps,
+            gen_length = self.gen_length,
+            block_length = self.gen_blocksize,
+            temperature = self.temperature,
+            cfg_scale = self.cfg,
+            remasking = self.remasking,
+            mask_id = self.mask_id,
+            confidence_eos_eot_inf = self.diff_confidence_eos_eot_inf,
+            logits_eos_inf = self.diff_logits_eos_inf,
+        )
+        responses = []
+        batch_size = prompt.shape[0]
+        
+        for i in range(batch_size):
+            responses.append(self.tokenizer.decode(x[i, -self.gen_length:], skip_special_tokens=True))
+        print('--------------------')
+        for i in range(batch_size):
+            print(f'Response {i}:', responses[i])
+            print('====================')
+        print('--------------------')
+        stopping_criteria = set(self.stop_words)
+        for i in range(batch_size):
+            response = responses[i]
+            for stop_word in stopping_criteria:
+                if stop_word in response:
+                    response = response.split(stop_word)[0]
+                    break
+            responses[i] = response
+        return responses
+    
+    def get_token_len(self, prompt: str, add_special_tokens: bool=True) -> int:
+        m = _convert_base_messages([prompt])[0]
+        t = self.tokenizer(m, add_special_tokens=add_special_tokens)
+        return len(t['input_ids'])

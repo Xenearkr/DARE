@@ -6,7 +6,7 @@ export HF_HOME=
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_TRUST_REMOTE_CODE=true
 export HF_HUB_OFFLINE=1
-export COMPASS_DATA_CACHE=opencompass
+export COMPASS_DATA_CACHE=
 cd opencompass
 
 # parameter parsing
@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-model=${model:-LLaDA2.0-Mini}
+model=${model:-LLaDA2.0-mini}
 engine=${engine:-hf}
 
 if [ -z "${task}" ]; then
@@ -42,58 +42,64 @@ fi
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
 exp_name="eval_${model}_${task}"
-log_dir=logs/EVAL/${exp_name}
+log_dir=./logs/EVAL/${exp_name}
 mkdir -p ${log_dir}
+
+if [ "${engine}" = "sglang" ]; then
+  prefix="sglang_"
+else
+  prefix=""
+fi
 
 # task Execution Map
 case "${task}" in
   mmlu)
-    py_script=llada2_mini_examples/llada2_mini_gen_mmlu_length256.py
-    work_dir=outputs/llada2_mini_mmlu_length256
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_mmlu.py
+    work_dir=outputs/${prefix}llada2_mini_mmlu
     ;;
   mmlupro)
-    py_script=llada2_mini_examples/llada2_mini_gen_mmlupro_length256.py
-    work_dir=outputs/llada2_mini_mmlupro_length256
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_mmlupro.py
+    work_dir=outputs/${prefix}llada2_mini_mmlupro
     ;;
   hellaswag)
-    py_script=llada2_mini_examples/llada2_mini_gen_hellaswag_length256.py
-    work_dir=outputs/llada2_mini_hellaswag_length256
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_hellaswag.py
+    work_dir=outputs/${prefix}llada2_mini_hellaswag
     ;;
   gpqa)
-    py_script=llada2_mini_examples/llada2_mini_gen_gpqa_length128.py
-    work_dir=outputs/llada2_mini_gpqa_length128
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_gpqa.py
+    work_dir=outputs/${prefix}llada2_mini_gpqa
     ;;
   arcc)
-    py_script=llada2_mini_examples/llada2_mini_gen_arcc_length512.py
-    work_dir=outputs/llada2_mini_arcc_length512
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_arcc.py
+    work_dir=outputs/${prefix}llada2_mini_arcc
     ;;
   mbpp)
-    py_script=llada2_mini_examples/llada2_mini_gen_mbpp_length512.py
-    work_dir=outputs/llada2_mini_mbpp_length512
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_mbpp.py
+    work_dir=outputs/${prefix}llada2_mini_mbpp
     ;;
   humaneval)
-    py_script=llada2_mini_examples/llada2_mini_gen_humaneval_length512.py
-    work_dir=outputs/llada2_mini_gen_humaneval_length512
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_humaneval.py
+    work_dir=outputs/${prefix}llada2_mini_gen_humaneval
     ;;
   gsm8k)
-    py_script=llada2_mini_examples/llada2_mini_gen_gsm8k_length256.py
-    work_dir=outputs/llada2_mini_gen_gsm8k_length256
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_gsm8k.py
+    work_dir=outputs/${prefix}llada2_mini_gen_gsm8k
     ;;
   math)
-    py_script=llada2_mini_examples/llada2_mini_gen_math_length512.py
-    work_dir=outputs/llada2_mini_gen_math_length512
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_math.py
+    work_dir=outputs/${prefix}llada2_mini_gen_math
     ;;
   olympiadbench)
-    py_script=llada2_mini_examples/llada2_mini_gen_olympiadbench_length2048.py
-    work_dir=outputs/llada2_mini_gen_olympiadbench_length2048
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_olympiadbench.py
+    work_dir=outputs/${prefix}llada2_mini_gen_olympiadbench
     ;;
   aime2024)
-    py_script=llada2_mini_examples/llada2_mini_gen_aime2024_length2048.py
-    work_dir=outputs/llada2_mini_gen_aime2024_length2048
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_aime2024.py
+    work_dir=outputs/${prefix}llada2_mini_gen_aime2024
     ;;
   aime2025)
-    py_script=llada2_mini_examples/llada2_mini_gen_aime2025_length2048.py
-    work_dir=outputs/llada2_mini_gen_aime2025_length2048
+    py_script=llada2_mini_examples/${prefix}llada2_mini_gen_aime2025.py
+    work_dir=outputs/${prefix}llada2_mini_gen_aime2025
     ;;
   *)
     echo "Unknown task: ${task}"
@@ -103,6 +109,7 @@ esac
 
 echo "task: ${task}"
 echo "model: ${model}"
+echo "engine: ${engine}"
 echo "Script: ${py_script}"
 echo "Work Dir: ${work_dir}"
 echo "Log Dir: ${log_dir}"
