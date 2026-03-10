@@ -58,5 +58,6 @@ from .sdar import SDARModel, SDARBaseModel  # noqa: F401
 
 from .lladamoe import LLaDAMoEModel, LLaDAMoEBaseModel
 from .llada2 import LLaDA2MoEModel
+from .llada2dot1 import LLaDA2Dot1MoEModel
 
 from .sglang_model import SGLangModel
