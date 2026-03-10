@@ -1,0 +1,44 @@
+from mmengine.config import read_base
+with read_base():
+    from ..opencompass.configs.datasets.gsm8k.gsm8k_gen import \
+        gsm8k_datasets
+    from ..opencompass.configs.models.dllm.sglang_llada2dot1_mini import \
+        models as sglang_llada2dot1_mini
+datasets = gsm8k_datasets
+models = sglang_llada2dot1_mini
+eval_cfg = {
+    "dllm_algorithm": "LowConfidence",
+    "dllm_algorithm_config": {
+        "block_size": 32,
+        "threshold": 0.95,
+    },
+    'model_kwargs': {
+        "trust_remote_code": True,
+        "attention_backend": "flashinfer",
+    },
+    "generation_kwargs": {
+        "max_new_tokens": 4096,
+        "temperature": 0.0,
+    },
+    "max_out_len": 4096,
+    'batch_size': 8
+}
+for model in models:
+    model.update(eval_cfg)
+from opencompass.partitioners import NumWorkerPartitioner
+from opencompass.runners import LocalRunner
+from opencompass.tasks import OpenICLInferTask
+infer = dict(
+    partitioner=dict(
+        type=NumWorkerPartitioner,
+        num_worker=8,    
+        num_split=None,   
+        min_task_size=16, 
+    ),
+    runner=dict(
+        type=LocalRunner,
+        max_num_workers=64,
+        task=dict(type=OpenICLInferTask),
+        retry=5
+    ),
+)
