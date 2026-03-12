@@ -41,14 +41,15 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
+- [2026-03-12]: Support sp for SDAR family, LLaDA2.0 and 2.1.
 - [2026-03-10]: Support evaluation of SDAR-30B-A3B-Chat with SGLang and lmdeploy.
 - [2026-03-09]: Support evaluation of LLaDA2.1-mini with SGLang.
 - [2026-03-03]: Support mdpo for LLaDA and Dream.
 - [2026-03-02]: Support SGLang for SDAR rl rollout.
-- [2026-02-28]: Several errors/bugs/updates for LLaDA and Dream sequence parallel have been fixed/adapted.
+- [2026-02-28]: Fix bugs and update features for LLaDA and Dream sequence parallel.
 - [2026-02-27]: Support evaluation of SDAR with SGLang.
 - [2026-02-26]: Update LLaDA cj-grpo and add Dream cj-grpo.
-- [2025-12-28]: Several errors/bugs/updates in dp_actor_algorithm have been fixed/adapted.
+- [2025-12-28]: Fix bugs and update features in dp_actor_algorithm.
 - [2025-12-24]: Support online rl (online weight update of rollout) for SDAR.
 - [2025-12-23]: Support vrpo (preference optimization) for Dream.
 - [2025-12-16]: Support vrpo (preference optimization) for LLaDA.
@@ -225,6 +226,21 @@ bash recipe/run_vrpo_llada_8b_instruct.sh --task ultrafeedback
 bash recipe/run_vrpo_dream_7b_instruct.sh --task ultrafeedback
 ```
 
+### 🚀 Convert Weights
+
+Run an example for preference optimization.
+
+```bash
+# convert FSDP sharded checkpoints to HuggingFace safetensors format
+bash scripts/convert_ckpt_to_hf.sh \
+    --model_path models/LLaDA-8B-Instruct \
+    --ckpt_path ./ckpts/<project>/<exp_name>/global_step_xxx/actor \
+    --output_path ./converted_models/llada_8b_stepxxx \
+    --model_name llada \
+    --fsdp_strategy fsdp2 \
+    --n_gpus 8
+```
+
 
 ## 📊 Evaluation
 
@@ -280,6 +296,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **SDAR-1.7B-Chat** | 1.7B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
 | **SDAR-4B-Chat** | 4B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
 | **SDAR-8B-Chat** | 8B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
+| **SDAR-30B-A3B-Chat** | 30BA3B | sft | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
 | **LLaDA2.0-mini** | 16BA1B | sft | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
 | **LLaDA2.1-mini** | 16BA1B | sft | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
 
@@ -303,18 +320,18 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 
 |   Bench/Model   | LLaDA-8B | Dream-7B | SDAR-8B-Chat | SDAR-30B-A3B | LLaDA2.0-mini | LLaDA2.1-mini |
 |-----------------|----------|----------|--------------|--------------|---------------|---------------|
-|     **MMLU**    | 65.24 | 66.83 | 77.23 |  | 72.54 | 69.91 |
-|   **MMLU-Pro**  | 36.82 | 31.89 | 56.49 |  | 57.10 | 57.52 |
-|  **Hellaswag**  | 75.30 | 63.23 | 87.59 |  | 82.35 | 78.00 |
-|    **ARC-C**    | 87.80 | 81.36 | 86.78 |  | 85.76 | 83.39 |
-|    **GSM8k**    | 79.68 | 83.24 | 91.36 |  | 88.48 | 86.13 |
-|     **MATH**    | 41.08 | 48.02 | 78.40 |  | 81.50 | 84.56 |
-|     **GPQA**    | 31.82 | 26.77 | 41.40 |  | 34.34 | 34.34 |
-|    **AIME24**   | 2.08  | 0.83  | 13.33 |  | 16.67 | 26.67 |
-|    **AIME25**   | 0.42  | 0.00  | 16.67 |  | 23.33 | 26.67 |
-|**OlympiadBench**| 9.70  | 12.22 | 24.93 |  | 38.82 | 40.31 |
-|  **HumanEval**  | 46.34 | 78.05 | 79.88 |  | 81.10 | 81.10 |
-|     **MBPP**    | 38.80 | 56.40 | 71.60 |  | 64.80 | 62.60 |
+|     **MMLU**    | 65.24 | 66.83 | 77.23 | 79.16 | 72.54 | 69.91 |
+|   **MMLU-Pro**  | 36.82 | 31.89 | 56.49 | 25.59 | 57.10 | 57.52 |
+|  **Hellaswag**  | 75.30 | 63.23 | 87.59 | 92.81 | 82.35 | 78.00 |
+|    **ARC-C**    | 87.80 | 81.36 | 86.78 | 78.98 | 85.76 | 83.39 |
+|    **GSM8k**    | 79.68 | 83.24 | 91.36 | 92.49 | 88.48 | 86.13 |
+|     **MATH**    | 41.08 | 48.02 | 78.40 | 68.56 | 81.50 | 84.56 |
+|     **GPQA**    | 31.82 | 26.77 | 41.40 | 36.36 | 34.34 | 34.34 |
+|    **AIME24**   | 2.08  | 0.83  | 13.33 | 13.33 | 16.67 | 26.67 |
+|    **AIME25**   | 0.42  | 0.00  | 16.67 | 6.67  | 23.33 | 26.67 |
+|**OlympiadBench**| 9.70  | 12.22 | 24.93 | 32.90 | 38.82 | 40.31 |
+|  **HumanEval**  | 46.34 | 78.05 | 79.88 | 84.15 | 81.10 | 81.10 |
+|     **MBPP**    | 38.80 | 56.40 | 71.60 | 52.00 | 64.80 | 62.60 |
 
 **Algorithm Comparison (LLaDA-8B-Instruct)**
 
