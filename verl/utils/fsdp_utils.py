@@ -89,6 +89,14 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     min_num_params = _get_attr("min_num_params", 0)
     auto_wrap_policy = None
 
+    # Check if model is MoE for special handling
+    is_moe = False
+    if hasattr(module, "config"):
+        is_moe = (hasattr(module.config, "num_experts") and
+                  module.config.num_experts > 1) or \
+                 (hasattr(module.config, "n_routed_experts") and
+                  module.config.n_routed_experts > 1)
+
     policies = []
 
     from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy
@@ -103,7 +111,21 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         policies.append(lambda_policy)
 
     if min_num_params > 0:
-        size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
+        # For MoE models, use a modified size-based policy that excludes expert modules
+        if is_moe:
+            def moe_size_policy_fn(module):
+                # Don't shard expert weights to avoid communication overhead
+                module_type = type(module).__name__.lower()
+                if 'expert' in module_type or 'gate' in module_type:
+                    return False
+                # Use size-based policy for other modules
+                return len(list(module.named_children())) == 0 and \
+                       getattr(module, "weight", None) is not None and \
+                       module.weight.numel() >= min_num_params
+
+            size_policy = functools.partial(lambda_auto_wrap_policy, lambda_fn=moe_size_policy_fn)
+        else:
+            size_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=min_num_params)
         policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
