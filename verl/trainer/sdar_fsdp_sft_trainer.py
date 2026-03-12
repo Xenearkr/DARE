@@ -84,6 +84,27 @@ def extract_step(path):
     return None
 
 
+def modify_padded_position_ids_2d(position_ids: torch.LongTensor) -> torch.LongTensor:
+    if position_ids.dim() != 2:
+        raise ValueError(f"Input tensor must be 2D, but got {position_ids.dim()} dimensions.")
+
+    batch_size, seq_len = position_ids.shape
+    device = position_ids.device
+    col_indices = torch.arange(seq_len, device=device, dtype=position_ids.dtype).expand(batch_size, -1)
+    mask = position_ids != 0
+    masked_indices = col_indices * mask
+    last_nonzero_idx = torch.max(masked_indices, dim=1).values
+    has_nonzero = torch.any(mask, dim=1)
+    pad_start_idx = torch.where(
+        has_nonzero,
+        last_nonzero_idx + 1,
+        torch.tensor(0, device=device, dtype=position_ids.dtype),
+    )
+    padding_mask = col_indices >= pad_start_idx.unsqueeze(1)
+    new_pad_values = col_indices - pad_start_idx.unsqueeze(1)
+    return torch.where(padding_mask, new_pad_values, position_ids)
+
+
 class FSDPdLLMSFTTrainer:
     def __init__(self, config, device_mesh: DeviceMesh, ulysses_device_mesh: DeviceMesh, tokenizer, train_dataset: Dataset, val_dataset: Dataset):
         self.config = config
@@ -341,15 +362,68 @@ class FSDPdLLMSFTTrainer:
                 loss = output.loss
 
             else:
-                torch.distributed.barrier()
-                raise RuntimeError(
-                    "SDAR flex_attention training does not support sequence parallelism yet. "
-                    "Disable use_remove_padding and set ulysses_sequence_parallel_size=1."
+                if input_ids.size(0) != 1:
+                    raise ValueError("SDAR sequence parallelism currently requires micro_batch_size_per_gpu == 1.")
+
+                sp_size = get_ulysses_sequence_parallel_world_size()
+                sp_group = self.ulysses_device_mesh["sp"].get_group()
+                sp_rank = self.ulysses_device_mesh.get_local_rank("sp")
+
+                position_ids = modify_padded_position_ids_2d(position_ids)
+                prompt_mask = labels == -100
+                (
+                    concat_inputs_ids,
+                    concat_position_ids,
+                    flex_attention_mask_3d,
+                    logits_to_keep_half,
+                    logits_to_keep_full,
+                    p_mask_full,
+                ) = self.model.prepare_for_bd_training(input_ids, position_ids, prompt_mask)
+
+                concat_inputs_ids_sliced, concat_position_ids_sliced, _ = ulysses_pad_and_slice_inputs(
+                    concat_inputs_ids,
+                    concat_position_ids,
+                    sp_size=sp_size,
                 )
-                
+                logits_to_keep_sliced, _, _ = ulysses_pad_and_slice_inputs(
+                    logits_to_keep_full.to(dtype=torch.long),
+                    None,
+                    sp_size=sp_size,
+                )
+                logits_to_keep_sliced = logits_to_keep_sliced.bool()
+
+                local_keep_count = logits_to_keep_sliced.sum().to(dtype=torch.long)
+                gathered_keep_counts = [torch.zeros_like(local_keep_count) for _ in range(sp_size)]
+                torch.distributed.all_gather(gathered_keep_counts, local_keep_count, group=sp_group)
+                gathered_keep_counts = [count.item() for count in gathered_keep_counts]
+                keep_start = sum(gathered_keep_counts[:sp_rank])
+                keep_end = keep_start + gathered_keep_counts[sp_rank]
+
+                flat_targets = labels[logits_to_keep_half].contiguous()
+                local_targets = flat_targets[keep_start:keep_end]
+                local_p_mask = p_mask_full[keep_start:keep_end]
+                answer_len = (labels != -100).sum().to(device=input_ids.device, dtype=torch.float32)
+
+                output = self.fsdp_model(
+                    input_ids=concat_inputs_ids_sliced,
+                    attention_mask=flex_attention_mask_3d,
+                    position_ids=concat_position_ids_sliced,
+                    use_cache=False,
+                    logits_to_keep=logits_to_keep_sliced,
+                    ulysses_sp_training=True,
+                    ulysses_sp_targets=local_targets,
+                    ulysses_sp_p_mask=local_p_mask,
+                    ulysses_sp_answer_len=answer_len,
+                )
+                loss = output.loss
+
             if do_backward:
                 loss.backward()
-            return loss
+
+            reported_loss = loss.detach()
+            if use_sp:
+                torch.distributed.all_reduce(reported_loss, group=self.ulysses_device_mesh["sp"].get_group())
+            return reported_loss
 
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()

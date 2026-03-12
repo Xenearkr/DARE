@@ -232,11 +232,25 @@ def apply_monkey_patch(
             apply_llada_ulysses_patch(model)
         return
 
+    elif model.config.model_type == "llada2_moe":
+        if use_remove_padding or ulysses_sp_size > 1:
+            from verl.models.transformers.llada2 import apply_llada2_ulysses_patch
+
+            apply_llada2_ulysses_patch(model)
+        return
+
     elif model.config.model_type == "Dream":
         if use_remove_padding or ulysses_sp_size > 1:
             from verl.models.transformers.dream import apply_dream_ulysses_patch
 
             apply_dream_ulysses_patch(model)
+        return
+
+    elif model.config.model_type in {"sdar", "sdar_moe"}:
+        if use_remove_padding or ulysses_sp_size > 1:
+            from verl.models.transformers.sdar import apply_sdar_ulysses_patch
+
+            apply_sdar_ulysses_patch(model)
         return
 
     # transformers<=4.47.1
