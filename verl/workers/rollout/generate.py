@@ -203,10 +203,10 @@ def get_transfer_index(
     # 2) Confidence for chosen tokens (or random)
     if remasking == "low_confidence":
         # Use higher precision for softmax stability
-        p = F.softmax(logits.to(torch.float64), dim=-1)
-        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, L), float64
+        p = F.softmax(logits.to(torch.float32), dim=-1)
+        x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)  # (B, L), float32
     elif remasking == "random":
-        x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float64)  # (B, L)
+        x0_p = torch.rand(x0.shape, device=x0.device, dtype=torch.float32)  # (B, L)
     else:
         raise NotImplementedError(remasking)
 
@@ -256,7 +256,7 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
     logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
     x0 = torch.argmax(logits_with_noise, dim=-1) # b, l
     if remasking == 'low_confidence':
-        p = F.softmax(logits.to(torch.float64), dim=-1)
+        p = F.softmax(logits.to(torch.float32), dim=-1)
         x0_p = torch.squeeze(
             torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # b, l
     elif remasking == 'random':
