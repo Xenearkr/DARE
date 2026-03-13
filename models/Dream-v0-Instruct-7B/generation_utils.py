@@ -143,8 +143,8 @@ class DreamGenerationConfig(GenerationConfig):
         # Validate the values of the attributes
         self.validate(is_init=True)
 
-    def validate(self, is_init=False):
-        pass
+    def validate(self, is_init=False, strict=False):
+        return
 
 class DreamGenerationMixin:
     @staticmethod
@@ -351,13 +351,15 @@ class DreamGenerationMixin:
             input_ids=input_ids,
             attention_mask=attention_mask 
         )
+        threshold = kwargs.get("threshold", 0.9)
 
         result = self._sample(
             input_ids,
             attention_mask=attention_mask,
             generation_config=generation_config,
             generation_tokens_hook_func=generation_tokens_hook_func,
-            generation_logits_hook_func=generation_logits_hook_func
+            generation_logits_hook_func=generation_logits_hook_func,
+            threshold=threshold
         )
         return result
 
@@ -367,7 +369,8 @@ class DreamGenerationMixin:
         attention_mask: Optional[torch.LongTensor],
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
-        generation_logits_hook_func
+        generation_logits_hook_func,
+        threshold: Optional[float] = 0.9
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
@@ -406,7 +409,15 @@ class DreamGenerationMixin:
 
         # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
-        for i in range(steps):
+        i = 0
+        if alg == 'confidence_threshold':
+            mask_index = (x == mask_token_id)
+            assert mask_index.sum() % steps == 0, "mask_index.sum() must be divisible by steps"
+            assert x.shape[0] == 1, "batch size must be 1"
+
+            number_transfer_tokens = mask_index.sum().item() // steps
+            left_tokens_last_step = 0
+        while i < steps:
             mask_index = (x == mask_token_id)
             logits = self(x, attention_mask, tok_idx).logits
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
@@ -415,8 +426,9 @@ class DreamGenerationMixin:
             logits = generation_logits_hook_func(i, x, logits)
 
             mask_logits = logits[mask_index]
-            t = timesteps[i]
-            s = timesteps[i + 1]
+            if not alg == 'confidence_threshold':
+                t = timesteps[i]
+                s = timesteps[i + 1]
         
             if alg == 'origin':
                 p_transfer = 1 - s / t if i < steps - 1 else 1
@@ -424,6 +436,31 @@ class DreamGenerationMixin:
                 transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
                 _, x0[transfer_index_t_s]= sample_tokens(mask_logits[transfer_index_t_s], temperature=temperature, top_p=top_p, top_k=top_k)
                 x[mask_index] = x0.clone()
+            elif alg == 'confidence_threshold':
+                confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+                x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
+                x_[mask_index] = x0.clone()
+                full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
+                full_confidence[mask_index] = confidence
+                current_transfer_tokens = number_transfer_tokens + left_tokens_last_step
+                left_tokens_last_step = 0
+                selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
+                transfer_index = torch.zeros_like(x, device=x.device, dtype=torch.bool)
+                select_index = select_index.to(x.device)
+                transfer_index[0, select_index[0]] = True
+                for k in range(1, current_transfer_tokens):
+                    if selected_confidence[0, k] < threshold:
+                        if i < steps - 1:
+                            left_tokens_last_step += 1
+                            transfer_index[0, select_index[0, k]] = False
+                        else:
+                            number_transfer_tokens = 0
+                            steps += 1
+                            left_tokens_last_step += 1
+                            transfer_index[0, select_index[0, k]] = False
+
+                x[transfer_index] = x_[transfer_index].clone()
+
             else:
                 if alg == 'maskgit_plus':
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
@@ -454,6 +491,7 @@ class DreamGenerationMixin:
 
             if histories is not None:
                 histories.append(x.clone())
+            i += 1
         
         if return_dict_in_generate:
             return DreamModelOutput(
