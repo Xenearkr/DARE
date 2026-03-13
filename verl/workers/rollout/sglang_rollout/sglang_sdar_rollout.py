@@ -135,8 +135,8 @@ class SGLangSDARRollout(SGLangRollout):
             [ip, port] = broadcast_pyobj(
                 [ip, port],
                 rank=self._rank,
-                dist_group=self._device_mesh_cpu.get_group("tp"),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                dist_group=self._device_mesh_cpu.get_group(self._tp_mesh_name),
+                src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
                 force_cpu_device=False,
             )
             from verl.workers.rollout.sglang_rollout.utils import is_ipv6

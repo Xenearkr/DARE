@@ -90,20 +90,35 @@ def _pre_process_inputs(
 # NOTE(linjunrong): adhoc
 def _post_process_outputs(tokenizer, output):
     def _map_each_response(resp):
-        output_token_logprobs = resp["meta_info"]["output_token_logprobs"]
-        log_probs, output_token_ids = zip(*[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs])
-        return torch.tensor(output_token_ids), torch.tensor(log_probs)
+        meta_info = resp.get("meta_info", {})
+        output_token_logprobs = meta_info.get("output_token_logprobs") or []
+
+        if output_token_logprobs:
+            pairs = [(log_prob, token_id) for log_prob, token_id, *_ in output_token_logprobs]
+            log_probs, output_token_ids = zip(*pairs)
+            return torch.tensor(output_token_ids), torch.tensor(log_probs, dtype=torch.float32)
+
+        output_token_ids = resp.get("token_ids")
+        if output_token_ids is None:
+            output_token_ids = resp.get("output_ids")
+        if output_token_ids is None:
+            raise ValueError(f"SGLang response missing both token_ids and output_token_logprobs: {resp.keys()}")
+
+        return torch.tensor(output_token_ids), None
 
     out_map = map(lambda x: _map_each_response(x), output)
     batched_output_token_ids = []
     batched_logprobs = []
     for output_token_ids, log_probs in out_map:
         batched_output_token_ids.append(output_token_ids)
-        batched_logprobs.append(log_probs)
+        if log_probs is not None:
+            batched_logprobs.append(log_probs)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     batched_output_token_ids = pad_sequence(batched_output_token_ids, batch_first=True, padding_value=pad_token_id)
     if len(batched_logprobs) > 0:
-        batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
+        batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=0.0)
+    else:
+        batched_logprobs = None
     return batched_output_token_ids, batched_logprobs
 
 
@@ -180,6 +195,14 @@ class SGLangRollout(BaseRollout):
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
 
+    def _get_tp_mesh_name(self) -> str:
+        mesh_dim_names = getattr(self._device_mesh_cpu, "mesh_dim_names", None) or ()
+        if "tp" in mesh_dim_names:
+            return "tp"
+        if "infer_tp" in mesh_dim_names:
+            return "infer_tp"
+        raise KeyError(f"Unable to find tensor-parallel mesh dim in {mesh_dim_names}")
+
     def _init_distributed_env(self, device_mesh_cpu, **kwargs):
         self._device_mesh_cpu = device_mesh_cpu
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
@@ -210,14 +233,19 @@ class SGLangRollout(BaseRollout):
             self._device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
 
         self._rank = self._device_mesh_cpu.get_rank()
-        self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
-        self._tp_size = self._device_mesh_cpu["tp"].size()
+        self._tp_mesh_name = self._get_tp_mesh_name()
+        self._tp_rank = self._device_mesh_cpu[self._tp_mesh_name].get_local_rank()
+        self._tp_size = self._device_mesh_cpu[self._tp_mesh_name].size()
         if self._rank == 0:
             logger.info(f"_init_distributed_env: :tp_world: {self._tp_size}, global_world: {world_size}")
         # get tp_rank of this process in this tp group
-        visible_devices = [None] * self._device_mesh_cpu.size(1)
+        visible_devices = [None] * self._tp_size
 
-        torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._device_mesh_cpu.get_group("tp"))
+        torch.distributed.all_gather_object(
+            visible_devices,
+            os.environ["CUDA_VISIBLE_DEVICES"],
+            self._device_mesh_cpu.get_group(self._tp_mesh_name),
+        )
         self.visible_devices_set = set(",".join(visible_devices).split(","))
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
 
@@ -240,8 +268,8 @@ class SGLangRollout(BaseRollout):
             [ip, port] = broadcast_pyobj(
                 [ip, port],
                 rank=self._rank,
-                dist_group=self._device_mesh_cpu.get_group("tp"),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                dist_group=self._device_mesh_cpu.get_group(self._tp_mesh_name),
+                src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
                 force_cpu_device=False,
             )
             dist_init_addr = f"[{ip}]:{port}" if is_ipv6(ip) else f"{ip}:{port}"
@@ -562,18 +590,21 @@ class SGLangRollout(BaseRollout):
             [output] = broadcast_pyobj(
                 data=[output],
                 rank=self._rank,
-                dist_group=self._device_mesh_cpu["tp"].get_group(),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                dist_group=self._device_mesh_cpu[self._tp_mesh_name].get_group(),
+                src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
                 force_cpu_device=False,
             )
             out = _post_process_outputs(self.tokenizer, output)
 
             response = out[0].to(idx.device)
-            rollout_log_probs = out[1].to(idx.device)
+            rollout_log_probs = out[1]
+            if rollout_log_probs is not None:
+                rollout_log_probs = rollout_log_probs.to(idx.device)
 
             if response.shape[1] < self.config.response_length:
                 response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-                rollout_log_probs = pad_sequence_to_length(rollout_log_probs, self.config.response_length, self.pad_token_id)
+                if rollout_log_probs is not None:
+                    rollout_log_probs = pad_sequence_to_length(rollout_log_probs, self.config.response_length, 0.0)
 
             # utilize current sampling params
             if self.sampling_params.get("n", 1) > 1 and do_sample:
@@ -602,17 +633,17 @@ class SGLangRollout(BaseRollout):
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                "rollout_log_probs": rollout_log_probs,  # we will recompute old log prob with actor
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
+        batch_tensors = {
+            "prompts": idx,
+            "responses": response,
+            "input_ids": seq,  # here input_ids become the whole sentences
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
+        if rollout_log_probs is not None:
+            batch_tensors["rollout_log_probs"] = rollout_log_probs  # diagnostic only; old log prob is recomputed by actor
+
+        batch = TensorDict(batch_tensors, batch_size=batch_size)
 
         # free cache engine
         if self.config.free_cache_engine and self._engine is not None:
@@ -833,8 +864,8 @@ class SGLangRollout(BaseRollout):
         [sorted_output_req_list] = broadcast_pyobj(
             data=[sorted_output_req_list],
             rank=self._rank,
-            dist_group=self._device_mesh_cpu["tp"].get_group(),
-            src=self._device_mesh_cpu["tp"].mesh[0].item(),
+            dist_group=self._device_mesh_cpu[self._tp_mesh_name].get_group(),
+            src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
             force_cpu_device=False,
         )
         # Construct the batch data
@@ -1049,8 +1080,8 @@ class SGLangRollout(BaseRollout):
             output = broadcast_pyobj(
                 data=[output],
                 rank=self._rank,
-                dist_group=self._device_mesh_cpu["tp"].get_group(),
-                src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                dist_group=self._device_mesh_cpu[self._tp_mesh_name].get_group(),
+                src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
                 force_cpu_device=False,
             )
 

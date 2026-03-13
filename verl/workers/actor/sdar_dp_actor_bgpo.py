@@ -90,15 +90,15 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                     loss_per_sample[b, i] = -loss_b_i  # convert to log likelihood (batch_size, mc_num)            
 
             log_likelihood = loss_per_sample.sum(dim=1) / mc_num  # (batch_size,)
-            log_prob = log_likelihood.unsqueeze(-1).expand(-1, response_length) # (batch_size, response_length)
+            log_probs = log_likelihood.view(-1, 1)  # (batch_size, 1)
             loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, -1, response_length).contiguous()  # (batch_size, mc_num, response_length)
         
         entropy = None
         if calculate_entropy:
-            probs = log_prob.exp()
-            entropy = -probs * log_prob  # (bs, response_length) entropy of each token
+            probs = log_probs.exp()
+            entropy = -probs * log_probs  # (bs, response_length) entropy of each token
             
-        return entropy, log_prob, loss_per_sample
+        return entropy, log_probs, loss_per_sample
     
     def _get_logits(self, model, seq, attention_mask, position_ids, prompt_len, cfg_scale=0.0, MASK_TOKEN_ID=126336):
         """
@@ -166,20 +166,20 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         else:
             micro_batches = batch.split(micro_batch_size)
 
-        log_prob_lst = []
+        log_probs_lst = []
         entropy_lst = []
         loss_per_sample_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_prob, loss_per_sample = self._forward_micro_batch(micro_batch, temperature=temperature, n_l=self.n_l, mc_num=self.mc_num, calculate_entropy=calculate_entropy, call_fn_name="compute_log_prob")
-            log_prob_lst.append(log_prob)
+                entropy, log_probs, loss_per_sample = self._forward_micro_batch(micro_batch, temperature=temperature, n_l=self.n_l, mc_num=self.mc_num, calculate_entropy=calculate_entropy, call_fn_name="compute_log_prob")
+            log_probs_lst.append(log_probs)
             loss_per_sample_lst.append(loss_per_sample)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
-        log_probs = torch.concat(log_prob_lst, dim=0)
+        log_probs = torch.concat(log_probs_lst, dim=0)
         loss_per_sample = torch.concat(loss_per_sample_lst, dim=0)
         entropys = None
         if calculate_entropy:
@@ -204,7 +204,7 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
-            select_keys.append("ref_log_probs")
+            select_keys.append("ref_log_prob")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -251,7 +251,7 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     old_log_probs = data["old_log_probs"]  # (bsz, 1)
-                    old_loss_per_sample = data["old_loss_per_sample"]  # (bsz, mc_num, response_length)
+                    old_loss_per_sample = data["old_loss_per_sample"]  # (bsz, mc_num)
                     advantages = data["advantages"]
 
                     clip_ratio = self.config.clip_ratio
@@ -277,7 +277,7 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                     for i in range(mc_num):
                         entropy, log_prob, loss_per_sample = self._forward_micro_batch(micro_batch=data, temperature=temperature, n_l=1, mc_num=1, calculate_entropy=calculate_entropy, call_fn_name="update_policy")
                         print(f"\nloss_per_sample: {loss_per_sample[0, 0, 0]}")
-
+                        print(f"\nold_loss_per_sample: {old_loss_per_sample[0, 0, 0]}")
                         # Compute policy loss
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_bgpo(
                             old_l_theta=old_loss_per_sample[:, i, :],  # (bsz, response_length)
@@ -300,9 +300,9 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                             policy_loss = pg_loss
 
                         if self.config.use_kl_loss:  # NOTE: Currently not considering KL
-                            ref_log_probs = data["ref_log_probs"]
+                            ref_log_prob = data["ref_log_prob"]
                             # compute kl loss
-                            kld = kl_penalty(l_theta=log_prob, ref_l_theta=ref_log_probs, kl_penalty=self.config.kl_loss_type, advantages=advantages)
+                            kld = kl_penalty(l_theta=loss_per_sample[:, 0, :], ref_l_theta=ref_log_prob[:, i, :], kl_penalty=self.config.kl_loss_type, advantages=advantages)
                             kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef

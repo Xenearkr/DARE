@@ -150,7 +150,7 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
 
 @torch.no_grad()
 def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
-    if fsdp_version(model) == 2:
+    if fsdp_version(model) == 2 or fsdp_version(model) == 0:
         offload_fsdp2_model_to_cpu(model, empty_cache)
         return
 
@@ -173,15 +173,14 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache: bool = True):
 
 @torch.no_grad()
 def offload_fsdp2_model_to_cpu(model, empty_cache: bool = True):
-    for param in model.parameters():
-        param.data = param.data.to(torch.device("cpu"), non_blocking=True)
+    model.cpu()
     if empty_cache:
         get_torch_device().empty_cache()
 
 
 @torch.no_grad()
 def load_fsdp_model_to_gpu(model: FSDP):
-    if fsdp_version(model) == 2:
+    if fsdp_version(model) == 2 or fsdp_version(model) == 0:
         load_fsdp2_model_to_gpu(model)
         return
 
@@ -201,9 +200,8 @@ def load_fsdp_model_to_gpu(model: FSDP):
 
 @torch.no_grad()
 def load_fsdp2_model_to_gpu(model):
-    device = torch.cuda.current_device()
-    for param in model.parameters():
-        param.data = param.data.to(device, non_blocking=True)
+    device = get_torch_device().current_device()
+    model.to(device)
 
 
 @torch.no_grad()

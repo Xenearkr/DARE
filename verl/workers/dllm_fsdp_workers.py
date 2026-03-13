@@ -440,7 +440,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
-        elif rollout_name in ["sglang", "sglang_async"]:
+        elif rollout_name in ["sglang", "sglang_async"] and self.config.model.name != 'sdar':
             if rollout_name == "sglang_async":
                 warnings.warn(
                     "'sglang_async' has been deprecated and merged into 'sglang'. "
@@ -532,7 +532,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
 
             rollout_sharding_manager = FSDPSGLangSDARShardingManager(
                 module=self.actor_module_fsdp,
-                inference_engine=None,  # SGLang handles weight sync internally via update_weights
+                inference_engine=rollout._engine,
                 model_config=self.actor_model_config,
                 full_params="hf" in self.config.rollout.load_format,
                 device_mesh=rollout_device_mesh,
@@ -680,7 +680,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # Support all hardwares
-        data = data.to(get_torch_device().current_device())
+        # data = data.to(get_torch_device().current_device())
 
         assert self._is_actor
         if self._is_offload_param:
@@ -689,7 +689,9 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
 
         with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            # data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+            data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
