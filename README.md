@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
+- [2026-03-13]: Fix bugs in SDAR SGLang rollout and dp actor.
 - [2026-03-12]: Support sp for SDAR family, LLaDA2.0 and 2.1.
 - [2026-03-10]: Support evaluation of SDAR-30B-A3B-Chat with SGLang and lmdeploy.
 - [2026-03-09]: Support evaluation of LLaDA2.1-mini with SGLang.
