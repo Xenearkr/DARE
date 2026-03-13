@@ -30,21 +30,41 @@ def main(config):
 
 def run_ppo(config) -> None:
     if not ray.is_initialized():
-        # this is for local ray cluster
-        if config.actor_rollout_ref.model.name in ['sdar']:
+        # Build runtime environment with required environment variables
+        runtime_env = {
+            "env_vars": {
+                "TOKENIZERS_PARALLELISM": "true",
+                "NCCL_DEBUG": "WARN",
+                "VLLM_LOGGING_LEVEL": "WARN",
+                "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
+                "WANDB_API_KEY": os.environ.get("WANDB_API_KEY", ""),
+                "WANDB_RESUME": os.environ.get("WANDB_RESUME", "allow"),
+                "WANDB_MODE": os.environ.get("WANDB_MODE", "offline"),
+                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+            }
+        }
+
+        # Detect if we're in a multi-node cluster environment
+        # Check for Ray cluster address from environment or use auto-detection
+        ray_address = os.environ.get("RAY_ADDRESS", None)
+
+        if ray_address:
+            # Connect to existing Ray cluster (multi-node or single-node cluster)
             ray.init(
-                address="127.0.0.1:6379",
-                runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN",
-                "WANDB_PROJECT": os.environ["WANDB_PROJECT"], "WANDB_API_KEY": os.environ["WANDB_API_KEY"], 
-                "WANDB_RESUME": os.environ.get("WANDB_RESUME", "allow"), "WANDB_MODE": os.environ.get("WANDB_MODE", "offline"),
-                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}},
+                address=ray_address,
+                runtime_env=runtime_env,
+            )
+        elif config.trainer.nnodes > 1:
+            # Multi-node training: use auto to connect to existing cluster
+            # The head node should start Ray first, workers will connect via auto-detection
+            ray.init(
+                address="auto",
+                runtime_env=runtime_env,
             )
         else:
+            # Single-node training: start local Ray cluster
             ray.init(
-                runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN",
-                "WANDB_PROJECT": os.environ["WANDB_PROJECT"], "WANDB_API_KEY": os.environ["WANDB_API_KEY"], 
-                "WANDB_RESUME": os.environ.get("WANDB_RESUME", "allow"), "WANDB_MODE": os.environ.get("WANDB_MODE", "offline"),
-                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true"}},
+                runtime_env=runtime_env,
                 num_cpus=config.ray_init.num_cpus,
             )
 
