@@ -483,3 +483,7 @@ def _forward_process_spg(batch, attention_mask, prompt_len, seed=42, block_lengt
 
 
     return noisy_batch.view(-1, l), is_mask.view(-1, l), p_mask.view(-1, l)
+
+
+# Re-export MDPO loss function for convenience
+from verl.trainer.ppo.mdpo_algos import compute_mdpo_policy_loss
