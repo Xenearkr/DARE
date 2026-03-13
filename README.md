@@ -50,6 +50,10 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 - [2026-02-28]: Fix bugs and update features for LLaDA and Dream sequence parallel.
 - [2026-02-27]: Support evaluation of SDAR with SGLang.
 - [2026-02-26]: Update LLaDA cj-grpo and add Dream cj-grpo.
+
+<details>
+<summary>2025</summary>
+
 - [2025-12-28]: Fix bugs and update features in dp_actor_algorithm.
 - [2025-12-24]: Support online rl (online weight update of rollout) for SDAR.
 - [2025-12-23]: Support vrpo (preference optimization) for Dream.
@@ -59,6 +63,8 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 - [2025-12-08]: Support coupled-grpo, cj-grpo and spg algorithm.
 - [2025-12-03]: Support sequence parallel to enable longer generation ability for dLLMs.
 - [2025-12-01]: We initialize the codebase of DARE (dLLM Alignment and Reinforcement Executor), including training (sft, peft, and rl) and faster evaluation.
+
+</details>
 
 
 ## 🔍 Catalogue
