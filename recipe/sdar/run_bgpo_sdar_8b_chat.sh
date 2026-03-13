@@ -175,25 +175,25 @@ if [ $task == "math" ]; then
     train_files="['data/preprocessed/rl/train/gsm8k_1.parquet']"
     val_files="['data/preprocessed/rl/test/gsm8k_1.parquet']"
     max_prompt_length=512
-    max_response_length=512
+    max_response_length=2048
     total_epoch=1
 elif [ $task == "code" ]; then
     train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
     val_files="['data/preprocessed/rl/test/mbpp_1.parquet','data/preprocessed/rl/test/humaneval_1.parquet','data/preprocessed/rl/test/humanevalplus_1.parquet']"
     max_prompt_length=1024
-    max_response_length=512
+    max_response_length=2048
     total_epoch=5
 elif [ $task == "countdown" ]; then
     train_files="['data/preprocessed/rl/train/countdown-n20000_1.parquet']"
     val_files="['data/preprocessed/rl/test/countdown_1.parquet']"
     max_prompt_length=512
-    max_response_length=256
+    max_response_length=2048
     total_epoch=1
 elif [ $task == "sudoku" ]; then
     train_files="['data/preprocessed/rl/train/sudoku-n20000_1.parquet']"
     val_files="['data/preprocessed/rl/test/sudoku_1.parquet']"
     max_prompt_length=512
-    max_response_length=256
+    max_response_length=2048
     total_epoch=1
 fi
 
@@ -222,9 +222,9 @@ n_gpus_per_node=$(echo $CUDA_VISIBLE_DEVICES | tr "," "\n" | wc -l)
 if [ "$engine" = "lmdeploy" ]; then
     batch_size=14  # batch_size must be greater than the number of GPUs used
 elif [ "$engine" = "sglang" ]; then
-    batch_size=8  # Reduced from 16 to prevent OOM with SGLang embedded engine
+    batch_size=16  # Reduced from 16 to prevent OOM with SGLang embedded engine
 fi
-n_rollout=4  # Reduced from 8 to save memory (fewer responses per prompt)
+n_rollout=8  # Reduced from 8 to save memory (fewer responses per prompt)
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1  # gradient accumulation = batch_size / ppo_micro_batch_size_per_gpu
 train_temperature=1.0
@@ -281,12 +281,17 @@ python3 -m verl.trainer.dllm_main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    actor_rollout_ref.model.enable_gradient_checkpointing=False \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.trust_remote_code=True \
     +actor_rollout_ref.model.attn_implementation="flash_attention_2" \
     +actor_rollout_ref.model.baseline=$baseline \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    +actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.param_dtype=bfloat16 \
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.reduce_dtype=bfloat16 \
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.buffer_dtype=bfloat16 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=$fsdp_size \
     +actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[SDARDecoderLayer] \
     +actor_rollout_ref.actor.mc_num=$mc_num \
