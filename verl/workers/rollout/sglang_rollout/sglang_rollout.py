@@ -193,7 +193,8 @@ class SGLangRollout(BaseRollout):
         self._init_sampling_params(**kwargs)
 
         self.tokenizer = tokenizer
-        self.pad_token_id = tokenizer.pad_token_id
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        self.eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else self.pad_token_id
 
     def _get_tp_mesh_name(self) -> str:
         mesh_dim_names = getattr(self._device_mesh_cpu, "mesh_dim_names", None) or ()
@@ -284,10 +285,10 @@ class SGLangRollout(BaseRollout):
         if first_rank_in_node:
             rank = dist.get_rank()
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-            self._engine = Engine(
+            engine_kwargs = dict(
                 model_path=actor_module,
                 dtype=self.config.dtype,
-                mem_fraction_static=self.config.gpu_memory_utilization,
+                mem_fraction_static=self.config.get("mem_fraction_static", self.config.gpu_memory_utilization),
                 enable_memory_saver=True,
                 base_gpu_id=0,
                 gpu_id_step=1,
@@ -308,6 +309,13 @@ class SGLangRollout(BaseRollout):
                 # log_requests_level=2,
                 # max_running_requests=1,
             )
+            if self.config.get("max_running_requests") is not None:
+                engine_kwargs["max_running_requests"] = self.config.get("max_running_requests")
+            if self.config.get("attention_backend"):
+                engine_kwargs["attention_backend"] = self.config.get("attention_backend")
+            if self.config.get("dllm_algorithm"):
+                engine_kwargs["dllm_algorithm"] = self.config.get("dllm_algorithm")
+            self._engine = Engine(**engine_kwargs)
         else:
             self._engine = None
 
@@ -506,7 +514,9 @@ class SGLangRollout(BaseRollout):
 
         # used to generate attention mask for the
         # response based on EOS token position
-        eos_token_id = prompts.meta_info["eos_token_id"]
+        eos_token_id = prompts.meta_info.get("eos_token_id", self.eos_token_id)
+        if eos_token_id is None:
+            eos_token_id = self.pad_token_id
 
         batch_size = idx.size(0)
 
