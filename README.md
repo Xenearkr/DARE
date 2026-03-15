@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
+- [2026-03-16]: Support bgpo and ebpo for LLaDA2.X.
 - [2026-03-13]: Fix bugs in SDAR SGLang rollout and dp actor.
 - [2026-03-12]: Support sp for SDAR family, LLaDA2.0 and 2.1.
 - [2026-03-10]: Support evaluation of SDAR-30B-A3B-Chat with SGLang and lmdeploy.
@@ -304,8 +305,8 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **SDAR-4B-Chat** | 4B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
 | **SDAR-8B-Chat** | 8B | sft/rl | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
 | **SDAR-30B-A3B-Chat** | 30BA3B | sft | ✅ | [lmdeploy](https://github.com/InternLM/lmdeploy) [SGLang](https://github.com/sgl-project/sglang) |
-| **LLaDA2.0-mini** | 16BA1B | sft | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
-| **LLaDA2.1-mini** | 16BA1B | sft | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
+| **LLaDA2.0-mini** | 16BA1B | sft/rl | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
+| **LLaDA2.1-mini** | 16BA1B | sft/rl | ✅ | [SGLang](https://github.com/sgl-project/sglang) |
 
 
 ## 🌱 Supported RL Algorithms
@@ -319,6 +320,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **cj-grpo** | [2509.23924](https://arxiv.org/pdf/2509.23924) | [yjyddq/EOSER-ASS-RL](https://github.com/yjyddq/EOSER-ASS-RL) |
 | **spg** | [2510.09541](https://arxiv.org/pdf/2510.09541) | [facebookresearch/SPG](https://github.com/facebookresearch/SPG) |
 | **bgpo** | [2510.11683](https://arxiv.org/pdf/2510.11683) | [THU-KEG/BGPO](https://github.com/THU-KEG/BGPO) |
+| **ebpo** | [2602.08676](https://arxiv.org/pdf/2602.08676) | [inclusionAI/LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X) (closed source) |
 
 
 ## 📈 Performance

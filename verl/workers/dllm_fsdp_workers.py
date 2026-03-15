@@ -135,6 +135,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             "eos_token_id": self.tokenizer.eos_token_id,
             "pad_token_id": self.tokenizer.pad_token_id,
         }
+        if getattr(self.tokenizer, "mask_token_id", None) is not None:
+            override_config_kwargs["mask_token_id"] = self.tokenizer.mask_token_id
         override_config_kwargs.update(override_model_config)
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
@@ -368,6 +370,13 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                     rollout_sharding_manager = BaseShardingManager()
                     # TODO: a sharding manager that do nothing?
 
+            elif self.config.model.name == 'llada2':
+                from verl.workers.rollout.llada2_rollout import DLLMRollout
+                from verl.workers.sharding_manager.base import BaseShardingManager
+
+                rollout = DLLMRollout(module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer)
+                rollout_sharding_manager = BaseShardingManager()
+
             elif self.config.model.name == 'dream':
                 if self.config.algorithm.name == "mdpo":
                     from verl.workers.rollout.mdpo_dream_rollout import MDPORollout
@@ -559,6 +568,14 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_vrpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'mdpo':
                 from verl.workers.actor.llada_dp_actor_mdpo import DLLMDataParallelPPOActor
+            else:
+                raise NotImplementedError
+
+        elif self.config.model.name == 'llada2':
+            if self.config.algorithm.name == 'bgpo':
+                from verl.workers.actor.llada2_dp_actor_bgpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'ebpo':
+                from verl.workers.actor.llada2_dp_actor_ebpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 
@@ -790,7 +807,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         MASK_TOKEN_ID = self.actor_module_fsdp.config.mask_token_id
 
         # select _forward_process according to algorithm
-        if self.config.algorithm.name in ["d1", "bgpo", "coupled-grpo", "vrpo"]:
+        if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "coupled-grpo", "vrpo"]:
             if self.config.algorithm.name == "d1":
                 assert n_l == mc_num == 1, "d1 method requires n_l == mc_num == 1"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_d1 as _forward_process
@@ -799,6 +816,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_coupled_grpo as _forward_process
             elif self.config.algorithm.name == "bgpo":
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_bgpo as _forward_process
+            elif self.config.algorithm.name == "ebpo":
+                from verl.trainer.ppo.dllm_core_algos import _forward_process_ebpo as _forward_process
             elif self.config.algorithm.name == "vrpo":
                 assert n_l == mc_num, "vrpo allocates the full budget to timesteps, requires n_l == mc_num"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_vrpo as _forward_process
@@ -822,7 +841,15 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                     mc_p_mask_list = []
                     
                     for j in range(n_y_l):
-                        perturbed_seq, mask_indices, p_mask = _forward_process(batch=single_input_id, attention_mask=attention_mask[i], prompt_len=prompt_len, MASK_TOKEN_ID=MASK_TOKEN_ID)  # (n_l, seq_len)
+                        forward_kwargs = {
+                            "batch": single_input_id,
+                            "attention_mask": attention_mask[i],
+                            "prompt_len": prompt_len,
+                            "MASK_TOKEN_ID": MASK_TOKEN_ID,
+                        }
+                        if self.config.algorithm.name == "ebpo":
+                            forward_kwargs["block_length"] = self.config.rollout["block_length"]
+                        perturbed_seq, mask_indices, p_mask = _forward_process(**forward_kwargs)  # (n_l, seq_len)
                         assert (mask_indices == (perturbed_seq == MASK_TOKEN_ID)).all()
                         
                         mc_perturbed_seq_list.append(perturbed_seq)

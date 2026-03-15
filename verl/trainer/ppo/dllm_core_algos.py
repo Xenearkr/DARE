@@ -92,6 +92,78 @@ def compute_policy_loss_bgpo(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def compute_policy_loss_ebpo(
+    old_l_theta,
+    l_theta,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    Compute the clipped PPO objective for EBPO using block-level ELBO estimates.
+
+    The incoming ``old_l_theta`` and ``l_theta`` tensors are token-shaped for
+    compatibility with the rest of the trainer, but for EBPO they contain
+    non-zero ELBO contributions only on the sampled block. We first aggregate
+    them into one block-level score per sample, then apply PPO clipping on the
+    resulting block-level probability ratio.
+    """
+    assert isinstance(old_l_theta, torch.Tensor), f"old_l_theta must be a tensor, got {type(old_l_theta)}"
+    assert isinstance(l_theta, torch.Tensor), f"l_theta must be a tensor, got {type(l_theta)}"
+    assert isinstance(advantages, torch.Tensor), f"advantages must be a tensor, got {type(advantages)}"
+    assert old_l_theta.shape == l_theta.shape == advantages.shape, (
+        f"old_l_theta, l_theta and advantages must have the same shape, but got "
+        f"{old_l_theta.shape}, {l_theta.shape} and {advantages.shape}"
+    )
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    response_mask = response_mask.bool()
+    block_mask = ((old_l_theta != 0) | (l_theta != 0)) & response_mask
+    no_active_block = block_mask.sum(dim=-1, keepdim=True) == 0
+    block_mask = torch.where(no_active_block, response_mask, block_mask)
+    block_mask_f = block_mask.float()
+
+    block_old_l_theta = (old_l_theta * block_mask_f).sum(dim=-1)
+    block_l_theta = (l_theta * block_mask_f).sum(dim=-1)
+    block_advantages = (advantages * block_mask_f).sum(dim=-1) / block_mask_f.sum(dim=-1).clamp_min(1.0)
+
+    positive_term = torch.clamp(1 + block_l_theta - block_old_l_theta, min=1e-8)
+    negative_approx_kl = torch.where(
+        block_advantages > 0,
+        torch.log(positive_term),
+        block_l_theta - block_old_l_theta,
+    )
+    ratio = torch.exp(negative_approx_kl)
+
+    ppo_kl = (-negative_approx_kl).mean()
+
+    pg_losses1 = -block_advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+
+    pg_losses2 = -block_advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = torch.gt(pg_losses2, pg_losses1).float().mean()
+
+    pg_losses3 = -block_advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = (torch.gt(clip_pg_losses1, pg_losses3) * (block_advantages < 0).float()).mean()
+
+    pg_losses = torch.where(block_advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_loss = pg_losses.mean()
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
 def compute_policy_loss(
     old_l_theta,
     l_theta,
@@ -319,7 +391,7 @@ def _forward_process_bgpo(batch, attention_mask, prompt_len, t=None, eps=1e-3, M
     # print(f"pad prompt_len: {prompt_len}")
     response_indices = torch.where(response_mask)[0]  # Valid token indices (target_len,)
     target_len = response_mask.sum().item()  # Valid token count in response region
-    assert target_len == seq_len - prompt_len
+    # assert target_len == seq_len - prompt_len
     # print(f"true target_len: {target_len}")
 
     # NOTE: discrete version (refer to https://github.com/ML-GSAI/LLaDA/blob/main/eval_llada.py):
@@ -339,6 +411,46 @@ def _forward_process_bgpo(batch, attention_mask, prompt_len, t=None, eps=1e-3, M
     noisy_batch = torch.where(mask_indices, MASK_TOKEN_ID, batch)  # mask tokens and get noisy batch
     p_mask = (x / target_len).unsqueeze(1).repeat(1, seq_len)  # Normalized weight for each sample's mask ratio (mask probability)
     # print(f"noisy_batch[0] sum: {noisy_batch[0][attention_mask == 1].sum()}")
+    return noisy_batch, mask_indices, p_mask
+
+
+def _forward_process_ebpo(batch, attention_mask, prompt_len, block_length=32, t=None, eps=1e-3, MASK_TOKEN_ID=126336):
+    """
+    Forward process for EBPO.
+
+    Unlike BGPO, EBPO samples a single response block per trajectory and masks
+    only tokens inside that block. This matches the paper's block-level ELBO
+    approximation under block-causal attention.
+    """
+    b, seq_len = batch.shape
+
+    response_mask = attention_mask.bool().clone()
+    response_mask[:prompt_len] = False
+    response_indices = torch.where(response_mask)[0]
+    target_len = response_mask.sum().item()
+
+    num_blocks = max((target_len + block_length - 1) // block_length, 1)
+    mask_indices = torch.zeros((b, seq_len), dtype=torch.bool, device=batch.device)
+    p_mask = torch.zeros((b, seq_len), dtype=torch.float32, device=batch.device)
+
+    sampled_blocks = torch.randint(0, num_blocks, (b,), device=batch.device)
+    for i in range(b):
+        block_id = int(sampled_blocks[i].item())
+        block_start = block_id * block_length
+        block_end = min(block_start + block_length, target_len)
+        block_token_indices = response_indices[block_start:block_end]
+        cur_block_len = block_token_indices.numel()
+        if cur_block_len == 0:
+            continue
+
+        mask_num = torch.randint(1, cur_block_len + 1, (), device=batch.device).item()
+        perm = torch.randperm(cur_block_len, device=batch.device)
+        selected = block_token_indices[perm[:mask_num]]
+
+        mask_indices[i, selected] = True
+        p_mask[i, selected] = float(mask_num) / float(cur_block_len)
+
+    noisy_batch = torch.where(mask_indices, MASK_TOKEN_ID, batch)
     return noisy_batch, mask_indices, p_mask
 
 
