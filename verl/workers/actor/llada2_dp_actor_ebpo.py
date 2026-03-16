@@ -19,6 +19,7 @@ stores ELBO contributions only on the sampled response block and optimizes a
 true block-level PPO objective.
 """
 
+import itertools
 import logging
 import os
 
@@ -30,7 +31,7 @@ from verl.trainer.ppo.dllm_core_algos import agg_loss, compute_policy_loss_ebpo,
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_torch_device
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import rearrange_micro_batches
+from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.workers.actor.llada2_dp_actor_bgpo import DLLMDataParallelPPOActor as BGPOActor
 
 logger = logging.getLogger(__file__)
@@ -38,10 +39,42 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class DLLMDataParallelPPOActor(BGPOActor):
+    def _get_num_blocks(self, response_length: int) -> int:
+        return (response_length + self.block_length - 1) // self.block_length
+
+    def _build_block_response_mask(self, response_mask: torch.Tensor) -> torch.Tensor:
+        batch_size, response_length = response_mask.shape
+        num_blocks = self._get_num_blocks(response_length)
+        pad_len = num_blocks * self.block_length - response_length
+        if pad_len > 0:
+            response_mask = F.pad(response_mask, (0, pad_len), value=0)
+        return response_mask.view(batch_size, num_blocks, self.block_length).any(dim=-1)
+
+    def _aggregate_token_to_blocks(self, token: torch.Tensor, token_mask: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+        batch_size, response_length = token.shape
+        num_blocks = self._get_num_blocks(response_length)
+        pad_len = num_blocks * self.block_length - response_length
+        if pad_len > 0:
+            token = F.pad(token, (0, pad_len), value=0)
+            token_mask = F.pad(token_mask, (0, pad_len), value=0)
+   
+        token = token.view(batch_size, num_blocks, self.block_length)
+        token_mask = token_mask.view(batch_size, num_blocks, self.block_length).float()
+        # denom = token_mask.sum(dim=-1).clamp_min(1.0)
+        # return (token_scores * token_mask).sum(dim=-1) / denom
+        block = (token * token_mask).sum(dim=-1)
+        if reduction == "sum":
+            return block
+        if reduction == "mean":
+            denom = token_mask.sum(dim=-1).clamp_min(1.0)
+            return block / denom
+        raise ValueError(f"Unsupported reduction: {reduction}")
+    
     def _forward_micro_batch(self, micro_batch, temperature, n_l, mc_num, calculate_entropy=False, call_fn_name=""):
         batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
         response_length = micro_batch["responses"].size(-1)
         prompt_section_length = seq_length - response_length
+        num_blocks = self._get_num_blocks(response_length)
         device = micro_batch["input_ids"].device
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -120,13 +153,12 @@ class DLLMDataParallelPPOActor(BGPOActor):
                     block_positions = torch.nonzero(block_target_mask, as_tuple=False).flatten() + block_start
                     loss_per_token[b, i, block_positions] = block_token_losses
 
-            log_prob = loss_per_token.mean(dim=1)
+            log_likelihood = loss_per_token.mean(dim=1).sum(dim=-1)
+            log_prob = log_likelihood.unsqueeze(-1).expand(-1, response_length) # (batch_size, response_length)
 
         entropy = None
         if calculate_entropy:
-            entropy = torch.zeros_like(log_prob)
-            nonzero = log_prob != 0
-            entropy[nonzero] = -log_prob[nonzero].exp() * log_prob[nonzero]
+            entropy = -log_prob.exp() * log_prob
 
         return entropy, log_prob, loss_per_token
 
@@ -194,8 +226,10 @@ class DLLMDataParallelPPOActor(BGPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
+                    block_response_mask = self._build_block_response_mask(response_mask)
                     old_loss_per_sample = data["old_loss_per_sample"]
-                    advantages = data["advantages"]
+                    # advantages = data["advantages"]
+                    advantages = self._aggregate_token_to_blocks(data["advantages"], response_mask, reduction="mean")
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -221,7 +255,7 @@ class DLLMDataParallelPPOActor(BGPOActor):
                             "mask_indices": mask_indices[:, i : i + 1],
                             "p_mask": p_mask[:, i : i + 1],
                         }
-                        entropy, log_prob, loss_per_example = self._forward_micro_batch(
+                        entropy, log_prob, loss_per_sample = self._forward_micro_batch(
                             micro_batch=cur_data,
                             temperature=temperature,
                             n_l=1,
@@ -229,12 +263,21 @@ class DLLMDataParallelPPOActor(BGPOActor):
                             calculate_entropy=calculate_entropy,
                             call_fn_name="update_policy",
                         )
-
+                        old_loss_per_block = self._aggregate_token_to_blocks(
+                            old_loss_per_sample[:, i, :],
+                            response_mask,
+                            reduction="sum",
+                        )
+                        loss_per_block = self._aggregate_token_to_blocks(
+                            loss_per_sample[:, 0, :],
+                            response_mask,
+                            reduction="sum",
+                        )
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_ebpo(
-                            old_l_theta=old_loss_per_sample[:, i, :],
-                            l_theta=loss_per_example[:, 0, :],
+                            old_l_theta=old_loss_per_block,
+                            l_theta=loss_per_block,
                             advantages=advantages,
-                            response_mask=response_mask,
+                            response_mask=block_response_mask,
                             cliprange=clip_ratio,
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,
@@ -244,6 +287,7 @@ class DLLMDataParallelPPOActor(BGPOActor):
 
                         if entropy_coeff != 0:
                             entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            # entropy_loss = agg_loss(loss_mat=entropy, loss_mask=block_response_mask, loss_agg_mode=loss_agg_mode)
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
                             policy_loss = pg_loss
@@ -257,6 +301,7 @@ class DLLMDataParallelPPOActor(BGPOActor):
                                 advantages=advantages,
                             )
                             kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            # kl_loss = agg_loss(loss_mat=kld, loss_mask=block_response_mask, loss_agg_mode=loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                             metrics["actor/kl_loss"] = kl_loss.detach().item()
                             metrics["actor/kl_coef"] = self.config.kl_loss_coef
