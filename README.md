@@ -404,7 +404,7 @@ If you find our work useful, please consider citing:
 We thank the open-source community for their wonderful work and valuable contributions:
 - Models Source: [GSAI-ML](https://huggingface.co/GSAI-ML), [inclusionAI](https://huggingface.co/inclusionAI), [Dream-org](https://huggingface.co/Dream-org), [JetLM](https://huggingface.co/JetLM), [huggingface](https://huggingface.co/) for model supply or hosting
 - Algorithm: [d1](https://github.com/dllm-reasoning/d1), [CJ-GRPO](https://github.com/yjyddq/EOSER-ASS-RL), [MDPO](https://github.com/autonomousvision/mdpo), [Coupled-GRPO](https://github.com/apple/ml-diffucoder), [SPG](https://github.com/facebookresearch/SPG), [BGPO](https://github.com/THU-KEG/BGPO), [LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X)
-- Training Framework: [verl](https://github.com/volcengine/verl), [BGPO](https://github.com/THU-KEG/BGPO), [Dream](https://github.com/DreamLM/Dream)
+- Training Framework: [verl](https://github.com/volcengine/verl), [BGPO](https://github.com/THU-KEG/BGPO), [Dream](https://github.com/DreamLM/Dream), [dFactory](https://github.com/inclusionAI/dFactory)
 - Inference Acceleration/Engine: [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [lmdeploy](https://github.com/InternLM/lmdeploy), [SGLang](https://github.com/sgl-project/sglang)
 - Evaluation Framework: [opencompass](https://github.com/open-compass/opencompass), [LLaDA](https://github.com/ML-GSAI/LLaDA)
 
