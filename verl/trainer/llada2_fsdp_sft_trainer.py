@@ -46,7 +46,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, PreTrainedModel
 
 import verl.utils.hdfs_io as hdfs_io
-from verl.utils.dataset.llada_sft_dataset import dLLMSFTDataset
+from verl.utils.dataset.llada2_sft_dataset import dLLMSFTDataset
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fs import copy_to_local
@@ -104,6 +104,10 @@ class FSDPLLada2SFTTrainer:
         self.ulysses_device_mesh = ulysses_device_mesh
         self.sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self.tokenizer = tokenizer
+        self.debug_enabled = os.getenv("LLADA2_SFT_DEBUG", "0").lower() not in ("", "0", "false", "no")
+        self.debug_max_steps = int(os.getenv("LLADA2_SFT_DEBUG_MAX_STEPS", "3"))
+        self._debug_forward_calls = 0
+        self._debug_training_steps = 0
         if self.config.data.chat_template is not None:
             raise ValueError("Apply Chat template from config is not supported yet.")
 
@@ -130,38 +134,115 @@ class FSDPLLada2SFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(self.config)
         self.device_name = get_device_name()
-        self._causal_mask_cache = {}
+        self._attention_mask_cache = {}
 
-    def _build_llada2_block_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Convert attention mask to LLaDA2-required additive block mask [B, 1, L, L]."""
+    def _debug_should_log(self, step_idx: int | None = None) -> bool:
+        if not self.debug_enabled or self.device_mesh.get_rank() != 0:
+            return False
+        if step_idx is None:
+            return True
+        return step_idx <= self.debug_max_steps
+
+    def _debug_print(self, message: str, step_idx: int | None = None):
+        if self._debug_should_log(step_idx):
+            print(f"[llada2_sft_debug][rank{self.device_mesh.get_rank()}] {message}", flush=True)
+
+    def _debug_tensor_summary(self, name: str, tensor: torch.Tensor) -> str:
+        if tensor is None:
+            return f"{name}=None"
+        summary = f"{name}.shape={tuple(tensor.shape)} {name}.dtype={tensor.dtype} {name}.device={tensor.device}"
+        if tensor.numel() > 0 and tensor.is_floating_point():
+            finite_mask = torch.isfinite(tensor)
+            finite_count = int(finite_mask.sum().item())
+            summary += (
+                f" {name}.finite={finite_count}/{tensor.numel()}"
+                f" {name}.min={float(tensor.min().item()):.4e}"
+                f" {name}.max={float(tensor.max().item()):.4e}"
+            )
+        elif tensor.numel() > 0:
+            summary += (
+                f" {name}.min={int(tensor.min().item())}"
+                f" {name}.max={int(tensor.max().item())}"
+            )
+        return summary
+
+    def _debug_cuda_memory(self) -> str:
+        if not is_cuda_available:
+            return "cuda=unavailable"
+        device_idx = get_torch_device().current_device()
+        allocated = torch.cuda.memory_allocated(device_idx) / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved(device_idx) / (1024 ** 3)
+        return f"cuda_mem_gb(allocated={allocated:.2f}, reserved={reserved:.2f}, device={device_idx})"
+
+    def _manual_clip_grad_norm_(self, parameters, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
+        params = [param for param in parameters if param.grad is not None]
+        if len(params) == 0:
+            return torch.zeros((), device=self.device_name)
+
+        if norm_type != 2.0:
+            raise NotImplementedError("LLaDA2 SFT manual grad clip currently only supports L2 norm.")
+
+        local_sq_norm = torch.zeros((), device=params[0].grad.device, dtype=torch.float32)
+        for param in params:
+            grad = param.grad.detach()
+            local_sq_norm += torch.sum(grad.float() * grad.float())
+
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local_sq_norm, op=torch.distributed.ReduceOp.SUM)
+
+        total_norm = torch.sqrt(local_sq_norm)
+        max_norm = float(max_norm)
+        if max_norm > 0:
+            clip_coef = max_norm / (total_norm.item() + 1e-6)
+            if clip_coef < 1.0:
+                for param in params:
+                    param.grad.mul_(clip_coef)
+        return total_norm
+
+    def _build_llada2_causal_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Placeholder for the legacy non-block-diffusion path."""
+        pass
+
+    def _build_llada2_block_diffusion_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Build the official LLaDA2 block-diffusion mask over `[noisy_x, clean_x]`."""
         mask_dtype = getattr(self, "model_dtype", torch.float32)
         if not isinstance(mask_dtype, torch.dtype):
             mask_dtype = torch.float32
 
-        if attention_mask.dim() == 4:
-            if attention_mask.dtype == torch.bool:
-                block_mask = torch.zeros_like(attention_mask, dtype=mask_dtype)
-                block_mask.masked_fill_(~attention_mask, torch.finfo(mask_dtype).min)
-                return block_mask
-            return attention_mask.to(dtype=mask_dtype)
         if attention_mask.dim() != 2:
-            raise ValueError(f"Expected attention_mask dim 2 or 4, got shape {tuple(attention_mask.shape)}")
+            raise ValueError(
+                f"Expected 2D attention_mask for block-diffusion SFT, got shape {tuple(attention_mask.shape)}"
+            )
 
         attention_mask = attention_mask.bool()
         batch_size, seq_len = attention_mask.shape
+        device = attention_mask.device
+        block_size = self.config.trainer.get("block_size", 32)
+        full_len = seq_len * 2
+        cache_key = ("block_diffusion_base", full_len, block_size, device)
+        cached_base_mask = self._attention_mask_cache.get(cache_key)
+        if cached_base_mask is None or cached_base_mask.device != device:
+            q_idx = torch.arange(full_len, device=device)[:, None]
+            kv_idx = torch.arange(full_len, device=device)[None, :]
+            noisy_q = q_idx < seq_len
+            noisy_k = kv_idx < seq_len
+            block_q = torch.where(noisy_q, q_idx // block_size, (q_idx - seq_len) // block_size)
+            block_k = torch.where(noisy_k, kv_idx // block_size, (kv_idx - seq_len) // block_size)
 
-        causal_mask = self._causal_mask_cache.get(seq_len)
-        if causal_mask is None or causal_mask.device != attention_mask.device:
-            causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=attention_mask.device))
-            self._causal_mask_cache[seq_len] = causal_mask
+            block_diagonal = (block_q == block_k) & (noisy_q == noisy_k)
+            offset_block_causal = (block_q > block_k) & (~noisy_k) & noisy_q
+            block_causal = (block_q >= block_k) & (~noisy_k) & (~noisy_q)
+            cached_base_mask = block_diagonal | offset_block_causal | block_causal
+            self._attention_mask_cache[cache_key] = cached_base_mask
 
-        key_mask = attention_mask[:, None, None, :]
-        query_mask = attention_mask[:, None, :, None]
-        visible_mask = query_mask & key_mask & causal_mask[None, None, :, :]
+        full_valid_mask = torch.cat((attention_mask, attention_mask), dim=1)
+        query_mask = full_valid_mask[:, None, :, None]
+        key_mask = full_valid_mask[:, None, None, :]
+        visible_mask = query_mask & key_mask & cached_base_mask.unsqueeze(0).unsqueeze(0)
 
-        block_mask = torch.zeros((batch_size, 1, seq_len, seq_len), dtype=mask_dtype, device=attention_mask.device)
-        block_mask.masked_fill_(~visible_mask, torch.finfo(mask_dtype).min)
-        return block_mask
+        additive_mask = torch.zeros((batch_size, 1, full_len, full_len), dtype=mask_dtype, device=device)
+        additive_mask.masked_fill_(~visible_mask, torch.finfo(mask_dtype).min)
+        return additive_mask
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -384,84 +465,190 @@ class FSDPLLada2SFTTrainer:
     def _compute_loss_and_backward(self, batch, do_backward=True):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.config.ulysses_sequence_parallel_size > 1
+        block_diffusion_mode = self.config.trainer.get("block_diffusion_mode", True)
+        same_token_labels = self.config.trainer.get("same_token_labels", True)
+        self._debug_forward_calls += 1
+        debug_step_idx = self._debug_forward_calls
 
         # Move inputs to GPU and prepare loss mask
-        input_ids = batch["input_ids"].to(self.device_name)
+        noisy_input_ids = batch.get("noisy_input_ids", batch["input_ids"]).to(self.device_name)
+        clean_input_ids = batch.get("clean_input_ids", None)
+        if clean_input_ids is not None:
+            clean_input_ids = clean_input_ids.to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
         loss_mask = batch.pop("loss_mask").to(self.device_name)
         loss_fct = nn.CrossEntropyLoss(reduction="none")
-        t = batch["t"].to(self.device_name)
         labels = batch["labels"].to(self.device_name)
 
         # Context manager for sequence parallel if needed
         context = self.sharding_manager if use_sp else nullcontext()
         with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            if not use_sp:
-                # Standard forward pass without sequence parallel
-                # LLaDA2 requires block attention mask with shape [B, 1, L, L].
-                block_attention_mask = self._build_llada2_block_attention_mask(attention_mask)
-                output = self.fsdp_model(
-                    input_ids=input_ids,
-                    attention_mask=block_attention_mask,
-                    position_ids=position_ids,
-                    use_cache=False,
+            if not block_diffusion_mode:
+                raise NotImplementedError(
+                    "LLaDA2 SFT currently only supports trainer.block_diffusion_mode=true."
                 )
-                logits = output.logits
 
-                # Flatten the tokens
-                logits = logits.view(-1, self.model.config.vocab_size)
-                labels = labels.view(-1)
-                # Enable model parallelism
-                unsclaed_loss = loss_fct(logits, labels).view(input_ids.shape[0], -1)
+            if clean_input_ids is None:
+                raise ValueError("llada2 block-diffusion SFT requires `clean_input_ids` in the batch.")
 
-                loss = unsclaed_loss / t.unsqueeze(-1).view(input_ids.shape[0], -1)
-                loss = loss * loss_mask.to(loss.device)
-            else:
-                sp_size = get_ulysses_sequence_parallel_world_size()
-                seqlen = input_ids.size(1)
-                pad_size = (sp_size - seqlen % sp_size) % sp_size
+            self._debug_print(
+                "block_diffusion enter "
+                + " | ".join([
+                    self._debug_tensor_summary("noisy_input_ids", noisy_input_ids),
+                    self._debug_tensor_summary("clean_input_ids", clean_input_ids),
+                    self._debug_tensor_summary("attention_mask", attention_mask),
+                    self._debug_tensor_summary("position_ids", position_ids),
+                    self._debug_tensor_summary("labels", labels),
+                    self._debug_tensor_summary("loss_mask", loss_mask),
+                    self._debug_cuda_memory(),
+                ]),
+                debug_step_idx,
+            )
 
-                block_attention_mask = self._build_llada2_block_attention_mask(attention_mask)
+            batch_size, seq_len = noisy_input_ids.shape
+            full_input_ids = torch.cat((noisy_input_ids, clean_input_ids), dim=1)
+            full_position_ids = torch.cat((position_ids, position_ids), dim=1)
+            block_attention_mask = self._build_llada2_block_diffusion_attention_mask(attention_mask)
+            self._debug_print(
+                "block_diffusion mask_ready "
+                + " | ".join([
+                    self._debug_tensor_summary("full_input_ids", full_input_ids),
+                    self._debug_tensor_summary("full_position_ids", full_position_ids),
+                    self._debug_tensor_summary("block_attention_mask", block_attention_mask),
+                    self._debug_cuda_memory(),
+                ]),
+                debug_step_idx,
+            )
 
-                if pad_size > 0:
-                    input_ids_local = torch.nn.functional.pad(
-                        input_ids, (0, pad_size), value=self.tokenizer.pad_token_id
+            if use_sp:
+                if noisy_input_ids.size(0) != 1:
+                    raise ValueError(
+                        "LLaDA2 block-diffusion sequence parallelism currently requires micro_batch_size_per_gpu == 1."
                     )
-                    labels_local = torch.nn.functional.pad(labels, (0, pad_size), value=0)
-                    position_ids_local = torch.nn.functional.pad(position_ids, (0, pad_size), value=0)
-                else:
-                    input_ids_local = input_ids
-                    labels_local = labels
-                    position_ids_local = position_ids
 
-                input_ids_local = slice_input_tensor(input_ids_local, dim=1, padding=False)
-                labels_local = slice_input_tensor(labels_local, dim=1, padding=False)
-                position_ids_local = slice_input_tensor(position_ids_local, dim=1, padding=False)
-
-                output = self.fsdp_model(
-                    input_ids=input_ids_local,
-                    attention_mask=block_attention_mask,
-                    position_ids=position_ids_local,
-                    use_cache=False,
+                sp_size = get_ulysses_sequence_parallel_world_size()
+                full_labels = torch.cat(
+                    (
+                        labels,
+                        torch.full_like(labels, fill_value=-100),
+                    ),
+                    dim=1,
+                )
+                full_loss_mask = torch.cat(
+                    (
+                        loss_mask,
+                        torch.zeros_like(loss_mask, dtype=loss_mask.dtype),
+                    ),
+                    dim=1,
                 )
 
+                full_input_ids_local, full_position_ids_local, pad_size = ulysses_pad_and_slice_inputs(
+                    full_input_ids,
+                    full_position_ids,
+                    sp_size=sp_size,
+                )
+                if pad_size > 0:
+                    full_labels = torch.nn.functional.pad(full_labels, (0, pad_size), value=-100)
+                    full_loss_mask = torch.nn.functional.pad(full_loss_mask, (0, pad_size), value=0)
+
+                full_labels_local = slice_input_tensor(full_labels, dim=1, padding=False)
+                full_loss_mask_local = slice_input_tensor(full_loss_mask, dim=1, padding=False)
+
+                self._debug_print(
+                    "block_diffusion sp_inputs_ready "
+                    + " | ".join([
+                        self._debug_tensor_summary("full_input_ids_local", full_input_ids_local),
+                        self._debug_tensor_summary("full_position_ids_local", full_position_ids_local),
+                        self._debug_tensor_summary("full_labels_local", full_labels_local),
+                        self._debug_tensor_summary("full_loss_mask_local", full_loss_mask_local),
+                        f"pad_size={pad_size}",
+                        self._debug_cuda_memory(),
+                    ]),
+                    debug_step_idx,
+                )
+
+                self._debug_print("block_diffusion sp_forward_start", debug_step_idx)
+                output = self.fsdp_model(
+                    input_ids=full_input_ids_local,
+                    attention_mask=block_attention_mask,
+                    position_ids=full_position_ids_local,
+                    use_cache=False,
+                )
                 logits_local = output.logits
+                self._debug_print(
+                    "block_diffusion sp_forward_done "
+                    + " | ".join([
+                        self._debug_tensor_summary("logits_local", logits_local),
+                        self._debug_cuda_memory(),
+                    ]),
+                    debug_step_idx,
+                )
+
                 local_loss = loss_fct(
                     logits_local.view(-1, self.model.config.vocab_size),
-                    labels_local.view(-1),
-                ).view_as(labels_local)
-
-                unsclaed_full_loss = gather_outpus_and_unpad(
+                    full_labels_local.view(-1),
+                ).view_as(full_labels_local)
+                local_loss = local_loss * full_loss_mask_local.to(local_loss.device)
+                loss = gather_outpus_and_unpad(
                     local_loss,
                     gather_dim=1,
                     unpad_dim=1,
                     padding_size=pad_size,
                     grad_scaler=False,
                 )
+                self._debug_print(
+                    "block_diffusion sp_loss_ready "
+                    + " | ".join([
+                        self._debug_tensor_summary("local_loss", local_loss),
+                        self._debug_tensor_summary("gathered_loss", loss),
+                        self._debug_cuda_memory(),
+                    ]),
+                    debug_step_idx,
+                )
+            else:
+                self._debug_print("block_diffusion forward_start", debug_step_idx)
+                output = self.fsdp_model(
+                    input_ids=full_input_ids,
+                    attention_mask=block_attention_mask,
+                    position_ids=full_position_ids,
+                    use_cache=False,
+                )
+                logits = output.logits[:, :seq_len, :]
+                self._debug_print(
+                    "block_diffusion forward_done "
+                    + " | ".join([
+                        self._debug_tensor_summary("logits", logits),
+                        self._debug_cuda_memory(),
+                    ]),
+                    debug_step_idx,
+                )
 
-                full_loss = unsclaed_full_loss / t.unsqueeze(-1)
-                loss = full_loss * loss_mask
+                if same_token_labels:
+                    unscaled_loss = loss_fct(
+                        logits.view(-1, self.model.config.vocab_size),
+                        labels.view(-1),
+                    ).view(batch_size, seq_len)
+                else:
+                    shifted_logits = logits[:, :-1, :].contiguous()
+                    shifted_labels = labels[:, 1:].contiguous()
+                    shifted_loss_mask = loss_mask[:, 1:].contiguous()
+                    unscaled_loss = loss_fct(
+                        shifted_logits.view(-1, self.model.config.vocab_size),
+                        shifted_labels.view(-1),
+                    ).view(batch_size, seq_len - 1)
+                    loss_mask = shifted_loss_mask
+
+                loss = unscaled_loss * loss_mask.to(unscaled_loss.device)
+                self._debug_print(
+                    "block_diffusion loss_ready "
+                    + " | ".join([
+                        self._debug_tensor_summary("unscaled_loss", unscaled_loss),
+                        self._debug_tensor_summary("loss", loss),
+                        self._debug_cuda_memory(),
+                    ]),
+                    debug_step_idx,
+                )
 
             valid_token_this_rank = torch.sum(loss_mask)
 
@@ -479,33 +666,67 @@ class FSDPLLada2SFTTrainer:
             loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
             # print('----loss----:', loss)
             if do_backward:
+                self._debug_print(
+                    "backward_start "
+                    + " | ".join([
+                        self._debug_tensor_summary("final_loss", loss.detach()),
+                        self._debug_cuda_memory(),
+                    ]),
+                    debug_step_idx,
+                )
                 loss.backward()
+                self._debug_print(f"backward_done | {self._debug_cuda_memory()}", debug_step_idx)
             return loss
 
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
+        self._debug_training_steps += 1
+        debug_step_idx = self._debug_training_steps
 
         log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
+        self._debug_print(f"training_step_start step={debug_step_idx} | {self._debug_cuda_memory()}", debug_step_idx)
 
         self.optimizer.zero_grad()
 
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
+        self._debug_print(f"after_zero_grad step={debug_step_idx} | {self._debug_cuda_memory()}", debug_step_idx)
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
+        self._debug_print(
+            f"micro_batch_loop_start step={debug_step_idx} n_micro_batches={n_micro_batches}",
+            debug_step_idx,
+        )
         for micro_batch in micro_batches:
             loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
             step_loss += loss.item()
+        self._debug_print(
+            f"micro_batch_loop_done step={debug_step_idx} accumulated_step_loss={step_loss:.6f} | {self._debug_cuda_memory()}",
+            debug_step_idx,
+        )
 
-        if self.config.model.strategy == 'fsdp':
-            grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        self._debug_print(f"before_grad_clip step={debug_step_idx} | {self._debug_cuda_memory()}", debug_step_idx)
+        trainable_params = [
+            param for param in self.fsdp_model.parameters() if param.requires_grad and param.grad is not None
+        ]
+        if len(trainable_params) == 0:
+            grad_norm = torch.zeros((), device=self.device_name)
+        elif self.config.model.strategy == 'fsdp':
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=self.config.optim.clip_grad)
         elif self.config.model.strategy == 'fsdp2':
-            grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
+            # grad_norm = fsdp2_clip_grad_norm_(trainable_params, max_norm=self.config.optim.clip_grad)
+            grad_norm = self._manual_clip_grad_norm_(trainable_params, max_norm=self.config.optim.clip_grad)
         else:
             raise NotImplementedError(f"not implement {self.config.model.strategy}")
+        grad_norm_value = float(grad_norm.detach().float().item())
+        self._debug_print(
+            f"after_grad_clip step={debug_step_idx} grad_norm={grad_norm_value:.6f} | {self._debug_cuda_memory()}",
+            debug_step_idx,
+        )
 
         log_gpu_memory_usage("Before optimizer step", logger=logger)
+        self._debug_print(f"before_optimizer_step step={debug_step_idx} | {self._debug_cuda_memory()}", debug_step_idx)
 
         # if grad_norm is not finite, skip the update
         if not torch.isfinite(grad_norm):
@@ -513,10 +734,13 @@ class FSDPLLada2SFTTrainer:
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
+        self._debug_print(f"after_optimizer_step step={debug_step_idx} | {self._debug_cuda_memory()}", debug_step_idx)
 
         log_gpu_memory_usage("After optimizer step", logger=logger)
 
+        self._debug_print(f"before_lr_scheduler_step step={debug_step_idx}", debug_step_idx)
         self.lr_scheduler.step()
+        self._debug_print(f"after_lr_scheduler_step step={debug_step_idx}", debug_step_idx)
 
         # reduce loss across dp ranks
         lr = self.lr_scheduler.get_last_lr()[0]
@@ -524,12 +748,34 @@ class FSDPLLada2SFTTrainer:
         log_gpu_memory_usage("After offload weights", logger=logger)
 
         step_loss = torch.tensor(step_loss).to(self.device_name)
+        self._debug_print(
+            "before_step_loss_all_reduce "
+            + " | ".join([
+                f"step={debug_step_idx}",
+                self._debug_tensor_summary("step_loss_tensor", step_loss),
+                self._debug_cuda_memory(),
+            ]),
+            debug_step_idx,
+        )
         if is_cuda_available:
             torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.ulysses_device_mesh.size(0)
-        return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3}
+        self._debug_print(
+            "after_step_loss_all_reduce "
+            + " | ".join([
+                f"step={debug_step_idx}",
+                self._debug_tensor_summary("step_loss_tensor", step_loss),
+                self._debug_cuda_memory(),
+            ]),
+            debug_step_idx,
+        )
+        return {
+            'train/loss': step_loss.detach().item(),
+            'train/grad_norm': grad_norm_value,
+            'train/lr(1e-3)': lr * 1e3,
+        }
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
@@ -604,6 +850,55 @@ class FSDPLLada2SFTTrainer:
 
         for epoch in range(self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
+            if self.debug_enabled:
+                train_iter = iter(self.train_dataloader)
+                progress = tqdm(
+                    range(self.steps_per_epoch),
+                    total=self.steps_per_epoch,
+                    desc=f"Epoch {epoch + 1}/{self.config.trainer.total_epochs}",
+                    disable=rank != 0,
+                )
+                for batch_idx in progress:
+                    debug_step_idx = batch_idx + 1
+                    self._debug_print(f"fit waiting_for_batch epoch={epoch + 1} batch_idx={debug_step_idx}", debug_step_idx)
+                    data = next(train_iter)
+                    if isinstance(data, dict):
+                        batch_keys = sorted(data.keys())
+                        batch_shapes = ", ".join(
+                            f"{key}:{tuple(value.shape)}" for key, value in data.items() if hasattr(value, "shape")
+                        )
+                    else:
+                        batch_keys = [type(data).__name__]
+                        batch_shapes = "n/a"
+                    self._debug_print(
+                        f"fit fetched_batch epoch={epoch + 1} batch_idx={debug_step_idx} "
+                        f"keys={batch_keys} shapes={batch_shapes}",
+                        debug_step_idx,
+                    )
+                    global_step += 1
+                    data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                    self._debug_print(f"fit tensordict_ready epoch={epoch + 1} batch_idx={debug_step_idx}", debug_step_idx)
+                    metric = self.training_step(data)
+                    self._debug_print(f"fit training_step_done epoch={epoch + 1} batch_idx={debug_step_idx} metric={metric}", debug_step_idx)
+                    if rank == 0:
+                        tracking.log(data=metric, step=global_step)
+
+                    if global_step >= self.total_training_steps:
+                        val_losses = []
+                        for val_data in self.val_dataloader:
+                            val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(self.device_name)
+                            val_loss = self.validation_step(val_data)
+                            val_losses.append(val_loss)
+                        if rank == 0:
+                            avg_val_loss = torch.mean(torch.stack(val_losses))
+                            metric = {"val/loss": avg_val_loss.detach().item()}
+                            tracking.log(data=metric, step=global_step)
+                        torch.distributed.barrier()
+
+                        self.save_checkpoint(step=global_step)
+                        return
+                continue
+
             for data in tqdm(
                 self.train_dataloader,
                 total=self.steps_per_epoch,

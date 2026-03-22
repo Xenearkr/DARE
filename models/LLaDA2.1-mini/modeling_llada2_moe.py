@@ -19,6 +19,7 @@
 """PyTorch LLaDA2MoE model."""
 
 import math
+import warnings
 from typing import List, Callable, Optional, Tuple, Union
 
 import torch
@@ -29,6 +30,7 @@ from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
+    _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from transformers.modeling_outputs import (
@@ -445,13 +447,12 @@ class LLaDA2MoeAttention(nn.Module):
             bias=config.use_qkv_bias,
         )
 
-        if self.config.use_qk_norm:
-            self.query_layernorm = LLaDA2MoeRMSNorm(
-                self.head_dim, eps=config.rms_norm_eps
-            )
-            self.key_layernorm = LLaDA2MoeRMSNorm(
-                self.head_dim, eps=config.rms_norm_eps
-            )
+        self.query_layernorm = LLaDA2MoeRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )
+        self.key_layernorm = LLaDA2MoeRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps
+        )
         self.dense = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=config.use_bias
         )
@@ -493,9 +494,8 @@ class LLaDA2MoeAttention(nn.Module):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
-        if self.config.use_qk_norm:
-            query_states = self.query_layernorm(query_states)
-            key_states = self.key_layernorm(key_states)
+        query_states = self.query_layernorm(query_states)
+        key_states = self.key_layernorm(key_states)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -538,12 +538,200 @@ class LLaDA2MoeAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
+class LLaDA2MoeSdpaAttention(LLaDA2MoeAttention):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            logger.warning_once(
+                "LLaDA2MoeModel is using LLaDA2MoeSdpaAttention, but "
+                "`torch.nn.functional.scaled_dot_product_attention` does not "
+                "support `output_attentions=True`. Falling back to the manual "
+                "attention implementation."
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        qkv = self.query_key_value(hidden_states)
+        qkv = qkv.view(
+            bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim
+        )
+
+        query_states, key_states, value_states = qkv.split(
+            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
+        )
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        query_states = self.query_layernorm(query_states)
+        key_states = self.key_layernorm(key_states)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        if attention_mask is not None and attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+
+        if query_states.device.type == "cuda" and attention_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=self.is_causal and attention_mask is None and q_len > 1,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.dense(attn_output)
+
+        return attn_output, None, past_key_value
+
+
+class LLaDA2MoeFlexAttention(LLaDA2MoeAttention):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        position_embeddings: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            logger.warning_once(
+                "LLaDA2MoeModel is using LLaDA2MoeFlexAttention, but "
+                "`flex_attention` does not support `output_attentions=True`. "
+                "Falling back to the manual attention implementation."
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+
+        qkv = self.query_key_value(hidden_states)
+        qkv = qkv.view(
+            bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim
+        )
+
+        query_states, key_states, value_states = qkv.split(
+            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
+        )
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        query_states = self.query_layernorm(query_states)
+        key_states = self.key_layernorm(key_states)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        if attention_mask is not None and attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
+
+        attn_output, _ = ALL_ATTENTION_FUNCTIONS["flex_attention"](
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            **kwargs,
+        )
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.dense(attn_output)
+
+        return attn_output, None, past_key_value
+
+
+ATTENTION_CLASSES = {
+    "eager": LLaDA2MoeAttention,
+    "flex_attention": LLaDA2MoeFlexAttention,
+    "sdpa": LLaDA2MoeSdpaAttention,
+}
+
+
 class LLaDA2MoeDecoderLayer(nn.Module):
     def __init__(self, config: LLaDA2MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.attention = LLaDA2MoeAttention(config=config, layer_idx=layer_idx)
+        self.attention = ATTENTION_CLASSES[config._attn_implementation](
+            config=config, layer_idx=layer_idx
+        )
 
         self.mlp = (
             LLaDA2MoeSparseMoeBlock(config)
@@ -863,16 +1051,46 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                 device=inputs_embeds.device,
             )
             position_ids = position_ids.unsqueeze(0)
-        if attention_mask.size() == (batch_size, 1, seq_length, seq_length):
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_seen_tokens,
-            )
+        if attention_mask is None:
+            if self._use_sdpa and not output_attentions:
+                attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                    attention_mask,
+                    (batch_size, seq_length),
+                    inputs_embeds,
+                    past_seen_tokens,
+                )
+            else:
+                attention_mask = _prepare_4d_causal_attention_mask(
+                    attention_mask,
+                    (batch_size, seq_length),
+                    inputs_embeds,
+                    past_seen_tokens,
+                )
+        elif attention_mask.dim() == 2:
+            if self._use_sdpa and not output_attentions:
+                attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                    attention_mask,
+                    (batch_size, seq_length),
+                    inputs_embeds,
+                    past_seen_tokens,
+                )
+            else:
+                attention_mask = _prepare_4d_causal_attention_mask(
+                    attention_mask,
+                    (batch_size, seq_length),
+                    inputs_embeds,
+                    past_seen_tokens,
+                )
+        elif attention_mask.dim() == 4:
+            if attention_mask.size(0) != batch_size or attention_mask.size(1) != 1 or attention_mask.size(2) != seq_length:
+                raise ValueError(
+                    "LLaDA2 only supports 4D attention masks with shape "
+                    f"(batch, 1, seq_len, kv_len), but got {attention_mask.size()=}."
+                )
         else:
             raise ValueError(
-                f"LLaDA2.0 only support block attention mask with shape: {(batch_size, 1, seq_length, seq_length)}, the input attention with shape {attention_mask.size()=}!"
+                "LLaDA2 only supports 2D padding masks or 4D block attention masks, "
+                f"but got {attention_mask.size()=}."
             )
         # embed positions
         hidden_states = inputs_embeds

@@ -259,11 +259,19 @@ def llada2_ulysses_model_forward(
 def apply_llada2_ulysses_patch(model):
     module = sys.modules[model.__module__]
 
-    if not hasattr(module.LLaDA2MoeAttention, "_original_ulysses_forward"):
-        module.LLaDA2MoeAttention._original_ulysses_forward = module.LLaDA2MoeAttention.forward
+    attention_classes = [module.LLaDA2MoeAttention]
+    if hasattr(module, "LLaDA2MoeSdpaAttention"):
+        attention_classes.append(module.LLaDA2MoeSdpaAttention)
+    if hasattr(module, "LLaDA2MoeFlexAttention"):
+        attention_classes.append(module.LLaDA2MoeFlexAttention)
+
+    for attention_cls in attention_classes:
+        if not hasattr(attention_cls, "_original_ulysses_forward"):
+            attention_cls._original_ulysses_forward = attention_cls.forward
     if not hasattr(module.LLaDA2MoeModel, "_original_ulysses_forward"):
         module.LLaDA2MoeModel._original_ulysses_forward = module.LLaDA2MoeModel.forward
 
-    module.LLaDA2MoeAttention.forward = llada2_ulysses_attention_forward
+    for attention_cls in attention_classes:
+        attention_cls.forward = llada2_ulysses_attention_forward
     module.LLaDA2MoeModel.forward = llada2_ulysses_model_forward
     print("Monkey patch LLaDA2Moe attention/model for Ulysses SP")

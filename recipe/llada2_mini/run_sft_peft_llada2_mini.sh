@@ -1,6 +1,6 @@
 set -x
 export HYDRA_FULL_ERROR=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Add memory fragmentation optimization
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Add memory fragmentation optimization
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export WANDB_PROJECT="DARE"
 export WANDB_API_KEY=
@@ -9,6 +9,8 @@ export WANDB_MODE="offline"
 export HF_HOME=
 export HF_HUB_OFFLINE=1
 export OMP_NUM_THREADS=1
+export LLADA2_SFT_DEBUG=0
+export LLADA2_SFT_DEBUG_MAX_STEPS=64
 
 echo "Usage: run_sft_peft_llada2_mini.sh <nproc_per_node> <model_path> [other_configs...]"
 
@@ -37,14 +39,16 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     data.response_key=extra_info \
     data.max_length=4096 \
     +data.mask_token_id=156895 \
+    +data.pad_token_id=156892 \
+    +data.noise_range_low=0.3 \
+    +data.noise_range_high=0.8 \
     optim.lr=1e-4 \
     data.prompt_dict_keys=['question'] \
     +data.response_dict_keys=['answer'] \
     data.micro_batch_size_per_gpu=1 \
-    data.train_batch_size=8 \
     model.partial_pretrain=${MODEL_PATH} \
     model.trust_remote_code=True \
-    +model.attn_implementation="eager" \
+    +model.attn_implementation="sdpa" \
     +model.fsdp_config.model_dtype=float16 \
     model.fsdp_config.wrap_policy.min_num_params=10000 \
     trainer.default_local_dir=$CKPT_DIR \
@@ -52,7 +56,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     trainer.experiment_name=$EXP_NAME \
     trainer.logger=["console","wandb"] \
     trainer.total_training_steps=1000 \
-    ulysses_sequence_parallel_size=2 \
+    +trainer.block_diffusion_mode=true \
+    +trainer.block_size=32 \
+    +trainer.same_token_labels=true \
+    ulysses_sequence_parallel_size=4 \
     use_remove_padding=true \
     model.lora_rank=32 \
     model.lora_alpha=16 \
@@ -63,4 +70,3 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
 # Note: For MoE models, we use min_num_params instead of transformer_layer_cls_to_wrap
 # to avoid sharding expert weights, which would incur significant communication overhead.
 # LLaDA2.0-mini local implementation does not support flash_attention_2.
-
