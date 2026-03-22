@@ -14,9 +14,9 @@
 """
 LLaDA2.x EBPO actor.
 
-EBPO keeps the same block-causal forward pass as the llada2 BGPO path, but it
-stores ELBO contributions only on the sampled response block and optimizes a
-true block-level PPO objective.
+Like the llada2 BGPO path, EBPO should use the official block-diffusion
+training semantics over `[noisy_x, clean_x]` and then keep ELBO contributions
+only on the sampled response block.
 """
 
 import itertools
@@ -50,6 +50,26 @@ class DLLMDataParallelPPOActor(BGPOActor):
             response_mask = F.pad(response_mask, (0, pad_len), value=0)
         return response_mask.view(batch_size, num_blocks, self.block_length).any(dim=-1)
 
+    def _build_active_response_masks(
+        self,
+        sampled_token_mask: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        response_mask = response_mask.bool()
+        sampled_token_mask = sampled_token_mask.bool() & response_mask
+        active_block_mask = self._build_block_response_mask(sampled_token_mask)
+
+        batch_size, response_length = response_mask.shape
+        num_blocks = active_block_mask.size(1)
+        padded_len = num_blocks * self.block_length
+        active_response_mask = (
+            active_block_mask.unsqueeze(-1)
+            .expand(batch_size, num_blocks, self.block_length)
+            .reshape(batch_size, padded_len)
+        )
+        active_response_mask = active_response_mask[:, :response_length] & response_mask
+        return active_block_mask, active_response_mask
+
     def _aggregate_token_to_blocks(self, token: torch.Tensor, token_mask: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
         batch_size, response_length = token.shape
         num_blocks = self._get_num_blocks(response_length)
@@ -74,14 +94,15 @@ class DLLMDataParallelPPOActor(BGPOActor):
         batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
         response_length = micro_batch["responses"].size(-1)
         prompt_section_length = seq_length - response_length
-        num_blocks = self._get_num_blocks(response_length)
         device = micro_batch["input_ids"].device
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             perturbed_seq = micro_batch["perturbed_seq"]
             mask_indices = micro_batch["mask_indices"]
             p_mask = micro_batch["p_mask"]
+            seq = micro_batch["input_ids"]
             attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
 
             loss_per_token = torch.zeros((batch_size, mc_num, response_length), device=device)
             for i in range(mc_num):
@@ -89,25 +110,29 @@ class DLLMDataParallelPPOActor(BGPOActor):
                 cur_mask_indices = mask_indices[:, i, :]
                 cur_p_mask = p_mask[:, i, :]
 
-                compact_seq, compact_valid_mask, compact_target_mask, compact_p_mask, position_ids = self._compact_batch(
-                    seq=cur_perturbed_seq,
+                compact_noisy_seq, compact_clean_seq, compact_valid_mask, compact_target_mask, compact_p_mask, compact_position_ids = self._compact_batch(
+                    noisy_seq=cur_perturbed_seq,
+                    clean_seq=seq,
                     attention_mask=attention_mask,
+                    position_ids=position_ids,
                     cur_mask_indices=cur_mask_indices,
                     cur_p_mask=cur_p_mask,
                 )
                 block_attention_mask = self._build_block_attention_mask(compact_valid_mask)
+                full_input_ids = torch.cat((compact_noisy_seq, compact_clean_seq), dim=1)
+                full_position_ids = torch.cat((compact_position_ids, compact_position_ids), dim=1)
 
                 logits = self.actor_module(
-                    input_ids=compact_seq,
+                    input_ids=full_input_ids,
                     attention_mask=block_attention_mask,
-                    position_ids=position_ids,
+                    position_ids=full_position_ids,
                     return_dict=True,
-                ).logits
+                ).logits[:, : compact_noisy_seq.size(1), :]
 
                 for b in range(batch_size):
                     cur_len = int(compact_valid_mask[b].sum().item())
                     valid_logits = logits[b, :cur_len]
-                    valid_targets = compact_seq[b, :cur_len]
+                    valid_targets = compact_clean_seq[b, :cur_len]
                     valid_target_mask = compact_target_mask[b, :cur_len]
                     valid_p_mask = compact_p_mask[b, :cur_len]
 
@@ -226,7 +251,6 @@ class DLLMDataParallelPPOActor(BGPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
-                    block_response_mask = self._build_block_response_mask(response_mask)
                     old_loss_per_sample = data["old_loss_per_sample"]
                     # advantages = data["advantages"]
                     advantages = self._aggregate_token_to_blocks(data["advantages"], response_mask, reduction="mean")
@@ -249,10 +273,15 @@ class DLLMDataParallelPPOActor(BGPOActor):
                     p_mask = data["p_mask"]
                     mc_num = perturbed_seq.shape[1]
                     for i in range(mc_num):
+                        cur_mask_indices = mask_indices[:, i, :]
+                        active_block_mask, active_response_mask = self._build_active_response_masks(
+                            sampled_token_mask=cur_mask_indices[:, -response_length:],
+                            response_mask=response_mask,
+                        )
                         cur_data = {
                             **data,
                             "perturbed_seq": perturbed_seq[:, i : i + 1],
-                            "mask_indices": mask_indices[:, i : i + 1],
+                            "mask_indices": cur_mask_indices.unsqueeze(1),
                             "p_mask": p_mask[:, i : i + 1],
                         }
                         entropy, log_prob, loss_per_sample = self._forward_micro_batch(
@@ -277,7 +306,7 @@ class DLLMDataParallelPPOActor(BGPOActor):
                             old_l_theta=old_loss_per_block,
                             l_theta=loss_per_block,
                             advantages=advantages,
-                            response_mask=block_response_mask,
+                            response_mask=active_block_mask,
                             cliprange=clip_ratio,
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,
@@ -286,8 +315,11 @@ class DLLMDataParallelPPOActor(BGPOActor):
                         )
 
                         if entropy_coeff != 0:
-                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                            # entropy_loss = agg_loss(loss_mat=entropy, loss_mask=block_response_mask, loss_agg_mode=loss_agg_mode)
+                            entropy_loss = agg_loss(
+                                loss_mat=entropy,
+                                loss_mask=active_response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
                             policy_loss = pg_loss
@@ -298,10 +330,13 @@ class DLLMDataParallelPPOActor(BGPOActor):
                                 l_theta=log_prob,
                                 ref_l_theta=ref_log_probs,
                                 kl_penalty=self.config.kl_loss_type,
-                                advantages=advantages,
+                                advantages=data["advantages"],
                             )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                            # kl_loss = agg_loss(loss_mat=kld, loss_mask=block_response_mask, loss_agg_mode=loss_agg_mode)
+                            kl_loss = agg_loss(
+                                loss_mat=kld,
+                                loss_mask=active_response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                            )
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                             metrics["actor/kl_loss"] = kl_loss.detach().item()
                             metrics["actor/kl_coef"] = self.config.kl_loss_coef
