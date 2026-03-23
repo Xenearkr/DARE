@@ -131,6 +131,10 @@ pip install flash-attn==2.8.3 --no-build-isolation
 # install from whl
 # wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 # pip install flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+
+# You can go to https://flashattn.dev/ to find the compiled FlashAttention .whl that corresponds to your Python, PyTorch, and CUDA versions.
+# After download the .whl, install it
+pip install flash_attn-2.8.x+cu12xtorch2.x-cp3xx-cp3xx-linux_x86_64.whl # For example
 ```
 
 Build evaluation vitual environment:
