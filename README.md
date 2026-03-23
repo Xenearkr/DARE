@@ -411,5 +411,6 @@ We thank the open-source community for their wonderful work and valuable contrib
 - Training Framework: [verl](https://github.com/volcengine/verl), [BGPO](https://github.com/THU-KEG/BGPO), [Dream](https://github.com/DreamLM/Dream), [dFactory](https://github.com/inclusionAI/dFactory)
 - Inference Acceleration/Engine: [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [lmdeploy](https://github.com/InternLM/lmdeploy), [SGLang](https://github.com/sgl-project/sglang)
 - Evaluation Framework: [opencompass](https://github.com/open-compass/opencompass), [LLaDA](https://github.com/ML-GSAI/LLaDA)
+- Environment Dependencies: [verl](https://github.com/volcengine/verl), [opencompass](https://github.com/open-compass/opencompass), [flash-attn](https://flashattn.dev/)
 
 
