@@ -750,12 +750,13 @@ class ActorRolloutRefWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
         dist.barrier()
 
-        if self._is_lora and isinstance(self.actor_module, PeftModel):
+        actor_module = getattr(self, 'actor_module', self.actor_module_fsdp)
+        if self._is_lora and isinstance(actor_module, PeftModel):
             lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_config = {}
             if dist.get_rank() == 0:
                 os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(self.actor_module.peft_config.get('default', {}))
+                peft_config = asdict(actor_module.peft_config.get('default', {}))
                 peft_config['task_type'] = peft_config['task_type'].value
                 peft_config['peft_type'] = peft_config['peft_type'].value
                 peft_config['target_modules'] = list(peft_config['target_modules'])

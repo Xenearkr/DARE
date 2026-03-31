@@ -71,7 +71,10 @@ class DAPORewardManager:
             valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
 
-            # decode
+            # decode (filter out-of-vocab token IDs that map to None)
+            vocab_size = len(self.tokenizer)
+            valid_prompt_ids = valid_prompt_ids[valid_prompt_ids < vocab_size]
+            valid_response_ids = valid_response_ids[valid_response_ids < vocab_size]
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             eos_token = self.tokenizer.eos_token

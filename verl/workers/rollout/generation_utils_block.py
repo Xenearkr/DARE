@@ -581,7 +581,7 @@ class DreamGenerationMixin:
             current_block_end = current_block_start + block_length
 
             # update cache
-            model_output = self(x, attention_mask, tok_idx, use_cache=True)
+            model_output = self(input_ids=x, attention_mask=attention_mask, position_ids=tok_idx, use_cache=True)
             past_key_values = model_output.past_key_values
             logits = model_output.logits
             logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
@@ -625,15 +625,17 @@ class DreamGenerationMixin:
 
                 if dual_cache:
                     model_output = self(
-                        x[:, current_block_start:current_block_end], current_attention_mask,
-                        tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None,
+                        input_ids=x[:, current_block_start:current_block_end],
+                        attention_mask=current_attention_mask,
+                        position_ids=tok_idx[:, current_block_start:current_block_end] if tok_idx is not None else None,
                         past_key_values=past_key_values, use_cache=True,
                         dual_cache=dual_cache, replace_position=replace_position,
                     )
                 else:
                     model_output = self(
-                        x[:, current_block_start:], current_attention_mask,
-                        tok_idx[:, current_block_start:] if tok_idx is not None else None,
+                        input_ids=x[:, current_block_start:],
+                        attention_mask=current_attention_mask,
+                        position_ids=tok_idx[:, current_block_start:] if tok_idx is not None else None,
                         past_key_values=past_key_values, use_cache=True,
                     )
                 logits = model_output.logits

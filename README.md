@@ -41,6 +41,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 
 ## 📢 News
+- [2026-03-23]: Support d-TreeRPO algorithm for LLaDA and Dream models.
 - [2026-03-16]: Support bgpo and ebpo for LLaDA2.X.
 - [2026-03-13]: Fix bugs in SDAR SGLang rollout and dp actor.
 - [2026-03-12]: Support sp for SDAR family, LLaDA2.0 and 2.1.
@@ -131,10 +132,6 @@ pip install flash-attn==2.8.3 --no-build-isolation
 # install from whl
 # wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 # pip install flash_attn-2.8.3+cu12torch2.8cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
-
-# You can go to https://flashattn.dev/ to find the compiled FlashAttention .whl that corresponds to your Python, PyTorch, and CUDA versions.
-# After download the .whl, install it
-pip install flash_attn-2.8.x+cu12xtorch2.x-cp3xx-cp3xx-linux_x86_64.whl # For example
 ```
 
 Build evaluation vitual environment:
@@ -224,6 +221,12 @@ bash recipe/run_coupled_grpo_dream_7b_instruct.sh --task math # use Fast-dLLM fo
 
 # online rl for sdar_8b_chat
 bash recipe/run_bgpo_sdar_8b_chat.sh --task math # use lmdeploy engine for rollout acceleration
+
+# d-TreeRPO for llada_8b_instruct
+bash recipe/llada/run_dtreerpo_llada_8b_instruct.sh --task math
+
+# d-TreeRPO for dream_7b_instruct
+bash recipe/dream/run_dtreerpo_dream_7b_instruct.sh --task math
 ```
 
 ### 🚀 DPO/VRPO Quick Start
@@ -325,6 +328,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **spg** | [2510.09541](https://arxiv.org/pdf/2510.09541) | [facebookresearch/SPG](https://github.com/facebookresearch/SPG) |
 | **bgpo** | [2510.11683](https://arxiv.org/pdf/2510.11683) | [THU-KEG/BGPO](https://github.com/THU-KEG/BGPO) |
 | **ebpo** | [2602.08676](https://arxiv.org/pdf/2602.08676) | [inclusionAI/LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X) (closed source) |
+| **d-TreeRPO** | [2512.09675](https://arxiv.org/pdf/2512.09675) | [d-TreeRPO](https://github.com/your-repo/d-TreeRPO) |
 
 
 ## 📈 Performance
@@ -407,10 +411,9 @@ If you find our work useful, please consider citing:
 
 We thank the open-source community for their wonderful work and valuable contributions:
 - Models Source: [GSAI-ML](https://huggingface.co/GSAI-ML), [inclusionAI](https://huggingface.co/inclusionAI), [Dream-org](https://huggingface.co/Dream-org), [JetLM](https://huggingface.co/JetLM), [huggingface](https://huggingface.co/) for model supply or hosting
-- Algorithm: [d1](https://github.com/dllm-reasoning/d1), [CJ-GRPO](https://github.com/yjyddq/EOSER-ASS-RL), [MDPO](https://github.com/autonomousvision/mdpo), [Coupled-GRPO](https://github.com/apple/ml-diffucoder), [SPG](https://github.com/facebookresearch/SPG), [BGPO](https://github.com/THU-KEG/BGPO), [LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X)
+- Algorithm: [d1](https://github.com/dllm-reasoning/d1), [CJ-GRPO](https://github.com/yjyddq/EOSER-ASS-RL), [MDPO](https://github.com/autonomousvision/mdpo), [Coupled-GRPO](https://github.com/apple/ml-diffucoder), [SPG](https://github.com/facebookresearch/SPG), [BGPO](https://github.com/THU-KEG/BGPO), [LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X), [d-TreeRPO](https://arxiv.org/abs/2512.09675)
 - Training Framework: [verl](https://github.com/volcengine/verl), [BGPO](https://github.com/THU-KEG/BGPO), [Dream](https://github.com/DreamLM/Dream), [dFactory](https://github.com/inclusionAI/dFactory)
 - Inference Acceleration/Engine: [Fast-dLLM](https://github.com/NVlabs/Fast-dLLM), [lmdeploy](https://github.com/InternLM/lmdeploy), [SGLang](https://github.com/sgl-project/sglang)
 - Evaluation Framework: [opencompass](https://github.com/open-compass/opencompass), [LLaDA](https://github.com/ML-GSAI/LLaDA)
-- Environment Dependencies: [verl](https://github.com/volcengine/verl), [opencompass](https://github.com/open-compass/opencompass), [flash-attn](https://flashattn.dev/)
 
 
