@@ -6,8 +6,8 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export WANDB_MODE="offline"
 export HF_HUB_OFFLINE=1
 export TORCHDYNAMO_DISABLE=1
-export SWANLAB_API_KEY=Z2wdWHeNCtCCnPAXsLzX6
-export SWANLAB_MODE=cloud
+export SWANLAB_API_KEY=
+export SWANLAB_MODE=
 
 echo "[INFO] Cleaning up old Ray..."
 ray stop --force || true
