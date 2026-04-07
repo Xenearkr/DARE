@@ -188,9 +188,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
 
                 with _timer("step", timing_raw):
                     # d-TreeRPO skips standard rollout; tree search handles generation
-                    if self.config.algorithm.name == "dtreerpo":
-                        gen_batch_output = None
-                    else:
+                    if self.config.algorithm.name != "dtreerpo":
                         # generate a batch
                         with _timer("gen", timing_raw):
                             if not self.async_rollout_mode:
@@ -200,7 +198,6 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                                 self.async_rollout_manager.sleep()
 
-                    if self.config.algorithm.name != "dtreerpo":
                         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                             with _timer("gen_max", timing_raw):
                                 gen_baseline_batch = deepcopy(gen_batch)
