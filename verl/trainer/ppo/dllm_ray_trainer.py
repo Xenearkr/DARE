@@ -5,6 +5,7 @@ from verl.trainer.ppo.dllm_metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.mdpo_algos import compute_step_wise_advantage, select_top_k_steps
+from verl.trainer.ppo.dtreerpo_algos import compute_dtreerpo_rewards_and_segments
 
 
 class DLLMRayPPOTrainer(RayPPOTrainer):
@@ -120,195 +121,6 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                     metric_dict[pfx] = metric_val
 
         return metric_dict
-
-    def _dtreerpo_compute_rewards_and_segments(self, tree_output, batch, gen_batch):
-        """
-        Given tree search output, compute rewards at leaf nodes, propagate upward,
-        compute local advantages, and construct training segments.
-        """
-        import torch
-
-        tree_batch = tree_output.batch
-        meta = tree_output.meta_info
-        prompt_length = meta["prompt_length"]
-        num_leaves = meta["num_leaves"]
-        num_nodes = meta["num_nodes"]
-        branch_points = meta["branch_points"]
-
-        # After DP concat, dim0 = total_batch_size.
-        # Tensors: (total_batch, num_nodes/num_leaves, ...)
-        # Tree structure is the same for all batch items; take from first item.
-        batch_size = tree_batch["node_generations"].size(0)  # total batch size after DP gather
-
-        node_generations = tree_batch["node_generations"]  # (B, num_nodes, seq_len)
-        node_steps = tree_batch["node_steps"][0]           # (num_nodes,) - same for all batch items
-        node_is_leaf = tree_batch["node_is_leaf"][0]       # (num_nodes,)
-        node_parent_idx = tree_batch["node_parent_idx"][0] # (num_nodes,)
-        node_children_idx = tree_batch["node_children_idx"][0]  # (num_nodes, max_children)
-
-        leaf_input_ids_bt = tree_batch["leaf_input_ids"]   # (B, num_leaves, seq_len)
-        leaf_responses_bt = tree_batch["leaf_responses"]   # (B, num_leaves, resp_len)
-        leaf_attn_bt = tree_batch["leaf_attn"]             # (B, num_leaves, seq_len)
-
-        # Transpose node_generations to (num_nodes, B, seq_len) for tree processing
-        node_generations = node_generations.permute(1, 0, 2).contiguous()  # (num_nodes, B, seq_len)
-
-        seq_len = node_generations.size(-1)
-        response_length = seq_len - prompt_length
-        device = node_generations.device
-
-        # Flatten leaf data to (num_leaves * B, ...) for reward computation
-        leaf_input_ids = leaf_input_ids_bt.permute(1, 0, 2).contiguous().reshape(-1, seq_len)  # (num_leaves * B, seq_len)
-        leaf_responses = leaf_responses_bt.permute(1, 0, 2).contiguous().reshape(-1, response_length)
-        leaf_attn = leaf_attn_bt.permute(1, 0, 2).contiguous().reshape(-1, seq_len)
-
-        # Compute rewards for leaf nodes
-        leaf_total = num_leaves * batch_size
-        # Expand non_tensor_batch to match leaf batch size before passing to DataProto
-        expanded_non_tensors = {}
-        if batch.non_tensor_batch is not None:
-            for key, val in batch.non_tensor_batch.items():
-                if isinstance(val, np.ndarray):
-                    # Repeat each element num_leaves times (leaves are ordered leaf-major: all batch items for leaf0, then leaf1, etc.)
-                    expanded_non_tensors[key] = np.tile(val, num_leaves)[:leaf_total]
-                else:
-                    expanded_non_tensors[key] = val
-
-        leaf_batch = DataProto.from_dict(
-            tensors={
-                "input_ids": leaf_input_ids,
-                "responses": leaf_responses,
-                "prompts": leaf_input_ids[:, :prompt_length],
-                "attention_mask": leaf_attn,
-                "position_ids": leaf_attn.cumsum(dim=-1) - 1,
-            },
-            non_tensors=expanded_non_tensors,
-        )
-
-        reward_tensor, reward_extra_infos_dict = compute_reward(leaf_batch, self.reward_fn)
-        leaf_rewards = reward_tensor.sum(dim=-1)  # (num_leaves * batch_size,)
-
-        # Assign rewards to leaf nodes: reshape to (num_leaves, batch_size)
-        leaf_rewards_mat = leaf_rewards.reshape(num_leaves, batch_size)
-
-        # Create value vectors for all nodes
-        node_value_vecs = torch.zeros(num_nodes, batch_size, device=device)
-
-        # Assign leaf values
-        leaf_idx = 0
-        for i in range(num_nodes):
-            if node_is_leaf[i]:
-                node_value_vecs[i] = leaf_rewards_mat[leaf_idx]
-                leaf_idx += 1
-
-        # Bottom-up propagation: process steps from lowest to highest
-        for step in sorted(branch_points[:-1]):
-            for i in range(num_nodes):
-                if node_steps[i] == step and i > 0:  # skip root (i=0)
-                    children = node_children_idx[i]
-                    valid_children = children[children >= 0]
-                    if len(valid_children) > 0:
-                        child_vals = torch.stack([node_value_vecs[c] for c in valid_children])
-                        node_value_vecs[i] = torch.nanmean(child_vals, dim=0)
-
-        # Root propagation
-        root_children = node_children_idx[0]
-        valid_root_children = root_children[root_children >= 0]
-        if len(valid_root_children) > 0:
-            root_child_vals = torch.stack([node_value_vecs[c] for c in valid_root_children])
-            node_value_vecs[0] = torch.nanmean(root_child_vals, dim=0)
-
-        # Compute local advantages for each non-root node
-        node_local_adv = torch.zeros(num_nodes, batch_size, device=device)
-        for i in range(1, num_nodes):
-            parent = node_parent_idx[i].item()
-            siblings = node_children_idx[parent]
-            valid_siblings = siblings[(siblings >= 0) & (siblings != i)]
-            if len(valid_siblings) > 0:
-                sib_vals = torch.stack([node_value_vecs[s] for s in valid_siblings])
-                sib_mean = torch.nanmean(sib_vals, dim=0)
-            else:
-                sib_mean = torch.zeros(batch_size, device=device)
-            node_local_adv[i] = node_value_vecs[i] - sib_mean
-
-        # Build training segments
-        all_parent_ids = []
-        all_child_ids = []
-        all_attention_masks = []
-        all_local_advantages = []
-        all_group_ids = []
-
-        group_key_to_id = {}
-        next_gid = 0
-
-        response_length_cfg = self.config.actor_rollout_ref.rollout.get("response_length")
-        for i in range(1, num_nodes):
-            parent_idx_val = node_parent_idx[i].item()
-            parent_gen = node_generations[parent_idx_val]   # (batch_size, seq_len)
-            child_gen = node_generations[i]                 # (batch_size, seq_len)
-            adv = node_local_adv[i]                         # (batch_size,)
-
-            # Build attention mask
-            attn = torch.ones(batch_size, seq_len, dtype=torch.long, device=device)
-
-            for b in range(batch_size):
-                key = (parent_idx_val, b)
-                gid = group_key_to_id.get(key)
-                if gid is None:
-                    gid = next_gid
-                    next_gid += 1
-                    group_key_to_id[key] = gid
-                all_group_ids.append(gid)
-
-            all_parent_ids.append(parent_gen)
-            all_child_ids.append(child_gen)
-            all_attention_masks.append(attn)
-            all_local_advantages.append(adv)
-
-        if not all_parent_ids:
-            return None, {"dtreerpo/mean_leaf_reward": 0.0}
-
-        parent_ids_cat = torch.cat(all_parent_ids, dim=0)
-        child_ids_cat = torch.cat(all_child_ids, dim=0)
-        attn_cat = torch.cat(all_attention_masks, dim=0)
-        adv_cat = torch.cat(all_local_advantages, dim=0)
-        group_ids_cat = torch.tensor(all_group_ids, dtype=torch.long, device=device)
-        prompt_length_t = torch.tensor([prompt_length], dtype=torch.long, device=device).expand(parent_ids_cat.size(0))
-
-        from tensordict import TensorDict
-        segments = DataProto.from_dict(
-            tensors={
-                "parent_ids": parent_ids_cat,
-                "child_ids": child_ids_cat,
-                "attention_mask": attn_cat,
-                "local_advantages": adv_cat,
-                "group_ids": group_ids_cat,
-                "prompt_length": prompt_length_t,
-                # Dummy fields for metrics compatibility
-                "prompts": parent_ids_cat[:, :prompt_length],
-                "responses": child_ids_cat[:, prompt_length:],
-                "token_level_scores": torch.zeros(parent_ids_cat.size(0), response_length_cfg, device=device),
-                "token_level_rewards": torch.zeros(parent_ids_cat.size(0), response_length_cfg, device=device),
-                "response_mask": attn_cat[:, -response_length_cfg:],
-            },
-        )
-        segments.meta_info["micro_batch_size"] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-        segments.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
-        dtreerpo_metrics = {
-            "dtreerpo/mean_leaf_reward": leaf_rewards.mean().item(),
-            "dtreerpo/mean_root_value": node_value_vecs[0].mean().item(),
-            "dtreerpo/mean_local_adv": adv_cat.mean().item(),
-            "dtreerpo/num_segments": parent_ids_cat.size(0),
-        }
-
-        # Also set reward tensors on batch for standard metrics
-        # Use leaf rewards averaged per prompt as the reward signal
-        mean_leaf_reward_per_prompt = leaf_rewards_mat.mean(dim=0)  # (batch_size,)
-        if reward_extra_infos_dict:
-            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-        return segments, dtreerpo_metrics
 
     def fit(self):
         """
@@ -775,33 +587,22 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                     elif self.config.algorithm.name == "dtreerpo":
                         # d-TreeRPO: tree search, reward propagation, local advantage, actor update
                         with _timer("dtreerpo_tree_search", timing_raw):
-                            tree_search_batch = DataProto.from_dict(
-                                tensors={
-                                    "input_ids": gen_batch.batch["input_ids"],
-                                    "attention_mask": gen_batch.batch["attention_mask"],
-                                },
-                            )
-                            tree_search_batch.meta_info.update({
-                                "response_length": self.config.actor_rollout_ref.rollout.get("response_length"),
-                                "num_diffusion_steps": self.config.actor_rollout_ref.rollout.get("num_diffusion_steps"),
-                                "block_length": self.config.actor_rollout_ref.rollout.get("block_length"),
+                            gen_batch.meta_info.update({
                                 "tree_branch_factor": self.config.actor_rollout_ref.actor.get("tree_branch_factor", 4),
                                 "tree_contraction_factor": self.config.actor_rollout_ref.actor.get("tree_contraction_factor", 2),
                                 "num_tree_samples": self.config.actor_rollout_ref.actor.get("num_tree_samples", 4),
-                                "temperature": self.config.actor_rollout_ref.rollout.temperature,
-                                "cfg_scale": self.config.actor_rollout_ref.rollout.get("cfg_scale", 0.0),
                                 "remasking": "low_confidence",
                             })
-                            # Pad for DP
-                            tree_search_batch_padded, tree_pad_size = pad_dataproto_to_divisor(
-                                tree_search_batch, self.actor_rollout_wg.world_size
-                            )
-                            tree_output_padded = self.actor_rollout_wg.tree_search_generate(tree_search_batch_padded)
-                            tree_output = unpad_dataproto(tree_output_padded, pad_size=tree_pad_size)
+                            tree_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                         with _timer("dtreerpo_reward_propagation", timing_raw):
-                            dtreerpo_segments, dtreerpo_reward_metrics = self._dtreerpo_compute_rewards_and_segments(
-                                tree_output, batch, gen_batch
+                            dtreerpo_segments, dtreerpo_reward_metrics = compute_dtreerpo_rewards_and_segments(
+                                tree_output=tree_output,
+                                batch=batch,
+                                reward_fn=self.reward_fn,
+                                response_length_cfg=self.config.actor_rollout_ref.rollout.get("response_length"),
+                                micro_batch_size=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+                                temperature=self.config.actor_rollout_ref.rollout.temperature,
                             )
                             metrics.update(dtreerpo_reward_metrics)
 
