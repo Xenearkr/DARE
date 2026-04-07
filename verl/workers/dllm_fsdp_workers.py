@@ -209,7 +209,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                     'lora_alpha': self.config.model.lora_alpha,
                     'target_modules': convert_to_regular_types(self.config.model.target_modules),
                     'bias': "none",
-                    # 'lora_dropout': self.config.model.lora_dropout,  # LNY: add dropout
+                    'lora_dropout': self.config.model.get('lora_dropout', 0.0),
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
                 actor_module.print_trainable_parameters()
@@ -349,6 +349,14 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                     from verl.workers.sharding_manager.base import BaseShardingManager
                     rollout = MDPORollout(module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer)
                     rollout_sharding_manager = BaseShardingManager()
+                elif self.config.algorithm.name == "dtreerpo":
+                    from verl.workers.rollout.dtreerpo_llada_rollout import DTreeRPORollout
+                    from verl.workers.sharding_manager.base import BaseShardingManager
+                    from omegaconf import OmegaConf
+                    rollout_config = OmegaConf.to_container(self.config.rollout, resolve=True)
+                    rollout_config["model_name"] = self.config.model.name
+                    rollout = DTreeRPORollout(module=self.actor_module_fsdp, config=rollout_config, tokenizer=self.tokenizer)
+                    rollout_sharding_manager = BaseShardingManager()
                 elif not use_cache:
                     if self.config.algorithm.name == "cj-grpo":
                         from verl.workers.rollout.cj_llada_rollout import DLLMRollout
@@ -382,6 +390,14 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                     from verl.workers.rollout.mdpo_dream_rollout import MDPORollout
                     from verl.workers.sharding_manager.base import BaseShardingManager
                     rollout = MDPORollout(module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer)
+                    rollout_sharding_manager = BaseShardingManager()
+                elif self.config.algorithm.name == "dtreerpo":
+                    from verl.workers.rollout.dtreerpo_llada_rollout import DTreeRPORollout
+                    from verl.workers.sharding_manager.base import BaseShardingManager
+                    from omegaconf import OmegaConf
+                    rollout_config = OmegaConf.to_container(self.config.rollout, resolve=True)
+                    rollout_config["model_name"] = self.config.model.name
+                    rollout = DTreeRPORollout(module=self.actor_module_fsdp, config=rollout_config, tokenizer=self.tokenizer)
                     rollout_sharding_manager = BaseShardingManager()
                 elif not use_cache:
                     if self.config.algorithm.name == "cj-grpo":
@@ -568,6 +584,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_vrpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'mdpo':
                 from verl.workers.actor.llada_dp_actor_mdpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'dtreerpo':
+                from verl.workers.actor.llada_dp_actor_dtreerpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 
@@ -594,6 +612,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.dream_dp_actor_vrpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'mdpo':
                 from verl.workers.actor.dream_dp_actor_mdpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'dtreerpo':
+                from verl.workers.actor.dream_dp_actor_dtreerpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
 
@@ -907,6 +927,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         
         elif self.config.algorithm.name == "mdpo":
             raise RuntimeError("MDPO does not use forward_process. The diffusion trajectory is collected during rollout.")
+        elif self.config.algorithm.name == "dtreerpo":
+            raise RuntimeError("d-TreeRPO does not use forward_process. Tree search is performed via tree_search_generate.")
         else:
             raise NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name} for forward process in DLLMActorRolloutRefWorker")
         batch = TensorDict(
@@ -924,6 +946,29 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         )
         
         return DataProto(batch=batch)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_dtreerpo_log_prob(self, data: DataProto):
+        """Compute old local transition log probs for d-TreeRPO training segments."""
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(get_torch_device().current_device())
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["cfg_scale"] = self.config.rollout.get("cfg_scale", 0.0)
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            _, local_logps, _ = self.actor.compute_log_prob(data=data)
+            output = DataProto.from_dict(
+                tensors={"old_local_logps": local_logps},
+            )
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        output = output.to("cpu")
+        get_torch_device().empty_cache()
+        return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
@@ -1037,12 +1082,13 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
         dist.barrier()
 
-        if self._is_lora and isinstance(self.actor_module, PeftModel):
+        actor_module = getattr(self, 'actor_module', self.actor_module_fsdp)
+        if self._is_lora and isinstance(actor_module, PeftModel):
             lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_config = {}
             if dist.get_rank() == 0:
                 os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(self.actor_module.peft_config.get('default', {}))
+                peft_config = asdict(actor_module.peft_config.get('default', {}))
                 peft_config['task_type'] = peft_config['task_type'].value
                 peft_config['peft_type'] = peft_config['peft_type'].value
                 peft_config['target_modules'] = list(peft_config['target_modules'])

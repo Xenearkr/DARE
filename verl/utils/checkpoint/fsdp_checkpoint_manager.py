@@ -195,7 +195,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 # Some model's name_or_path is empty if not initialized from pretrained,
                 # in this cases, we don't save generation config.
                 generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
-                generation_config.save_pretrained(local_path)
+                # Fix invalid generation config (e.g., temperature=0.0 with do_sample=False)
+                if not generation_config.do_sample and generation_config.temperature == 0.0:
+                    generation_config.temperature = 1.0
+                try:
+                    generation_config.save_pretrained(local_path)
+                except ValueError:
+                    pass  # Skip saving generation config if validation fails
             else:
                 generation_config = None
 

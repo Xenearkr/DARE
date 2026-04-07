@@ -5,6 +5,7 @@ from verl.trainer.ppo.dllm_metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.mdpo_algos import compute_step_wise_advantage, select_top_k_steps
+from verl.trainer.ppo.dtreerpo_algos import compute_dtreerpo_rewards_and_segments
 
 
 class DLLMRayPPOTrainer(RayPPOTrainer):
@@ -186,56 +187,58 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with _timer("step", timing_raw):
-                    # generate a batch
-                    with _timer("gen", timing_raw):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        else:
-                            self.async_rollout_manager.wake_up()
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                            self.async_rollout_manager.sleep()
+                    # d-TreeRPO skips standard rollout; tree search handles generation
+                    if self.config.algorithm.name != "dtreerpo":
+                        # generate a batch
+                        with _timer("gen", timing_raw):
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            else:
+                                self.async_rollout_manager.wake_up()
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                self.async_rollout_manager.sleep()
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with _timer("gen_max", timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                            with _timer("gen_max", timing_raw):
+                                gen_baseline_batch = deepcopy(gen_batch)
+                                gen_baseline_batch.meta_info["do_sample"] = False
+                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                                batch = batch.union(gen_baseline_output)
+                                reward_baseline_tensor = self.reward_fn(batch)
+                                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                                batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
+                                batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                            del gen_baseline_batch, gen_baseline_output
+                                del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
-                    batch.batch["response_mask"] = compute_response_mask(batch)
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        batch.batch["response_mask"] = compute_response_mask(batch)
+                        # balance the number of valid tokens on each dp rank.
+                        # Note that this breaks the order of data inside the batch.
+                        # Please take care when you implement group based adv computation such as GRPO and rloo
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
 
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                        # compute global_valid tokens
+                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                    with _timer("reward", timing_raw):
-                        # compute reward model score
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                        with _timer("reward", timing_raw):
+                            # compute reward model score
+                            if self.use_rm:
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
 
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     if self.config.algorithm.name in ["d1", "coupled-grpo", "bgpo", "ebpo", "spg"]:
                         if self.config.actor_rollout_ref.model.name != "sdar":
@@ -578,10 +581,68 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                             metrics.update(actor_output_metrics)
 
-                    else:
-                        NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name}")
+                    elif self.config.algorithm.name == "dtreerpo":
+                        # d-TreeRPO: tree search, reward propagation, local advantage, actor update
+                        with _timer("dtreerpo_tree_search", timing_raw):
+                            gen_batch.meta_info.update({
+                                "tree_branch_factor": self.config.actor_rollout_ref.actor.get("tree_branch_factor", 4),
+                                "tree_contraction_factor": self.config.actor_rollout_ref.actor.get("tree_contraction_factor", 2),
+                                "num_tree_samples": self.config.actor_rollout_ref.actor.get("num_tree_samples", 4),
+                                "remasking": "low_confidence",
+                            })
+                            tree_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
-                    if self.config.algorithm.name != "mdpo":
+                        with _timer("dtreerpo_reward_propagation", timing_raw):
+                            dtreerpo_segments, dtreerpo_reward_metrics = compute_dtreerpo_rewards_and_segments(
+                                tree_output=tree_output,
+                                batch=batch,
+                                reward_fn=self.reward_fn,
+                                response_length_cfg=self.config.actor_rollout_ref.rollout.get("response_length"),
+                                micro_batch_size=self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
+                                temperature=self.config.actor_rollout_ref.rollout.temperature,
+                            )
+                            metrics.update(dtreerpo_reward_metrics)
+
+                        if dtreerpo_segments is not None and len(dtreerpo_segments.batch) > 0:
+                            # Compute old local log probs
+                            with _timer("dtreerpo_old_log_prob", timing_raw):
+                                old_logps_output = self.actor_rollout_wg.compute_dtreerpo_log_prob(dtreerpo_segments)
+                                dtreerpo_segments.batch["old_local_logps"] = old_logps_output.batch["old_local_logps"]
+
+                            # Compute ref log probs if KL is used
+                            if self.config.actor_rollout_ref.actor.use_kl_loss:
+                                with _timer("dtreerpo_ref_log_prob", timing_raw):
+                                    dtreerpo_segments.meta_info["is_lora"] = True
+                                    ref_logps_output = self.actor_rollout_wg.compute_dtreerpo_log_prob(dtreerpo_segments)
+                                    dtreerpo_segments.batch["ref_local_logps"] = ref_logps_output.batch["old_local_logps"]
+                                    dtreerpo_segments.meta_info.pop("is_lora", None)
+
+                            # Actor update
+                            if self.config.trainer.critic_warmup <= self.global_steps:
+                                with _timer("update_actor", timing_raw):
+                                    dtreerpo_segments.meta_info["multi_turn"] = False
+                                    dtreerpo_segments.meta_info["global_step"] = self.global_steps
+                                    # global_token_num needed for MFU calculation in update_actor
+                                    # Must be a list of per-sequence token counts
+                                    attn_mask = dtreerpo_segments.batch["attention_mask"]
+                                    token_counts = attn_mask.sum(dim=-1).long().tolist()
+                                    dtreerpo_segments.meta_info["global_token_num"] = token_counts
+                                    actor_output = self.actor_rollout_wg.update_actor(dtreerpo_segments)
+                                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                                metrics.update(actor_output_metrics)
+
+                            # For downstream metrics, create minimal token_level_scores etc.
+                            if "token_level_scores" not in batch.batch.keys():
+                                n_prompts = batch.batch.batch_size[0]
+                                resp_len = self.config.actor_rollout_ref.rollout.get("response_length", 1)
+                                dummy_scores = torch.zeros(n_prompts, resp_len)
+                                batch.batch["token_level_scores"] = dummy_scores
+                                batch.batch["token_level_rewards"] = dummy_scores
+
+                    else:
+                        raise NotImplementedError(f"Unsupported algorithm: {self.config.algorithm.name}")
+
+                    if self.config.algorithm.name not in ["mdpo", "dtreerpo"]:
                         # Standard flow for non-MDPO algorithms
                         if self.use_reference_policy:
                             # compute reference log_prob
@@ -649,9 +710,9 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                             metrics.update(actor_output_metrics)
 
-                    # Log rollout generations if enabled
+                    # Log rollout generations if enabled (not applicable for dtreerpo)
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    if rollout_data_dir and self.config.algorithm.name != "dtreerpo":
                         with _timer("dump_rollout_generations", timing_raw):
                             print(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
@@ -685,11 +746,15 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                if self.config.algorithm.name != "dtreerpo":
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    # TODO: implement actual tflpo and theoretical tflpo
+                    n_gpus = self.resource_pool_manager.get_n_gpus()
+                    metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+                else:
+                    # dtreerpo batch doesn't have standard responses/attention_mask/global_token_num
+                    metrics.update({f"timing_s/{name}": value for name, value in timing_raw.items()})
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
