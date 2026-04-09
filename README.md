@@ -396,10 +396,11 @@ Waiting for your joining and contribution.
 If you find our work useful, please consider citing:
 
 ```bibtex
-@article{yang2025dare,
-  title={DARE: dLLM Alignment and Reinforcement Executor},
-  author={Yang, Jingyi, Jiang Yuxian, Hu Xuhao, Shao Jing},
-  journal={URL https://github.com/yjyddq/DARE}
+@article{yang2026dare,
+  title={DARE: Diffusion Large Language Models Alignment and Reinforcement Executor},
+  author={Yang, Jingyi and Jiang, Yuxian and Hu, Xuhao and Cheng, Shuang and Qi, Biqing and Shao, Jing},
+  journal={arXiv preprint arXiv:2604.04215},
+  year={2026}
 }
 
 @article{yang2025taming,
