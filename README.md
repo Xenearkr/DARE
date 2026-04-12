@@ -332,7 +332,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **spg** | [2510.09541](https://arxiv.org/pdf/2510.09541) | [facebookresearch/SPG](https://github.com/facebookresearch/SPG) |
 | **bgpo** | [2510.11683](https://arxiv.org/pdf/2510.11683) | [THU-KEG/BGPO](https://github.com/THU-KEG/BGPO) |
 | **ebpo** | [2602.08676](https://arxiv.org/pdf/2602.08676) | [inclusionAI/LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X) (closed source) |
-| **d-TreeRPO** | [2512.09675](https://arxiv.org/pdf/2512.09675) | [d-TreeRPO](https://github.com/THU-BPM/d-TreeRPO) |
+| **d-TreeRPO** | [2512.09675](https://arxiv.org/pdf/2512.09675) | [THU-BPM/d-TreeRPO](https://github.com/THU-BPM/d-TreeRPO) |
 
 
 ## 📈 Performance
