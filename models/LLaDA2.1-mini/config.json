@@ -48,6 +48,7 @@
   "transformers_version": "4.57.1",
   "use_bias": false,
   "use_cache": false,
+  "use_qk_norm": true,
   "use_qkv_bias": false,
   "use_rmsnorm": true,
   "use_sliding_window": false,

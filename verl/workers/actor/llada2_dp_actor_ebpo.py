@@ -25,11 +25,13 @@ import os
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from verl.trainer.ppo.dllm_core_algos import agg_loss, compute_policy_loss_ebpo, kl_penalty
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_torch_device
+from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.workers.actor.llada2_dp_actor_bgpo import DLLMDataParallelPPOActor as BGPOActor
@@ -186,6 +188,51 @@ class DLLMDataParallelPPOActor(BGPOActor):
             entropy = -log_prob.exp() * log_prob
 
         return entropy, log_prob, loss_per_token
+
+    def _manual_clip_grad_norm_(self, parameters, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
+        params = [param for param in parameters if param.grad is not None]
+        if len(params) == 0:
+            return torch.zeros((), device=self.device_name)
+
+        if norm_type != 2.0:
+            raise NotImplementedError("LLaDA2 SFT manual grad clip currently only supports L2 norm.")
+
+        local_sq_norm = torch.zeros((), device=params[0].grad.device, dtype=torch.float32)
+        for param in params:
+            grad = param.grad.detach()
+            local_sq_norm += torch.sum(grad.float() * grad.float())
+
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(local_sq_norm, op=torch.distributed.ReduceOp.SUM)
+
+        total_norm = torch.sqrt(local_sq_norm)
+        max_norm = float(max_norm)
+        if max_norm > 0:
+            clip_coef = max_norm / (total_norm.item() + 1e-6)
+            if clip_coef < 1.0:
+                for param in params:
+                    param.grad.mul_(clip_coef)
+        return total_norm
+
+    def _optimizer_step(self):
+        assert self.config.grad_clip is not None
+
+        if isinstance(self.actor_module, FSDP):
+            grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
+        elif isinstance(self.actor_module, FSDPModule):
+            # llada2 hits the same FSDP2 grad-clip issue we saw in SFT, so keep
+            # the manual global-norm path but read the canonical PPO actor key.
+            grad_norm = self._manual_clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+
+        # if grad_norm is not finite, skip the update
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+            self.actor_optimizer.zero_grad()
+        else:
+            self.actor_optimizer.step()
+        return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
