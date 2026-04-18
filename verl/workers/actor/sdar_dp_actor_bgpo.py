@@ -36,7 +36,6 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
 from verl.workers.actor import DataParallelPPOActor
 from verl.workers.actor.llada_dp_actor_bgpo import DLLMDataParallelPPOActor as BaseDataParallelPPOActor
-import torch.nn.functional as F
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -73,7 +72,12 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             position_ids = micro_batch["position_ids"]
             seq = micro_batch["input_ids"]  # (bs, seq_len)
-            attention_mask = micro_batch["attention_mask"]  # (bs, mc_num, seq_len)
+            attention_mask = micro_batch["attention_mask"]  # (bs, seq_len)
+            perturbed_seq = micro_batch["perturbed_seq"]  # (bs, mc_num, seq_len)
+            mask_indices = micro_batch["mask_indices"]  # (bs, mc_num, seq_len)
+            p_mask = micro_batch["p_mask"]  # (bs, mc_num, seq_len)
+            mc_num = perturbed_seq.shape[1]
+            prompt_lens = attention_mask[:, :prompt_length].sum(dim=1)
 
             loss_per_sample = torch.zeros((batch_size, mc_num), device=device)
             for b in range(batch_size):
@@ -81,16 +85,19 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                     loss_b_i = self._get_logits(
                         model=self.actor_module,
                         seq=seq[b:b+1, :],
-                        attention_mask=attention_mask[b:b+1, :], 
+                        attention_mask=attention_mask[b:b+1, :],
                         position_ids=position_ids[b:b+1, :],
-                        prompt_len=attention_mask[b:b+1, :prompt_length].sum(dim=1), 
-                        cfg_scale=0.0, 
-                        MASK_TOKEN_ID=self.MASK_TOKEN_ID
+                        prompt_len=prompt_lens[b],
+                        perturbed_seq=perturbed_seq[b:b+1, i, :],
+                        mask_indices=mask_indices[b:b+1, i, :],
+                        p_mask=p_mask[b:b+1, i, :],
+                        cfg_scale=0.0,
+                        MASK_TOKEN_ID=self.MASK_TOKEN_ID,
                     )
-                    loss_per_sample[b, i] = -loss_b_i  # convert to log likelihood (batch_size, mc_num)            
+                    loss_per_sample[b, i] = -loss_b_i  # convert to log likelihood (batch_size, mc_num)
 
             log_likelihood = loss_per_sample.sum(dim=1) / mc_num  # (batch_size,)
-            log_probs = log_likelihood.view(-1, 1)  # (batch_size, 1)
+            log_probs = log_likelihood.unsqueeze(-1).expand(-1, response_length)  # (batch_size, response_length)
             loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, -1, response_length).contiguous()  # (batch_size, mc_num, response_length)
         
         entropy = None
@@ -100,30 +107,27 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
             
         return entropy, log_probs, loss_per_sample
     
-    def _get_logits(self, model, seq, attention_mask, position_ids, prompt_len, cfg_scale=0.0, MASK_TOKEN_ID=126336):
+    def _get_logits(self, model, seq, attention_mask, position_ids, prompt_len, perturbed_seq, mask_indices, p_mask, cfg_scale=0.0, MASK_TOKEN_ID=126336):
         """
         seq: (1, total_seqlen)
-        cu_seqlens: (batch_size+1,)
-        max_seqlen: int
-        prompt_len: (batch_size,) True prompt length of each sample
+        prompt_len: int
         """
+        if isinstance(prompt_len, torch.Tensor):
+            prompt_len = int(prompt_len.item())
         labels = seq.clone()
         labels[:, :prompt_len] = -100  # only compute loss on masked positions
-        logits_to_keep = attention_mask.clone()
-        if prompt_len > 1:
-            logits_to_keep[:, :prompt_len] = 0
-
         return_cls = model(
-            input_ids=seq, 
-            attention_mask=attention_mask.bool(), 
+            input_ids=seq,
+            attention_mask=attention_mask.bool(),
             position_ids=position_ids,
             labels=labels,
-            logits_to_keep=logits_to_keep,
-            use_cache=False
+            use_cache=False,
+            bd_noisy_input_ids=perturbed_seq,
+            bd_target_mask=mask_indices.bool(),
+            bd_p_mask=p_mask,
+            force_block_diffusion_training=True,
         )
-
-        loss = return_cls.loss
-        return loss
+        return return_cls.loss
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
@@ -151,7 +155,7 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "perturbed_seq", "mask_indices", "p_mask"]
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -190,7 +194,7 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
             loss_per_sample = loss_per_sample[revert_indices]
-        return entropys, log_probs, loss_per_sample   # loss_per_sample is stored in old_log_probs field
+        return entropys, log_probs, loss_per_sample
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -200,11 +204,11 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "old_loss_per_sample", "advantages"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "old_loss_per_sample", "advantages", "perturbed_seq", "mask_indices", "p_mask"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
-            select_keys.append("ref_log_prob")
+            select_keys.append("ref_log_probs")
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -250,8 +254,8 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
-                    old_log_probs = data["old_log_probs"]  # (bsz, 1)
-                    old_loss_per_sample = data["old_loss_per_sample"]  # (bsz, mc_num)
+                    old_log_probs = data["old_log_probs"]  # (bsz, response_length)
+                    old_loss_per_sample = data["old_loss_per_sample"]  # (bsz, mc_num, response_length)
                     advantages = data["advantages"]
 
                     clip_ratio = self.config.clip_ratio
@@ -272,12 +276,25 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                     accumulated_ppo_kl = 0.0
                     accumulated_pg_clipfrac_lower = 0.0
                     
-                    input_ids = data["input_ids"]
-                    mc_num = old_loss_per_sample.shape[1]
+                    perturbed_seq = data["perturbed_seq"]
+                    mask_indices = data["mask_indices"]
+                    p_mask = data["p_mask"]
+                    mc_num = perturbed_seq.shape[1]
                     for i in range(mc_num):
-                        entropy, log_prob, loss_per_sample = self._forward_micro_batch(micro_batch=data, temperature=temperature, n_l=1, mc_num=1, calculate_entropy=calculate_entropy, call_fn_name="update_policy")
-                        print(f"\nloss_per_sample: {loss_per_sample[0, 0, 0]}")
-                        print(f"\nold_loss_per_sample: {old_loss_per_sample[0, 0, 0]}")
+                        cur_data = {
+                            **data,
+                            "perturbed_seq": perturbed_seq[:, i : i + 1],
+                            "mask_indices": mask_indices[:, i : i + 1],
+                            "p_mask": p_mask[:, i : i + 1],
+                        }
+                        entropy, log_prob, loss_per_sample = self._forward_micro_batch(
+                            micro_batch=cur_data,
+                            temperature=temperature,
+                            n_l=1,
+                            mc_num=1,
+                            calculate_entropy=calculate_entropy,
+                            call_fn_name="update_policy",
+                        )
                         # Compute policy loss
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_bgpo(
                             old_l_theta=old_loss_per_sample[:, i, :],  # (bsz, response_length)
@@ -300,9 +317,14 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                             policy_loss = pg_loss
 
                         if self.config.use_kl_loss:  # NOTE: Currently not considering KL
-                            ref_log_prob = data["ref_log_prob"]
+                            ref_log_probs = data["ref_log_probs"]
                             # compute kl loss
-                            kld = kl_penalty(l_theta=loss_per_sample[:, 0, :], ref_l_theta=ref_log_prob[:, i, :], kl_penalty=self.config.kl_loss_type, advantages=advantages)
+                            kld = kl_penalty(
+                                l_theta=log_prob,
+                                ref_l_theta=ref_log_probs,
+                                kl_penalty=self.config.kl_loss_type,
+                                advantages=advantages,
+                            )
                             kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
@@ -315,7 +337,6 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                         else:
                             loss = policy_loss / self.gradient_accumulation
                         loss /= self.mc_num
-                        print(f"loss: {loss}\n")
                         loss.backward()  # Gradient is accumulated in model parameters, but will not be updated now
                         
                         accumulated_pg_loss += pg_loss.detach().item()

@@ -45,10 +45,10 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_u
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 # from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
-try:                                                                                                                         
-    from transformers.utils import LossKwargs                                                                                
-except ImportError:   # LossKwargs not available in transformers 4.57.1, use object as base                                                    
-    LossKwargs = object                                                                                                      
+try:
+    from transformers.utils import LossKwargs
+except ImportError:   # LossKwargs not available in transformers 4.57.1, use object as base
+    LossKwargs = object
 from transformers.utils import auto_docstring, can_return_tuple, is_torch_flex_attn_available, logging
 from .configuration_sdar import SDARConfig
 from .fused_linear_diffusion_cross_entropy import FusedLinearDiffusionCrossEntropyLoss
@@ -352,6 +352,41 @@ def block_attn_mask(num_tokens, block_size, device):
     return masks
 
 
+def build_bd_inputs_and_mask(inputs_ids, noisy_inputs_ids, position_ids, logits_to_keep_half, num_tokens, block_size):
+    bsz, seq_len = inputs_ids.shape
+    router_noisy_part_list = []
+    for i in range(bsz):
+        cur_router_noisy_part = (torch.arange(num_tokens[i].shape[0] * 2, device=inputs_ids.device) % 2 == 0)
+        cur_router_noisy_part = cur_router_noisy_part.repeat_interleave(num_tokens[i].repeat_interleave(2))
+        router_noisy_part_list.append(cur_router_noisy_part)
+    router_noisy_part = torch.stack(router_noisy_part_list, dim=0)
+
+    concat_inputs_ids = inputs_ids.repeat(1, 2)
+    logits_to_keep = torch.zeros(bsz, 2 * seq_len, dtype=torch.bool, device=inputs_ids.device)
+    concat_position_ids = torch.zeros(
+        bsz, 2 * seq_len, dtype=position_ids.dtype, device=position_ids.device
+    )
+
+    for i in range(bsz):
+        concat_inputs_ids[i][router_noisy_part[i]] = noisy_inputs_ids[i]
+        concat_inputs_ids[i][~router_noisy_part[i]] = inputs_ids[i]
+
+        logits_to_keep[i][router_noisy_part[i]] = logits_to_keep_half[i]
+
+        concat_position_ids[i][router_noisy_part[i]] = position_ids[i]
+        concat_position_ids[i][~router_noisy_part[i]] = position_ids[i]
+
+    attention_mask = block_attn_mask(num_tokens, block_size, inputs_ids.device)
+    flex_attention_mask_3d = create_block_mask(
+        lambda b, h, q_idx, kv_idx: attention_mask[b, q_idx, kv_idx],
+        B=attention_mask.size(0),
+        H=None,
+        Q_LEN=attention_mask.size(1),
+        KV_LEN=attention_mask.size(2),
+    )
+    return concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep
+
+
 # @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
 def fused_flex_attention(query, key, value, attention_mask, **kwargs):
     return flex_attention(query, key, value, block_mask=attention_mask, **kwargs)
@@ -535,6 +570,8 @@ class SDARAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         bsz, q_len = input_shape
         hidden_shape = (*input_shape, -1, self.head_dim)
+        force_training_mask = kwargs.pop("force_training_mask", False)
+        use_diffusion_attention = self.training or force_training_mask
 
         query_states = self.q_norm(self.q_proj(
             hidden_states).view(hidden_shape)).transpose(1, 2)
@@ -559,7 +596,7 @@ class SDARAttention(nn.Module):
             value_states = torch.cat(
                 [past_value_states, value_states], dim=-2)
 
-        if self.training:
+        if use_diffusion_attention:
             attn_output, attn_weights = fused_flex_attention(
                 query=query_states,
                 key=key_states,
@@ -1072,7 +1109,6 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         return self.model
 
     def prepare_for_bd_training(self, inputs_ids, position_ids, prompt_mask):
-        bsz, seq_len = inputs_ids.shape
         num_tokens = calculate_token_nums(position_ids) # List[torch.Tensor]
         noisy_inputs_ids, logits_to_keep_half, p_mask = forward_add_noise_packed(
             inputs_ids=inputs_ids,
@@ -1080,39 +1116,28 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             prompt_mask=prompt_mask,
             mask_id=self.config.mask_token_id,
         )
-        router_noisy_part_list = []
-        for i in range(bsz):
-            cur_router_noisy_part = (torch.arange(num_tokens[i].shape[0] *2) % 2 == 0).to(inputs_ids.device)
-            cur_router_noisy_part = cur_router_noisy_part.repeat_interleave(num_tokens[i].repeat_interleave(2))
-            router_noisy_part_list.append(cur_router_noisy_part)
-        router_noisy_part = torch.stack(router_noisy_part_list, dim=0)
-
-        # concated inputs_ids: (bzs, seq_len x 2)
-        concat_inputs_ids = inputs_ids.repeat(1, 2)
-        # concated logits_to_keep: (bsz, seq_len x 2)
-        logits_to_keep = torch.zeros(
-                    bsz, 2 * seq_len, dtype=torch.bool, device=inputs_ids.device)
-        # concated position_ids: (bsz, seq_len x 2)
-        concat_position_ids = torch.zeros(
-                    bsz, 2 * seq_len, dtype=position_ids.dtype, device=position_ids.device)
-        for i in range(bsz):
-            concat_inputs_ids[i][router_noisy_part[i]] = noisy_inputs_ids[i]
-            concat_inputs_ids[i][~router_noisy_part[i]] = inputs_ids[i]
-
-            logits_to_keep[i][router_noisy_part[i]] = logits_to_keep_half[i]
-
-            concat_position_ids[i][router_noisy_part[i]] = position_ids[i]
-            concat_position_ids[i][~router_noisy_part[i]] = position_ids[i]
-
-        # create flex_attention mask
-        attention_mask = block_attn_mask(num_tokens, self.config.block_size, inputs_ids.device)
-        flex_attention_mask_3d = create_block_mask(
-                            lambda b, h, q_idx, kv_idx: attention_mask[b, q_idx, kv_idx],
-                            B=attention_mask.size(0), H=None,
-                            Q_LEN=attention_mask.size(1), KV_LEN=attention_mask.size(2),
+        concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep = build_bd_inputs_and_mask(
+            inputs_ids=inputs_ids,
+            noisy_inputs_ids=noisy_inputs_ids,
+            position_ids=position_ids,
+            logits_to_keep_half=logits_to_keep_half,
+            num_tokens=num_tokens,
+            block_size=self.config.block_size,
         )
-
         return concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask
+
+    def prepare_for_bd_training_from_artifacts(self, inputs_ids, noisy_inputs_ids, position_ids, logits_to_keep_half, p_mask):
+        num_tokens = calculate_token_nums(position_ids)
+        concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep = build_bd_inputs_and_mask(
+            inputs_ids=inputs_ids,
+            noisy_inputs_ids=noisy_inputs_ids,
+            position_ids=position_ids,
+            logits_to_keep_half=logits_to_keep_half,
+            num_tokens=num_tokens,
+            block_size=self.config.block_size,
+        )
+        selected_p_mask = p_mask[logits_to_keep_half]
+        return concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, selected_p_mask
 
     @can_return_tuple
     @auto_docstring
@@ -1157,19 +1182,40 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        if self.training:
+        return_dict = kwargs.pop("return_dict", True)
+        force_block_diffusion_training = kwargs.pop("force_block_diffusion_training", False)
+        bd_noisy_input_ids = kwargs.pop("bd_noisy_input_ids", None)
+        bd_target_mask = kwargs.pop("bd_target_mask", None)
+        bd_p_mask = kwargs.pop("bd_p_mask", None)
+        use_block_diffusion_path = self.training or force_block_diffusion_training
+        if use_block_diffusion_path:
             assert inputs_embeds is None, "only support input_ids during training"
-            prompt_mask = (labels == -100) if labels is not None else None
             position_ids = modify_padded_position_ids_2d(position_ids)
-            concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask = self.prepare_for_bd_training(input_ids, position_ids, prompt_mask)
+            if bd_noisy_input_ids is not None:
+                assert bd_target_mask is not None and bd_p_mask is not None, "Diffusion artifacts require mask indices and p_mask."
+                concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask = self.prepare_for_bd_training_from_artifacts(
+                    inputs_ids=input_ids,
+                    noisy_inputs_ids=bd_noisy_input_ids,
+                    position_ids=position_ids,
+                    logits_to_keep_half=bd_target_mask.bool(),
+                    p_mask=bd_p_mask,
+                )
+            else:
+                prompt_mask = (labels == -100) if labels is not None else None
+                concat_inputs_ids, concat_position_ids, flex_attention_mask_3d, logits_to_keep_half, logits_to_keep, p_mask = self.prepare_for_bd_training(
+                    input_ids, position_ids, prompt_mask
+                )
+            if not return_dict:
+                raise NotImplementedError("SDARForCausalLM training requires return_dict=True.")
             outputs = self.model(
                 input_ids=concat_inputs_ids,
                 attention_mask=flex_attention_mask_3d,
                 position_ids=concat_position_ids,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
-                return_dict=True,
+                return_dict=return_dict,
                 cache_position=cache_position,
+                force_training_mask=force_block_diffusion_training,
                 **kwargs,
             )
             hidden_states = outputs.last_hidden_state

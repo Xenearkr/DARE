@@ -241,10 +241,9 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
                     if self.config.algorithm.name in ["d1", "coupled-grpo", "bgpo", "ebpo", "spg"]:
-                        if self.config.actor_rollout_ref.model.name != "sdar":
-                            with _timer("forward_process", timing_raw):
-                                forward_batch_output = self.actor_rollout_wg.forward_process(batch)
-                            batch = batch.union(forward_batch_output)
+                        with _timer("forward_process", timing_raw):
+                            forward_batch_output = self.actor_rollout_wg.forward_process(batch)
+                        batch = batch.union(forward_batch_output)
                         if self.config.algorithm.name in ["bgpo", "ebpo"]:
                             # recompute old_log_probs
                             with _timer("old_log_prob", timing_raw):
