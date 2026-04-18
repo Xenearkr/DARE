@@ -39,9 +39,9 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
   <img src="assets/optimization_plan_bdlm.png" style="width:85%; height:auto;">
 </p> -->
 
-
 ## 📢 News
-- [2026-03-23]: Support d-TreeRPO algorithm for LLaDA and Dream models.
+- [2026-04-18]: Add an example of multi nodes rl training for llada d1
+- [2026-03-23]: Support d-treerpo algorithm for LLaDA and Dream.
 - [2026-03-16]: Support bgpo and ebpo for LLaDA2.X.
 - [2026-03-13]: Fix bugs in SDAR SGLang rollout and dp actor.
 - [2026-03-12]: Support sp for SDAR family, LLaDA2.0 and 2.1.
