@@ -1181,6 +1181,8 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         bd_noisy_input_ids = kwargs.pop("bd_noisy_input_ids", None)
         bd_target_mask = kwargs.pop("bd_target_mask", None)
         bd_p_mask = kwargs.pop("bd_p_mask", None)
+        return_block_diffusion_token_loss = kwargs.pop("return_block_diffusion_token_loss", False)
+        block_diffusion_token_loss = None
         use_block_diffusion_path = self.training or force_block_diffusion_training
         if use_block_diffusion_path:
             assert inputs_embeds is None, "only support input_ids during training"
@@ -1214,16 +1216,25 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             hidden_states = hidden_states[logits_to_keep].contiguous()
             assert labels is not None, "Labels must be provided for training."
             answer_len = (labels != -100).sum()
-            loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
-            loss = loss_fct(  # it will return (sum_loss, unreduced_loss)
-                    # conduct `view(-1, V)` inside the function
-                    x=hidden_states,
-                    target=labels[logits_to_keep_half].contiguous(),
-                    weight=self.lm_head.weight,
-                    bias=self.lm_head.bias,
-                    p_mask=p_mask,
-                )
-            loss = loss / answer_len
+            selected_targets = labels[logits_to_keep_half].contiguous()
+            if return_block_diffusion_token_loss:
+                diffusion_logits = self.lm_head(hidden_states).float()
+                block_diffusion_token_loss = F.cross_entropy(
+                    diffusion_logits,
+                    selected_targets,
+                    reduction="none",
+                ) / p_mask.float()
+                loss = block_diffusion_token_loss.sum() / answer_len
+            else:
+                loss_fct = FusedLinearDiffusionCrossEntropyLoss(reduction='sum')
+                loss = loss_fct(
+                        x=hidden_states,
+                        target=selected_targets,
+                        weight=self.lm_head.weight,
+                        bias=self.lm_head.bias,
+                        p_mask=p_mask,
+                    )
+                loss = loss / answer_len
             logits = None
         else:
             # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
@@ -1260,13 +1271,16 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
                 loss = loss_fct(
                     logits.view(-1, self.config.vocab_size), labels.view(-1))
 
-        return CausalLMOutputWithPast(
+        output = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+        if block_diffusion_token_loss is not None:
+            output.block_diffusion_token_loss = block_diffusion_token_loss
+        return output
 
 
 __all__ = [

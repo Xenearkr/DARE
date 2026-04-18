@@ -620,6 +620,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         elif self.config.model.name == 'sdar':
             if self.config.algorithm.name == 'bgpo':
                 from verl.workers.actor.sdar_dp_actor_bgpo import DLLMDataParallelPPOActor
+            elif self.config.algorithm.name == 'ebpo':
+                from verl.workers.actor.sdar_dp_actor_ebpo import DLLMDataParallelPPOActor
             else:
                 raise NotImplementedError
         # This is used to import external_lib into the huggingface systems
@@ -680,6 +682,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
                 self.config.actor.use_fused_kernels = use_fused_kernels
+                if self.config.model.name == 'sdar' and self.config.algorithm.name == 'ebpo':
+                    self.config.actor.block_length = self.config.rollout.get('block_length', self.config.actor.get('block_length', 4))
             self.actor = DLLMDataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout and not self.config.algorithm.name in ["vrpo"]:
