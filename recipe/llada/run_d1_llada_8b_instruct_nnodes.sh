@@ -260,6 +260,7 @@ PY
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_PROJECT="${WANDB_PROJECT:-DARE}"
+export WANDB_API_KEY="${WANDB_API_KEY}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 default_cache_root="${XDG_CACHE_HOME:-${HOME:-${REPO_ROOT}}/.cache}"
