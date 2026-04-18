@@ -166,6 +166,18 @@ pip install math_verify latex2sympy2_extended
 # pip install lmdeploy==0.10.1
 ```
 
+Install SGLang (required for SDAR and LLaDA2.x rollout and evaluation acceleration) from source:
+
+```bash
+# Use the last release branch
+git clone -b v0.5.9 https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Install the python packages
+pip install --upgrade pip
+pip install -e "python"
+```
+
 ### 🔧 Model Setup
 
 After downloading [LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct), replace the source files with our modified versions to enable several key features:
