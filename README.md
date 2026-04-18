@@ -40,7 +40,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 </p> -->
 
 ## 📢 News
-- [2026-04-18]: Add an example of multi nodes rl training for llada d1
+- [2026-04-18]: Add an example of multi nodes rl training for LLaDA d1.
 - [2026-03-23]: Support d-treerpo algorithm for LLaDA and Dream.
 - [2026-03-16]: Support bgpo and ebpo for LLaDA2.X.
 - [2026-03-13]: Fix bugs in SDAR SGLang rollout and dp actor.
@@ -300,7 +300,6 @@ bash scripts/eval_sdar_8b_chat.sh --task mmlu --engine lmdeploy
 ### 🚀 Eval on Local Bench Quick Start
 
 If you want to add more benchmarks, models, or custom datasets, please refer to the [Evaluation Guideline](https://github.com/yjyddq/DARE/blob/main/opencompass/README.md).
-
 
 
 
