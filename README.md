@@ -258,9 +258,7 @@ bash recipe/run_vrpo_llada_8b_instruct.sh --task ultrafeedback
 bash recipe/run_vrpo_dream_7b_instruct.sh --task ultrafeedback
 ```
 
-### 🚀 Convert Weights
-
-Run an example for preference optimization.
+### 🚀 Convert Checkpoints Weights to HuggingFace Safetensors
 
 ```bash
 # convert FSDP sharded checkpoints to HuggingFace safetensors format
@@ -276,10 +274,7 @@ bash scripts/convert_ckpt_to_hf.sh \
 
 ## 📊 Evaluation
 
-### 🚀 Convert FSDP Sharded Checkpoints to HuggingFace Safetensors
-
-
-### 🚀 Eval on OpenCompass's Bench Quick Start
+### 🚀 Eval on OpenCompass Quick Start
 
 First, please follow [opencompass](https://github.com/open-compass/opencompass) for benchmark dataset preparation. Then, you need to specify the model path in `opencompass/opencompass/configs/models/dllm/*`. For example `llada_instruct_8b.py`:
 
