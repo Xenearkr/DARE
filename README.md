@@ -87,20 +87,15 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 
 ## 🏆 Key Features
 
-- **Acceleration Inference/Rollout for dLLMs**
-  - Block cache ([Fast-dLLM](https://github.com/NVlabs/Fast-dLLM)) for LLaDAs and Dreams 2.2x faster rollout
-  - Inference engine ([lmdeploy](https://github.com/InternLM/lmdeploy), [sglang](https://github.com/sgl-project/sglang)) for SDARs 2-4× faster rollout
-- **Parallelism for dLLMs**
-  - Support sequence parallel for LLaDA and Dream
-- **Attention Backend**
-  - Support flash_attn, flash_attn_varlen, and flash_attn_with_kvcache backend for LLaDA
+- **Algorithm Zoo**
+  - Support d1, Coupled-GRPO, VRPO, MDPO, CJ-GRPO, BGPO, SPG, EBPO, d-TreeRPO
 - **Model Diversity**
   - Masked diffusion language models (e.g., LLaDA and Dream)
-  - Block diffusion language model (e.g., SDAR and LLaDA2.0)
+  - Block diffusion language model (e.g., SDAR and LLaDA2.X)
 - **Comprehensive Evaluation for dLLMs**
   - Integrate faster dLLM evaluation in [opencompass](https://github.com/open-compass/opencompass)
 - **Upcoming Features**
-  - Support Multi-Modal, Omni, etc.
+  - Support multi-modal, omni, more algorithms
 
 
 ## 🛠️ Installation and Setup
@@ -339,7 +334,7 @@ If you want to add more benchmarks, models, or custom datasets, please refer to 
 | **spg** | [2510.09541](https://arxiv.org/pdf/2510.09541) | [facebookresearch/SPG](https://github.com/facebookresearch/SPG) |
 | **bgpo** | [2510.11683](https://arxiv.org/pdf/2510.11683) | [THU-KEG/BGPO](https://github.com/THU-KEG/BGPO) |
 | **ebpo** | [2602.08676](https://arxiv.org/pdf/2602.08676) | [inclusionAI/LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X) (closed source) |
-| **d-TreeRPO** | [2512.09675](https://arxiv.org/pdf/2512.09675) | [THU-BPM/d-TreeRPO](https://github.com/THU-BPM/d-TreeRPO) |
+| **d-treerpo** | [2512.09675](https://arxiv.org/pdf/2512.09675) | [THU-BPM/d-TreeRPO](https://github.com/THU-BPM/d-TreeRPO) |
 
 
 ## 📈 Performance
