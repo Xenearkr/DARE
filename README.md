@@ -6,6 +6,7 @@
 
 <h2>DARE: dLLM Alignment and Reinforcement Executor</h2>
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv:2604.04215-red)](https://arxiv.org/pdf/2604.04215)
 <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
 <img src="https://visitor-badge.laobi.icu/badge?page_id=yjyddq.DARE" />
 <img src="https://img.shields.io/github/stars/yjyddq/DARE?style=flat-square&logo=github&label=Stars" alt="Stars">
