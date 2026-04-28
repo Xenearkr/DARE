@@ -43,6 +43,7 @@ DARE is a work in progress, we plan to support more models and algorithm for tra
 ## 📢 News
 - [2026-04-19]: Support ebpo for SDAR.
 - [2026-04-18]: Add an example of multi nodes rl training for LLaDA d1.
+- [2026-04-05]: We release our report "DARE: Diffusion Large Language Models Alignment and Reinforcement Executor" on arXiv.
 - [2026-03-23]: Support d-treerpo algorithm for LLaDA and Dream.
 - [2026-03-16]: Support bgpo and ebpo for LLaDA2.X.
 - [2026-03-13]: Fix bugs in SDAR SGLang rollout and dp actor.
