@@ -226,7 +226,6 @@ opencompass/tmp
 
 *.ipynb
 
-/*.sh
 =======
 *.safetensors
 __pycache__/
@@ -234,3 +233,4 @@ __pycache__/
 *$py.class
 outputs/
 ckpts/
+models/finetune_d3LLM
