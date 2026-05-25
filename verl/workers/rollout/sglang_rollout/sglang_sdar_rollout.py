@@ -19,14 +19,29 @@ which use block-level diffusion rather than token-level autoregressive generatio
 It integrates with SGLang's built-in dLLM (diffusion LLM) support.
 """
 
+import asyncio
 import logging
 import os
 from typing import TYPE_CHECKING
 
+import numpy as np
+import torch
 from omegaconf import DictConfig
+from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 
-from verl.workers.rollout.sglang_rollout.sglang_rollout import SGLangRollout
+from verl import DataProto
+from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from verl.workers.rollout.sglang_rollout.sglang_rollout import (
+    SGLangRollout,
+    _post_process_outputs,
+    _pre_process_inputs,
+)
+from verl.workers.rollout.sglang_rollout.sglang_sdar_dllm_patch import (
+    apply_sdar_dllm_lmdeploy_patch,
+    sdar_sampling_context,
+)
+from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer
@@ -94,12 +109,21 @@ class SGLangSDARRollout(SGLangRollout):
         self._mask_token_id = config.get("mask_token_id", 151669)
         self._block_length = config.get("block_length", 4)
         self._dllm_algorithm = config.get("dllm_algorithm", "LowConfidence")
+        self._dllm_confidence_threshold = config.get("dllm_confidence_threshold", 0.9)
+        self._num_diffusion_steps = config.get("num_diffusion_steps", 4)
+
+        apply_sdar_dllm_lmdeploy_patch(
+            confidence_threshold=self._dllm_confidence_threshold,
+            denoising_steps=self._num_diffusion_steps,
+        )
 
         logger.info(
             f"Initializing SGLangSDARRollout with: "
             f"mask_token_id={self._mask_token_id}, "
             f"block_length={self._block_length}, "
-            f"dllm_algorithm={self._dllm_algorithm}"
+            f"dllm_algorithm={self._dllm_algorithm}, "
+            f"dllm_confidence_threshold={self._dllm_confidence_threshold}, "
+            f"num_diffusion_steps={self._num_diffusion_steps}"
         )
 
         # Call parent init
@@ -206,3 +230,140 @@ class SGLangSDARRollout(SGLangRollout):
     def dllm_algorithm(self) -> str:
         """Return the dLLM algorithm being used."""
         return self._dllm_algorithm
+
+    @torch.no_grad()
+    def _batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        """LMDeploy-style rollout: one independent ``n=1`` generate per sample."""
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+        if not do_sample or is_validate:
+            return super()._batch_level_generate_sequences(prompts, **kwargs)
+        return self._lmdeploy_style_batch_level_generate_sequences(prompts, **kwargs)
+
+    @torch.no_grad()
+    def _lmdeploy_style_batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        idx = prompts.batch["input_ids"]
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+
+        eos_token_id = prompts.meta_info.get("eos_token_id", self.eos_token_id)
+        if eos_token_id is None:
+            eos_token_id = self.pad_token_id
+
+        batch_size = idx.size(0)
+        n_rollout = self.config.n
+
+        non_tensor_batch = prompts.non_tensor_batch
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)],
+                dtype=object,
+            )
+
+        raw_prompt_ids = non_tensor_batch.pop("raw_prompt_ids")
+        image_data = non_tensor_batch.pop("multi_modal_data", None) if "multi_modal_data" in non_tensor_batch else None
+
+        idx_list = []
+        image_list = []
+        for i in range(batch_size):
+            prompt_ids = raw_prompt_ids[i]
+            if isinstance(prompt_ids, np.ndarray):
+                prompt_ids = prompt_ids.tolist()
+            for _ in range(n_rollout):
+                idx_list.append(prompt_ids)
+                if image_data is not None:
+                    item = image_data[i]
+                    image_list.append(item.get("image", None) if isinstance(item, dict) else None)
+                else:
+                    image_list.append(None)
+
+        idx_repeat = idx.repeat_interleave(n_rollout, dim=0)
+        attention_mask_repeat = attention_mask.repeat_interleave(n_rollout, dim=0)
+        position_ids_repeat = position_ids.repeat_interleave(n_rollout, dim=0)
+        total_batch_size = batch_size * n_rollout
+
+        _non_tensor_batch = {}
+        for key, val in non_tensor_batch.items():
+            _non_tensor_batch[key] = np.repeat(val, n_rollout, axis=0)
+
+        gen_kwargs = dict(
+            n=1,
+            top_p=self.config.top_p,
+            temperature=self.config.temperature,
+            max_new_tokens=self.config.response_length,
+        )
+
+        with self.update_sampling_params(**gen_kwargs):
+            if self._tp_rank == 0:
+                loop = asyncio.get_event_loop()
+                merged_output = []
+                # LMDeploy API does not pass top_k; disable it for equivalent dLLM sampling.
+                with sdar_sampling_context(
+                    temperature=self.sampling_params["temperature"],
+                    top_k=0,
+                    top_p=self.sampling_params.get("top_p", 1.0),
+                ):
+                    for input_ids, image in zip(idx_list, image_list):
+                        output = loop.run_until_complete(
+                            self._engine.async_generate(
+                                prompt=None,
+                                sampling_params=self.sampling_params,
+                                return_logprob=True,
+                                input_ids=[input_ids],
+                                image_data=[image] if image is not None else None,
+                            )
+                        )
+                        if isinstance(output, list):
+                            merged_output.extend(output)
+                        else:
+                            merged_output.append(output)
+            else:
+                merged_output = None
+
+            [merged_output] = broadcast_pyobj(
+                data=[merged_output],
+                rank=self._rank,
+                dist_group=self._device_mesh_cpu[self._tp_mesh_name].get_group(),
+                src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
+                force_cpu_device=False,
+            )
+
+            response, rollout_log_probs = _post_process_outputs(self.tokenizer, merged_output)
+            response = response.to(idx.device)
+            if rollout_log_probs is not None:
+                rollout_log_probs = rollout_log_probs.to(idx.device)
+
+            if response.shape[1] < self.config.response_length:
+                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+                if rollout_log_probs is not None:
+                    rollout_log_probs = pad_sequence_to_length(
+                        rollout_log_probs, self.config.response_length, 0.0
+                    )
+
+            seq = torch.cat([idx_repeat, response], dim=-1)
+            response_length = response.size(1)
+            delta_position_id = torch.arange(1, response_length + 1, device=position_ids_repeat.device)
+            delta_position_id = delta_position_id.unsqueeze(0).repeat(total_batch_size, 1)
+            response_position_ids = position_ids_repeat[:, -1:] + delta_position_id
+            position_ids_out = torch.cat([position_ids_repeat, response_position_ids], dim=-1)
+            response_attention_mask = get_response_mask(
+                response_id=response, eos_token=eos_token_id, dtype=attention_mask_repeat.dtype
+            )
+            attention_mask_out = torch.cat((attention_mask_repeat, response_attention_mask), dim=-1)
+
+            batch_tensors = {
+                "prompts": idx_repeat,
+                "responses": response,
+                "input_ids": seq,
+                "attention_mask": attention_mask_out,
+                "position_ids": position_ids_out,
+            }
+            if rollout_log_probs is not None:
+                batch_tensors["rollout_log_probs"] = rollout_log_probs
+
+            batch = TensorDict(batch_tensors, batch_size=total_batch_size)
+
+        if self.config.free_cache_engine and self._engine is not None:
+            self._engine.flush_cache()
+
+        return DataProto(batch=batch, non_tensor_batch=_non_tensor_batch)

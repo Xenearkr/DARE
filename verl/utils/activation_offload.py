@@ -323,7 +323,10 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
 
         # Window map data structure helps us synchronize based on number
         # of layers offloaded
-        if self.layer_window_map[self.offloaded_group_count] == current_group:
+        if (
+            self.offloaded_group_count in self.layer_window_map
+            and self.layer_window_map[self.offloaded_group_count] == current_group
+        ):
             # Stream synchronization both ways
             self.d2h_stream.wait_stream(torch.cuda.current_stream())
             torch.cuda.current_stream().wait_stream(self.d2h_stream)
@@ -374,7 +377,11 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
         assert self.current_group >= 0
 
         # Layer window data structure helps us to reload at right times
-        if self.layer_window_map[self.offloaded_group_count - 1] == self.current_group:
+        if (
+            self.offloaded_group_count > 0
+            and (self.offloaded_group_count - 1) in self.layer_window_map
+            and self.layer_window_map[self.offloaded_group_count - 1] == self.current_group
+        ):
             # Stream synchronization both ways
             self.h2d_stream.wait_stream(torch.cuda.current_stream())
             torch.cuda.current_stream().wait_stream(self.h2d_stream)

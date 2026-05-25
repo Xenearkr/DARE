@@ -95,6 +95,8 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                         MASK_TOKEN_ID=self.MASK_TOKEN_ID,
                     )
                     loss_per_sample[b, i] = -loss_b_i  # convert to log likelihood (batch_size, mc_num)
+                    if call_fn_name == "update_policy":
+                        get_torch_device().empty_cache()
 
             log_likelihood = loss_per_sample.sum(dim=1) / mc_num  # (batch_size,)
             log_probs = log_likelihood.unsqueeze(-1).expand(-1, response_length)  # (batch_size, response_length)
@@ -280,80 +282,79 @@ class DLLMDataParallelPPOActor(BaseDataParallelPPOActor):
                     mask_indices = data["mask_indices"]
                     p_mask = data["p_mask"]
                     mc_num = perturbed_seq.shape[1]
+                    num_samples = data["input_ids"].size(0)
                     for i in range(mc_num):
-                        cur_data = {
-                            **data,
-                            "perturbed_seq": perturbed_seq[:, i : i + 1],
-                            "mask_indices": mask_indices[:, i : i + 1],
-                            "p_mask": p_mask[:, i : i + 1],
-                        }
-                        entropy, log_prob, loss_per_sample = self._forward_micro_batch(
-                            micro_batch=cur_data,
-                            temperature=temperature,
-                            n_l=1,
-                            mc_num=1,
-                            calculate_entropy=calculate_entropy,
-                            call_fn_name="update_policy",
-                        )
-                        # Compute policy loss
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_bgpo(
-                            old_l_theta=old_loss_per_sample[:, i, :],  # (bsz, response_length)
-                            l_theta=loss_per_sample[:, 0, :],  # (bsz, response_length)
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-
-                        if entropy_coeff != 0:
-                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                            # compute policy loss
-                            policy_loss = pg_loss - entropy_loss * entropy_coeff
-                        else:
-                            policy_loss = pg_loss
-
-                        if self.config.use_kl_loss:  # NOTE: Currently not considering KL
-                            ref_log_probs = data["ref_log_probs"]
-                            # compute kl loss
-                            kld = kl_penalty(
-                                l_theta=log_prob,
-                                ref_l_theta=ref_log_probs,
-                                kl_penalty=self.config.kl_loss_type,
-                                advantages=advantages,
+                        for b in range(num_samples):
+                            cur_data = {
+                                k: (v[b : b + 1] if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.size(0) == num_samples else v)
+                                for k, v in data.items()
+                            }
+                            cur_data["perturbed_seq"] = perturbed_seq[b : b + 1, i : i + 1]
+                            cur_data["mask_indices"] = mask_indices[b : b + 1, i : i + 1]
+                            cur_data["p_mask"] = p_mask[b : b + 1, i : i + 1]
+                            entropy, log_prob, loss_per_sample = self._forward_micro_batch(
+                                micro_batch=cur_data,
+                                temperature=temperature,
+                                n_l=1,
+                                mc_num=1,
+                                calculate_entropy=calculate_entropy,
+                                call_fn_name="update_policy",
                             )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_bgpo(
+                                old_l_theta=old_loss_per_sample[b : b + 1, i, :],
+                                l_theta=loss_per_sample[:, 0, :],
+                                advantages=advantages[b : b + 1],
+                                response_mask=response_mask[b : b + 1],
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                            )
 
-                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            metrics["actor/kl_loss"] = kl_loss.detach().item()
-                            metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                            if entropy_coeff != 0:
+                                entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask[b : b + 1], loss_agg_mode=loss_agg_mode)
+                                policy_loss = pg_loss - entropy_loss * entropy_coeff
+                            else:
+                                policy_loss = pg_loss
 
-                        if self.config.use_dynamic_bsz:
-                            # relative to the dynamic bsz
-                            loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                        else:
-                            loss = policy_loss / self.gradient_accumulation
-                        loss /= self.mc_num
-                        loss.backward()  # Gradient is accumulated in model parameters, but will not be updated now
-                        
-                        accumulated_pg_loss += pg_loss.detach().item()
-                        accumulated_pg_clipfrac += pg_clipfrac.detach().item()
-                        accumulated_ppo_kl += ppo_kl.detach().item()
-                        accumulated_pg_clipfrac_lower += pg_clipfrac_lower.detach().item()
+                            if self.config.use_kl_loss:
+                                ref_log_probs = data["ref_log_probs"]
+                                kld = kl_penalty(
+                                    l_theta=log_prob,
+                                    ref_l_theta=ref_log_probs[b : b + 1],
+                                    kl_penalty=self.config.kl_loss_type,
+                                    advantages=advantages[b : b + 1],
+                                )
+                                kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask[b : b + 1], loss_agg_mode=loss_agg_mode)
+                                policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                                metrics["actor/kl_loss"] = kl_loss.detach().item()
+                                metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                            if self.config.use_dynamic_bsz:
+                                loss = policy_loss / self.config.ppo_mini_batch_size
+                            else:
+                                loss = policy_loss / (self.gradient_accumulation * num_samples)
+                            loss /= self.mc_num
+                            loss.backward()
+                            get_torch_device().empty_cache()
+
+                            accumulated_pg_loss += pg_loss.detach().item()
+                            accumulated_pg_clipfrac += pg_clipfrac.detach().item()
+                            accumulated_ppo_kl += ppo_kl.detach().item()
+                            accumulated_pg_clipfrac_lower += pg_clipfrac_lower.detach().item()
 
                     data = {
-                        "actor/pg_loss": accumulated_pg_loss / mc_num,
-                        "actor/pg_clipfrac": accumulated_pg_clipfrac / mc_num,
-                        "actor/ppo_kl": accumulated_ppo_kl / mc_num,
-                        "actor/pg_clipfrac_lower": accumulated_pg_clipfrac_lower / mc_num,
+                        "actor/pg_loss": accumulated_pg_loss / (mc_num * num_samples),
+                        "actor/pg_clipfrac": accumulated_pg_clipfrac / (mc_num * num_samples),
+                        "actor/ppo_kl": accumulated_ppo_kl / (mc_num * num_samples),
+                        "actor/pg_clipfrac_lower": accumulated_pg_clipfrac_lower / (mc_num * num_samples),
                     }
                     append_to_dict(metrics, data)
 
-                grad_norm = self._optimizer_step()  # Update gradients after each mini-batch
+                grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
-        self.actor_optimizer.zero_grad()  # Clear gradient accumulation
+        self.actor_optimizer.zero_grad()
+        get_torch_device().empty_cache()
         return metrics

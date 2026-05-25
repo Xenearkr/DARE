@@ -7,6 +7,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TORCHDYNAMO_DISABLE=1
 export WANDB_PROJECT="DARE"
+export WANDB_API_KEY="${WANDB_API_KEY:-wandb_v1_ZyTW8NCbOruLfue0ZyzHc7XoUoz}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_RESUME="allow"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"

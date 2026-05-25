@@ -23,7 +23,7 @@ cleanup() {
     # clean up old ray
     ray stop --force || true
     pkill -f "ray" || true
-    rm -rf /tmp/ray || true
+    rm -rf /tmp/ray 2>/dev/null || true
 }
 
 trap cleanup EXIT INT TERM ERR
@@ -74,7 +74,7 @@ engine=${engine:-sglang}
 # clean up old ray
 echo "[INFO] Cleaning up old Ray..."
 ray stop --force || true
-rm -rf /tmp/ray || true
+rm -rf /tmp/ray 2>/dev/null || true
 
 # start up lmdeploy server (only for lmdeploy engine)
 if [ "$engine" = "lmdeploy" ]; then
@@ -144,11 +144,11 @@ ray start --head \
 
 export HYDRA_FULL_ERROR=1
 
-export WANDB_PROJECT="DARE"
-export WANDB_API_KEY=
-export WANDB_RESUME="allow"
-export WANDB_MODE="online"
-export HF_HOME=
+export WANDB_PROJECT="${WANDB_PROJECT:-DARE}"
+export WANDB_API_KEY="${WANDB_API_KEY:-wandb_v1_ZyTW8NCbOruLfue0ZyzHc7XoUoz}"
+export WANDB_RESUME="${WANDB_RESUME:-allow}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_OFFLINE=1
 export TORCHDYNAMO_DISABLE=1
 
@@ -203,7 +203,7 @@ elif [ $task == "code" ]; then
         total_epoch=1
     else
         train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
-        val_files="['data/preprocessed/rl/test/mbpp_1.parquet','data/preprocessed/rl/test/humaneval_1.parquet','data/preprocessed/rl/test/humanevalplus_1.parquet']"
+        val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
         max_prompt_length=1024
         max_response_length=1536
         total_epoch=5
@@ -283,11 +283,19 @@ else
     mc_num=4
     n_l=4
     ppo_max_token_len_per_gpu=3072
-    max_num_batched_tokens=4096
-    val_batch_size=16
-    save_freq=50
-    test_freq=50
+    max_num_batched_tokens=6144
+    val_batch_size=32
+    enable_activation_offload=True
+    save_freq=100
+    test_freq=100
     val_before_train=False
+    if [ "$engine" = "sglang" ]; then
+        echo "[INFO] SGLang full: smoke-style inference mem settings + activation_offload"
+        sglang_mem_fraction_static=0.35
+        sglang_gpu_memory_utilization=0.35
+        sglang_attention_backend=torch_native
+        sglang_disable_cuda_graph=True
+    fi
 fi
 
 lr=5e-7
@@ -358,6 +366,8 @@ python3 -m verl.trainer.dllm_main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    ++actor_rollout_ref.model.enable_activation_offload=${enable_activation_offload:-False} \
+    ++actor_rollout_ref.actor.use_torch_compile=False \
     actor_rollout_ref.model.trust_remote_code=True \
     +actor_rollout_ref.model.attn_implementation="flash_attention_2" \
     +actor_rollout_ref.model.baseline=$baseline \
@@ -382,6 +392,7 @@ python3 -m verl.trainer.dllm_main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=${sglang_gpu_memory_utilization:-0.4} \
     +actor_rollout_ref.rollout.mask_token_id=$mask_token_id \
     +actor_rollout_ref.rollout.dllm_algorithm=LowConfidence \
+    +actor_rollout_ref.rollout.dllm_confidence_threshold=0.9 \
     +actor_rollout_ref.rollout.attention_backend=${sglang_attention_backend:-fa3} \
     +actor_rollout_ref.rollout.disable_cuda_graph=${sglang_disable_cuda_graph:-False} \
     +actor_rollout_ref.rollout.mem_fraction_static=${sglang_mem_fraction_static:-0.45} \
@@ -419,10 +430,9 @@ python3 -m verl.trainer.dllm_main_ppo \
     trainer.test_freq=${test_freq:-10} \
     trainer.total_epochs=$total_epoch \
     custom_reward_function.path="verl/utils/reward_score/__init__.py" \
-    custom_reward_function.name="dllm_rm" 
-    # \
-    # >> ${log_dir}/${baseline}-${timestamp}.out \
-    # 2>> ${log_dir}/${baseline}-${timestamp}.err &
+    custom_reward_function.name="dllm_rm" \
+    >> ${log_dir}/${baseline}-${timestamp}.log 2>&1
+
     # actor_rollout_ref.model.lora_rank=32 \
     # actor_rollout_ref.model.lora_alpha=16 \
     # actor_rollout_ref.model.target_modules=all-linear 
