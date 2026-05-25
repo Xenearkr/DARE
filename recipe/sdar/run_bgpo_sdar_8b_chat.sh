@@ -285,8 +285,8 @@ else
     ppo_max_token_len_per_gpu=3072
     max_num_batched_tokens=4096
     val_batch_size=16
-    save_freq=100
-    test_freq=10
+    save_freq=50
+    test_freq=50
     val_before_train=False
 fi
 
