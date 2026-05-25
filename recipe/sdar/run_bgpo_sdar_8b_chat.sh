@@ -206,7 +206,7 @@ elif [ $task == "code" ]; then
         val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
         max_prompt_length=1024
         max_response_length=1536
-        total_epoch=5
+        total_epoch=1
     fi
 elif [ $task == "countdown" ]; then
     train_files="['data/preprocessed/rl/train/countdown-n20000_1.parquet']"
@@ -286,9 +286,9 @@ else
     max_num_batched_tokens=6144
     val_batch_size=32
     enable_activation_offload=True
-    save_freq=100
-    test_freq=100
-    val_before_train=False
+    save_freq=10
+    test_freq=20
+    val_before_train=True
     if [ "$engine" = "sglang" ]; then
         echo "[INFO] SGLang full: smoke-style inference mem settings + activation_offload"
         sglang_mem_fraction_static=0.35

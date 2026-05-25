@@ -22,6 +22,7 @@ It integrates with SGLang's built-in dLLM (diffusion LLM) support.
 import asyncio
 import logging
 import os
+import random
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -36,10 +37,6 @@ from verl.workers.rollout.sglang_rollout.sglang_rollout import (
     SGLangRollout,
     _post_process_outputs,
     _pre_process_inputs,
-)
-from verl.workers.rollout.sglang_rollout.sglang_sdar_dllm_patch import (
-    apply_sdar_dllm_lmdeploy_patch,
-    sdar_sampling_context,
 )
 from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
@@ -112,11 +109,6 @@ class SGLangSDARRollout(SGLangRollout):
         self._dllm_confidence_threshold = config.get("dllm_confidence_threshold", 0.9)
         self._num_diffusion_steps = config.get("num_diffusion_steps", 4)
 
-        apply_sdar_dllm_lmdeploy_patch(
-            confidence_threshold=self._dllm_confidence_threshold,
-            denoising_steps=self._num_diffusion_steps,
-        )
-
         logger.info(
             f"Initializing SGLangSDARRollout with: "
             f"mask_token_id={self._mask_token_id}, "
@@ -148,6 +140,9 @@ class SGLangSDARRollout(SGLangRollout):
         SGLang will automatically detect the SDAR model architecture and apply
         the appropriate block diffusion forward pass.
         """
+        import tempfile
+
+        import yaml
         from sglang.srt.entrypoints.engine import Engine
         from .utils import broadcast_pyobj, get_ip, get_open_port
 
@@ -195,8 +190,18 @@ class SGLangSDARRollout(SGLangRollout):
                 max_running_requests=self.config.get("max_running_requests", 1),
             )
 
-            # Add SDAR/dLLM specific parameters
+            # Add SDAR/dLLM specific parameters (read by scheduler subprocess)
             engine_kwargs["dllm_algorithm"] = self._dllm_algorithm
+            algo_cfg = {
+                "threshold": self._dllm_confidence_threshold,
+                "denoising_steps": self._num_diffusion_steps,
+                "temperature": float(self.config.get("temperature", 1.0)),
+                "top_k": 0,
+                "top_p": float(self.config.get("top_p", 1.0)),
+            }
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+                yaml.safe_dump(algo_cfg, f)
+                engine_kwargs["dllm_algorithm_config"] = f.name
 
             if self.config.get("disable_cuda_graph") is not None:
                 engine_kwargs["disable_cuda_graph"] = self.config.get("disable_cuda_graph")
@@ -293,75 +298,73 @@ class SGLangSDARRollout(SGLangRollout):
             max_new_tokens=self.config.response_length,
         )
 
-        with self.update_sampling_params(**gen_kwargs):
-            if self._tp_rank == 0:
-                loop = asyncio.get_event_loop()
-                merged_output = []
-                # LMDeploy API does not pass top_k; disable it for equivalent dLLM sampling.
-                with sdar_sampling_context(
-                    temperature=self.sampling_params["temperature"],
-                    top_k=0,
-                    top_p=self.sampling_params.get("top_p", 1.0),
-                ):
-                    for input_ids, image in zip(idx_list, image_list):
-                        output = loop.run_until_complete(
-                            self._engine.async_generate(
-                                prompt=None,
-                                sampling_params=self.sampling_params,
-                                return_logprob=True,
-                                input_ids=[input_ids],
-                                image_data=[image] if image is not None else None,
-                            )
-                        )
-                        if isinstance(output, list):
-                            merged_output.extend(output)
-                        else:
-                            merged_output.append(output)
-            else:
-                merged_output = None
-
-            [merged_output] = broadcast_pyobj(
-                data=[merged_output],
-                rank=self._rank,
-                dist_group=self._device_mesh_cpu[self._tp_mesh_name].get_group(),
-                src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
-                force_cpu_device=False,
-            )
-
-            response, rollout_log_probs = _post_process_outputs(self.tokenizer, merged_output)
-            response = response.to(idx.device)
-            if rollout_log_probs is not None:
-                rollout_log_probs = rollout_log_probs.to(idx.device)
-
-            if response.shape[1] < self.config.response_length:
-                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-                if rollout_log_probs is not None:
-                    rollout_log_probs = pad_sequence_to_length(
-                        rollout_log_probs, self.config.response_length, 0.0
+        if self._tp_rank == 0:
+            loop = asyncio.get_event_loop()
+            merged_output = []
+            for input_ids, image in zip(idx_list, image_list):
+                per_call_params = {
+                    **self.sampling_params,
+                    **gen_kwargs,
+                    "sampling_seed": random.randint(0, 2**31 - 1),
+                }
+                output = loop.run_until_complete(
+                    self._engine.async_generate(
+                        prompt=None,
+                        sampling_params=per_call_params,
+                        return_logprob=True,
+                        input_ids=[input_ids],
+                        image_data=[image] if image is not None else None,
                     )
+                )
+                if isinstance(output, list):
+                    merged_output.extend(output)
+                else:
+                    merged_output.append(output)
+        else:
+            merged_output = None
 
-            seq = torch.cat([idx_repeat, response], dim=-1)
-            response_length = response.size(1)
-            delta_position_id = torch.arange(1, response_length + 1, device=position_ids_repeat.device)
-            delta_position_id = delta_position_id.unsqueeze(0).repeat(total_batch_size, 1)
-            response_position_ids = position_ids_repeat[:, -1:] + delta_position_id
-            position_ids_out = torch.cat([position_ids_repeat, response_position_ids], dim=-1)
-            response_attention_mask = get_response_mask(
-                response_id=response, eos_token=eos_token_id, dtype=attention_mask_repeat.dtype
-            )
-            attention_mask_out = torch.cat((attention_mask_repeat, response_attention_mask), dim=-1)
+        [merged_output] = broadcast_pyobj(
+            data=[merged_output],
+            rank=self._rank,
+            dist_group=self._device_mesh_cpu[self._tp_mesh_name].get_group(),
+            src=self._device_mesh_cpu[self._tp_mesh_name].mesh[0].item(),
+            force_cpu_device=False,
+        )
 
-            batch_tensors = {
-                "prompts": idx_repeat,
-                "responses": response,
-                "input_ids": seq,
-                "attention_mask": attention_mask_out,
-                "position_ids": position_ids_out,
-            }
+        response, rollout_log_probs = _post_process_outputs(self.tokenizer, merged_output)
+        response = response.to(idx.device)
+        if rollout_log_probs is not None:
+            rollout_log_probs = rollout_log_probs.to(idx.device)
+
+        if response.shape[1] < self.config.response_length:
+            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
             if rollout_log_probs is not None:
-                batch_tensors["rollout_log_probs"] = rollout_log_probs
+                rollout_log_probs = pad_sequence_to_length(
+                    rollout_log_probs, self.config.response_length, 0.0
+                )
 
-            batch = TensorDict(batch_tensors, batch_size=total_batch_size)
+        seq = torch.cat([idx_repeat, response], dim=-1)
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids_repeat.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(total_batch_size, 1)
+        response_position_ids = position_ids_repeat[:, -1:] + delta_position_id
+        position_ids_out = torch.cat([position_ids_repeat, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask_repeat.dtype
+        )
+        attention_mask_out = torch.cat((attention_mask_repeat, response_attention_mask), dim=-1)
+
+        batch_tensors = {
+            "prompts": idx_repeat,
+            "responses": response,
+            "input_ids": seq,
+            "attention_mask": attention_mask_out,
+            "position_ids": position_ids_out,
+        }
+        if rollout_log_probs is not None:
+            batch_tensors["rollout_log_probs"] = rollout_log_probs
+
+        batch = TensorDict(batch_tensors, batch_size=total_batch_size)
 
         if self.config.free_cache_engine and self._engine is not None:
             self._engine.flush_cache()
