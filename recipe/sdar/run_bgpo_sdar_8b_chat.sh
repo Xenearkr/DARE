@@ -52,24 +52,29 @@ while [[ $# -gt 0 ]]; do
       engine="$2"
       shift; shift
       ;;
+    --smoke)
+      smoke_test=1
+      shift
+      ;;
     *)
       shift
       ;;
   esac
 done
 
+smoke_test=${smoke_test:-0}
+NUM_GPUS=4
+NUM_CPUS=48
+task=${task:-code}
+algorithm=${algorithm:-bgpo}
+model=${model:-sdar}
+model_path=${model_path:-models/SDAR-8B-Chat}
+engine=${engine:-sglang}
+
 # clean up old ray
 echo "[INFO] Cleaning up old Ray..."
 ray stop --force || true
 rm -rf /tmp/ray || true
-
-# start up ray head
-echo "[INFO] Starting Ray head..."
-ray start --head \
-  --node-ip-address=127.0.0.1 \
-  --port=6379 \
-  --num-gpus=8 \
-  --num-cpus=128
 
 # start up lmdeploy server (only for lmdeploy engine)
 if [ "$engine" = "lmdeploy" ]; then
@@ -103,21 +108,41 @@ if [ "$engine" = "lmdeploy" ]; then
 
     # wait lmdeploy server to be ready
     sleep 5
+    unset CUDA_VISIBLE_DEVICES
+    export CUDA_VISIBLE_DEVICES=1,2,3
+    TRAIN_GPUS=3
 elif [ "$engine" = "sglang" ]; then
     echo "[INFO] Using SGLang engine (embedded in rollout worker, no separate server needed)"
+    export CUDA_VISIBLE_DEVICES=0,1,2,3
+    TRAIN_GPUS=${NUM_GPUS}
+elif [ "$engine" = "hf" ]; then
+    export CUDA_VISIBLE_DEVICES=0,1,2,3
+    TRAIN_GPUS=${NUM_GPUS}
+else
+    echo "[ERROR] Unknown engine: ${engine}"
+    exit 1
 fi
+
+# Must be set before ray start: SGLang memory_saver conflicts with expandable_segments.
+if [ "$engine" = "sglang" ]; then
+    unset PYTORCH_CUDA_ALLOC_CONF
+    export CUDA_HOME="${CONDA_PREFIX:-}"
+    export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+    # fa3/flashinfer cuda-graph capture may fail Triton link in Ray workers; smoke uses torch_native.
+    sglang_attention_backend="${sglang_attention_backend:-fa3}"
+else
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    sglang_attention_backend=flashinfer
+fi
+
+echo "[INFO] Starting Ray head (${TRAIN_GPUS} GPUs, engine=${engine})..."
+ray start --head \
+  --node-ip-address=127.0.0.1 \
+  --port=6379 \
+  --num-gpus=${TRAIN_GPUS} \
+  --num-cpus=${NUM_CPUS}
 
 export HYDRA_FULL_ERROR=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True  # Add memory fragmentation optimization
-
-# Set CUDA_VISIBLE_DEVICES based on engine
-if [ "$engine" = "lmdeploy" ]; then
-    # GPU 0 for lmdeploy, GPUs 1-7 for training
-    export CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7
-elif [ "$engine" = "sglang" ] || [ "$engine" = "hf" ]; then
-    # All GPUs available for training
-    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-fi
 
 export WANDB_PROJECT="DARE"
 export WANDB_API_KEY=
@@ -126,12 +151,6 @@ export WANDB_MODE="offline"
 export HF_HOME=
 export HF_HUB_OFFLINE=1
 export TORCHDYNAMO_DISABLE=1
-
-
-algorithm=${algorithm:-bgpo}
-model=${model:-sdar}
-model_path=${model_path:-models/SDAR-8B-Chat}
-engine=${engine:-lmdeploy}
 
 # validate task
 valid_tasks=("math" "code" "sudoku" "countdown")
@@ -178,11 +197,17 @@ if [ $task == "math" ]; then
     max_response_length=2048
     total_epoch=1
 elif [ $task == "code" ]; then
-    train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
-    val_files="['data/preprocessed/rl/test/mbpp_1.parquet','data/preprocessed/rl/test/humaneval_1.parquet','data/preprocessed/rl/test/humanevalplus_1.parquet']"
-    max_prompt_length=1024
-    max_response_length=2048
-    total_epoch=5
+    if [ "${smoke_test}" -eq 1 ]; then
+        train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet']"
+        val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
+        total_epoch=1
+    else
+        train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
+        val_files="['data/preprocessed/rl/test/mbpp_1.parquet','data/preprocessed/rl/test/humaneval_1.parquet','data/preprocessed/rl/test/humanevalplus_1.parquet']"
+        max_prompt_length=1024
+        max_response_length=1536
+        total_epoch=5
+    fi
 elif [ $task == "countdown" ]; then
     train_files="['data/preprocessed/rl/train/countdown-n20000_1.parquet']"
     val_files="['data/preprocessed/rl/test/countdown_1.parquet']"
@@ -217,18 +242,57 @@ case $model in
         ;;
 esac
 
-# parameters setting
+# parameters setting (4×A6000)
 n_gpus_per_node=$(echo $CUDA_VISIBLE_DEVICES | tr "," "\n" | wc -l)
-if [ "$engine" = "lmdeploy" ]; then
-    batch_size=14  # batch_size must be greater than the number of GPUs used
-elif [ "$engine" = "sglang" ]; then
-    batch_size=16  # Reduced from 16 to prevent OOM with SGLang embedded engine
+sglang_mem_fraction_static=0.45
+sglang_gpu_memory_utilization=0.4
+
+if [ "${smoke_test}" -eq 1 ]; then
+    echo "[INFO] Smoke test mode (minimal seq/batch for SGLang startup)"
+    batch_size=4
+    n_rollout=4
+    mc_num=4
+    n_l=4
+    max_prompt_length=512
+    max_response_length=512
+    ppo_max_token_len_per_gpu=1536
+    max_num_batched_tokens=2048
+    val_batch_size=8
+    total_epoch=1
+    save_freq=1
+    test_freq=1
+    val_before_train=False
+    sglang_mem_fraction_static=0.35
+    sglang_gpu_memory_utilization=0.35
+    sglang_attention_backend=torch_native
+    sglang_disable_cuda_graph=True
+elif [ "$engine" = "lmdeploy" ]; then
+    batch_size=3
+    n_rollout=4
+    mc_num=4
+    n_l=4
+    ppo_max_token_len_per_gpu=3072
+    max_num_batched_tokens=6144
+    val_batch_size=32
+    save_freq=100
+    test_freq=10
+    val_before_train=False
+else
+    batch_size=4
+    n_rollout=4
+    mc_num=4
+    n_l=4
+    ppo_max_token_len_per_gpu=3072
+    max_num_batched_tokens=4096
+    val_batch_size=16
+    save_freq=100
+    test_freq=10
+    val_before_train=False
 fi
-n_rollout=8  # Reduced from 8 to save memory (fewer responses per prompt)
+
 lr=5e-7
-ppo_micro_batch_size_per_gpu=1  # gradient accumulation = batch_size / ppo_micro_batch_size_per_gpu
+ppo_micro_batch_size_per_gpu=1
 train_temperature=1.0
-algorithm="bgpo"
 fsdp_size=-1
 rollout_tensor_parallel_size=1
 
@@ -236,12 +300,24 @@ rollout_tensor_parallel_size=1
 val_num_diffusion_steps=4
 num_diffusion_steps=4
 block_length=4
-mc_num=16  # Reduced from 2 to save memory (fewer MC samples)
-n_l=16  # Reduced from 2 to save memory (fewer loss calculations)
+
+real_train_batch_size=$((batch_size * n_rollout))
+if [ $((real_train_batch_size % n_gpus_per_node)) -ne 0 ]; then
+    echo "[ERROR] batch_size(${batch_size}) * n_rollout(${n_rollout}) = ${real_train_batch_size} must be divisible by n_gpus (${n_gpus_per_node})"
+    exit 1
+fi
+if [ $((mc_num % n_l)) -ne 0 ]; then
+    echo "[ERROR] mc_num(${mc_num}) must be divisible by n_l(${n_l})"
+    exit 1
+fi
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
 project_name=$WANDB_PROJECT
-exp_name="${baseline}-bsz${batch_size}-n${n_rollout}-prompt${max_prompt_length}-response${max_response_length}-step${num_diffusion_steps}-lr${lr}-temp${train_temperature}-n_l${n_l}-mc_num${mc_num}-gpu${n_gpus_per_node}-${timestamp}"
+smoke_tag=""
+if [ "${smoke_test}" -eq 1 ]; then
+    smoke_tag="-smoke"
+fi
+exp_name="${baseline}${smoke_tag}-bsz${batch_size}-n${n_rollout}-prompt${max_prompt_length}-response${max_response_length}-step${num_diffusion_steps}-lr${lr}-temp${train_temperature}-n_l${n_l}-mc_num${mc_num}-gpu${n_gpus_per_node}-${timestamp}"
 ckpt_dir=./ckpts/${project_name}/${exp_name}
 log_dir=./logs/${project_name}/${exp_name}
 mkdir -p ${ckpt_dir}
@@ -257,7 +333,7 @@ python3 -m verl.trainer.dllm_main_ppo \
     data.train_files="$train_files" \
     data.val_files="$val_files" \
     data.train_batch_size=$batch_size \
-    data.val_batch_size=64 \
+    data.val_batch_size=${val_batch_size:-16} \
     data.max_prompt_length=$max_prompt_length \
     data.max_response_length=$max_response_length \
     data.filter_overlong_prompts=True \
@@ -274,7 +350,7 @@ python3 -m verl.trainer.dllm_main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size=$batch_size \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=5120 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu:-3072} \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -303,11 +379,12 @@ python3 -m verl.trainer.dllm_main_ppo \
     +actor_rollout_ref.rollout.max_new_tokens=$max_response_length \
     +actor_rollout_ref.rollout.use_cache=False \
     +actor_rollout_ref.rollout.dual_cache=False \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${sglang_gpu_memory_utilization:-0.4} \
     +actor_rollout_ref.rollout.mask_token_id=$mask_token_id \
     +actor_rollout_ref.rollout.dllm_algorithm=LowConfidence \
-    +actor_rollout_ref.rollout.attention_backend=flashinfer \
-    +actor_rollout_ref.rollout.mem_fraction_static=0.6 \
+    +actor_rollout_ref.rollout.attention_backend=${sglang_attention_backend:-fa3} \
+    +actor_rollout_ref.rollout.disable_cuda_graph=${sglang_disable_cuda_graph:-False} \
+    +actor_rollout_ref.rollout.mem_fraction_static=${sglang_mem_fraction_static:-0.45} \
     +actor_rollout_ref.rollout.max_running_requests=1 \
     actor_rollout_ref.rollout.n=$n_rollout \
     actor_rollout_ref.rollout.temperature=$train_temperature \
@@ -320,7 +397,7 @@ python3 -m verl.trainer.dllm_main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False \
     +actor_rollout_ref.rollout.val_kwargs.num_diffusion_steps=$val_num_diffusion_steps \
-    actor_rollout_ref.rollout.max_num_batched_tokens=11000 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens:-4096} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     +actor_rollout_ref.rollout.num_diffusion_steps=$num_diffusion_steps \
     +actor_rollout_ref.rollout.block_length=$block_length \
@@ -333,13 +410,13 @@ python3 -m verl.trainer.dllm_main_ppo \
     trainer.logger=["console","wandb"] \
     trainer.project_name=$project_name \
     trainer.experiment_name=$exp_name \
-    trainer.val_before_train=False \
+    trainer.val_before_train=${val_before_train:-False} \
     +trainer.val_only=False \
     trainer.n_gpus_per_node=$n_gpus_per_node \
     trainer.nnodes=1 \
     trainer.default_local_dir=$ckpt_dir \
-    trainer.save_freq=100 \
-    trainer.test_freq=10 \
+    trainer.save_freq=${save_freq:-100} \
+    trainer.test_freq=${test_freq:-10} \
     trainer.total_epochs=$total_epoch \
     custom_reward_function.path="verl/utils/reward_score/__init__.py" \
     custom_reward_function.name="dllm_rm" 
@@ -354,9 +431,11 @@ python3 -m verl.trainer.dllm_main_ppo \
 
 
 
-echo "[INFO] Training finished, stopping lmdeploy..."
-kill -9 ${LMDEPLOY_PID}
-pkill -f "ray"
+echo "[INFO] Training finished."
+if [ "${engine}" = "lmdeploy" ] && [ -n "${LMDEPLOY_PID:-}" ]; then
+    kill -9 "${LMDEPLOY_PID}" 2>/dev/null || true
+fi
+pkill -f "ray" || true
 # reward_model.reward_manager=dllm: used to select reward_manager in dllm_reward.load_reward_manager()
 # llada does not support gradient_checkpointing
 # custom_reward_function.name: stored as self.reward_fn, will be called using compute_reward() in ray_trainer

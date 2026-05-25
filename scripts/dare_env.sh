@@ -3,7 +3,8 @@
 
 export DARE_ROOT="/home/u-liujc/Codes/DARE"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# lmdeploy/actor 可用；SGLang rollout 需 enable_memory_saver，与 expandable_segments 冲突，由 run 脚本按 engine 设置
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TORCHDYNAMO_DISABLE=1
 export WANDB_PROJECT="DARE"
 export WANDB_MODE="${WANDB_MODE:-offline}"

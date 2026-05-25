@@ -174,6 +174,9 @@ class SGLangSDARRollout(SGLangRollout):
             # Add SDAR/dLLM specific parameters
             engine_kwargs["dllm_algorithm"] = self._dllm_algorithm
 
+            if self.config.get("disable_cuda_graph") is not None:
+                engine_kwargs["disable_cuda_graph"] = self.config.get("disable_cuda_graph")
+
             # Optionally add attention backend if specified
             if self.config.get("attention_backend"):
                 engine_kwargs["attention_backend"] = self.config.get("attention_backend")
