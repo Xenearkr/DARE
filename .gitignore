@@ -236,3 +236,4 @@ ckpts/
 models/finetune_d3LLM
 converted_models/
 wandb/
+logs/

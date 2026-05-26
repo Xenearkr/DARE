@@ -48,7 +48,13 @@ unset PYTORCH_CUDA_ALLOC_CONF
 python recipe/d3llm/verify_sglang_engine_smoke.py --smoke
 ```
 
-### 说明
+### Phase 3B：HF vs SGLang 并行对齐 verify
+
+```bash
+bash recipe/d3llm/run_verify_sglang_parallel.sh
+# 产物默认在 logs/DARE/verify_3b_<timestamp>/
+```
+
 
 - **阶段 0（离线）**：`recipe/d3llm/d3llm_multiblock.py` 通过 `D3LLM_ROOT` 绑定，不 import verl。
 - **阶段 1（训练）**：`verl/workers/rollout/dream_multiblock.py` + vendored `d3llm_dream_generate_util.py`（源自 d3LLM 官方实现），`model.name=dream`，`rollout.dllm_decode=multiblock`。
