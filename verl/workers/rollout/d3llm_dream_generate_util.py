@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.distributions as dists
+import torch.distributed as dist
 from torch.nn import functional as F
 from transformers import __version__
 from transformers.generation.configuration_utils import (
@@ -35,6 +36,27 @@ from transformers.utils import (
 )
 
 logger = logging.get_logger(__name__)
+
+_FSDP_ROLLOUT_SYNC = False
+
+
+def set_fsdp_rollout_sync(enabled: bool) -> None:
+    global _FSDP_ROLLOUT_SYNC
+    _FSDP_ROLLOUT_SYNC = enabled
+
+
+def _fsdp_any_rank_active(local_active: bool, device: torch.device) -> bool:
+    if not _FSDP_ROLLOUT_SYNC or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return local_active
+    flag = torch.tensor([1 if local_active else 0], device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return flag.item() > 0
+
+
+def _fsdp_dummy_forward(model, device: torch.device):
+    dummy = torch.zeros(1, 1, dtype=torch.long, device=device)
+    return model(dummy, None, None)
+
 
 def create_full_block_attention_mask(prompt_length, max_length, block_size, device=None, dtype=None):
     """
@@ -588,6 +610,7 @@ class DreamGenerationMixin:
         decoded_token_threshold = kwargs.get("decoded_token_threshold", 0.5)
         cache_delay_iter = kwargs.get("cache_delay_iter", 10000)    # how many steps to delay before KV-caching, default to 10000 steps (no KV-cache)
         early_stop = kwargs.get("early_stop", False)
+        max_nfe = kwargs.get("max_nfe", 10000)
         
         if cache_delay_iter >= 10000:  
             # no KV-cache
@@ -600,6 +623,7 @@ class DreamGenerationMixin:
                 block_add_threshold=block_add_threshold,
                 decoded_token_threshold=decoded_token_threshold,
                 early_stop=early_stop,
+                max_nfe=max_nfe,
             )
         else:
             # KV-cache
@@ -614,6 +638,7 @@ class DreamGenerationMixin:
                 cache_delay_iter=cache_delay_iter,
                 refresh_interval=kwargs.get("refresh_interval", 10000),
                 early_stop=early_stop,
+                max_nfe=max_nfe,
             )
         return result, nfe
 
@@ -732,6 +757,7 @@ class DreamGenerationMixin:
         block_add_threshold: float = 0.5,
         decoded_token_threshold: float = 0.5,
         early_stop: bool = False,
+        max_nfe: int = 10000,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         """
         Pipelined parallel decoding without cache.
@@ -980,8 +1006,7 @@ class DreamGenerationMixin:
                         if block_decoded > 0:
                             block_states[bid]["mask_count"] -= block_decoded
             
-            if nfe > 10000:
-                # # print(f"[DEBUG-MB] Breaking: nfe > 10000")
+            if nfe >= max_nfe:
                 break
         
         if return_dict_in_generate:
@@ -1000,6 +1025,7 @@ class DreamGenerationMixin:
         cache_delay_iter: int = 10000,
         refresh_interval: int = 10000,
         early_stop: bool = False,
+        max_nfe: int = 10000,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         """
         Pipelined parallel decoding with Delayed KV-Cache.
@@ -1083,10 +1109,18 @@ class DreamGenerationMixin:
             # print(f"\n[DEBUG-KV] === NFE={nfe} ===")
             # print(f"[DEBUG-KV] total_masks={total_masks}, next_block_id={next_block_id}/{num_blocks+1}")
             
-            if total_masks == 0 and next_block_id > num_blocks:
+            local_active = not (total_masks == 0 and next_block_id > num_blocks)
+            if not _fsdp_any_rank_active(local_active, x.device):
                 break
-            
+
             nfe += 1
+            if _FSDP_ROLLOUT_SYNC and dist.is_initialized() and dist.get_world_size() > 1:
+                dist.barrier()
+
+            if not local_active:
+                if _FSDP_ROLLOUT_SYNC and dist.is_initialized() and dist.get_world_size() > 1:
+                    _fsdp_dummy_forward(self, x.device)
+                continue
             
             # Early stop: handle EOS tokens (check every iteration as EOS position may change)
             if early_stop and eos_token_id is not None:
@@ -1153,7 +1187,7 @@ class DreamGenerationMixin:
                     
                     if total_masks == 0:
                         print(f"[EarlyStop-KV] Exiting at NFE={nfe}, all masks cleared after EOS")
-                        break
+                        continue
             
             # Update block activation states
             update_block_activation_states()
@@ -1191,6 +1225,9 @@ class DreamGenerationMixin:
                     rightmost_active_bid = bid
             
             if rightmost_active_bid == 0:
+                if _FSDP_ROLLOUT_SYNC and dist.is_initialized() and dist.get_world_size() > 1:
+                    _fsdp_dummy_forward(self, x.device)
+                    continue
                 break
             
             active_end = block_states[rightmost_active_bid]["end"]
@@ -1246,6 +1283,9 @@ class DreamGenerationMixin:
             
             # If forward_start_pos >= active_end, no blocks need forwarding
             if forward_start_pos >= active_end:
+                if _FSDP_ROLLOUT_SYNC and dist.is_initialized() and dist.get_world_size() > 1:
+                    _fsdp_dummy_forward(self, x.device)
+                    continue
                 break
             
             # Determine forward strategy
@@ -1406,7 +1446,7 @@ class DreamGenerationMixin:
                             break
             
             # Safety check
-            if nfe > 10000:
+            if nfe >= max_nfe:
                 break
         
         if return_dict_in_generate:

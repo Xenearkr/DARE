@@ -398,10 +398,57 @@ def parallel_init_module_fn(module: torch.nn.Module, shard_states: Dict[str, tor
 def fsdp_version(model):
     if isinstance(model, FSDP):
         return 1
-    elif isinstance(model, FSDPModule):
+    if FSDPModule is not None and (
+        isinstance(model, FSDPModule) or any(isinstance(m, FSDPModule) for m in model.modules())
+    ):
         return 2
-    else:
-        return 0
+    return 0
+
+
+@contextmanager
+def fsdp_rollout_inference_context(model: nn.Module):
+    """Independent per-rank rollout forwards under FSDP/FSDP2.
+
+    Sharded FSDP forwards require every rank to enter each layer's all-gather.
+    Multiblock decode uses variable NFE per rank/sample, so ranks finish at
+    different times and deadlock if they share the training FSDP module directly.
+
+    This context temporarily materializes full local weights (FSDP1:
+    ``summon_full_params``; FSDP2: ``FSDPModule.unshard``).  Inside the
+    context each rank may run forwards independently.  All ranks must leave
+    together: fast ranks block on a barrier until slow ranks finish, then
+    weights are re-sharded.
+
+    This is the same pattern as ``hf_rollout.py`` and does NOT keep a separate
+    permanent dense replica on each GPU.
+    """
+    if FSDPModule is None or not dist.is_initialized() or dist.get_world_size() == 1:
+        yield model
+        return
+
+    ver = fsdp_version(model)
+    if ver == 0:
+        yield model
+        return
+
+    if ver == 1:
+        with FSDP.summon_full_params(model, writeback=False, recurse=False):
+            yield model
+        return
+
+    fsdp_modules = [m for m in model.modules() if isinstance(m, FSDPModule)]
+    rank = dist.get_rank()
+    dist.barrier()
+    try:
+        for module in fsdp_modules:
+            module.unshard()
+        yield model
+    finally:
+        print(f"[RANK{rank}] rollout generation done locally; syncing before FSDP reshard", flush=True)
+        dist.barrier()
+        for module in fsdp_modules:
+            module.reshard()
+        dist.barrier()
 
 
 def get_fsdp_state_ctx(model, state_type, state_cfg, optim_cfg):

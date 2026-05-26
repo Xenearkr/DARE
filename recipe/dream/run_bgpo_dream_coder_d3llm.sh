@@ -81,7 +81,7 @@ num_diffusion_steps=${max_response_length}
 val_num_diffusion_steps=${max_response_length}
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1
-train_temperature=1.0
+train_temperature=0.2
 
 n_gpus_per_node=$(echo "$CUDA_VISIBLE_DEVICES" | tr "," "\n" | wc -l)
 if [ $((batch_size * n_rollout % n_gpus_per_node)) -ne 0 ]; then

@@ -28,6 +28,8 @@ from torch import nn
 import re
 import time
 
+from verl.utils.fsdp_utils import fsdp_rollout_inference_context
+
 from verl import DataProto
 
 from verl.workers.rollout.base import BaseRollout
@@ -134,14 +136,15 @@ class FASTDLLMRollout(BaseRollout):
         MAX_MODEL_LENGTH = self.config.max_num_batched_tokens  # Maximum length of packed sequences
         total_batch_size = batch_size * n_rollout
 
-        responses, full_input_ids, attention_mask, answers = execute_fastdream_generation(
-            idx_repeat=idx_repeat,
-            module=self.module,
-            attention_mask_repeat=attention_mask_repeat,
-            response_length=self.response_length,
-            tokenizer=self.tokenizer,
-            gen_kwargs=gen_kwargs
-        )
+        with fsdp_rollout_inference_context(self.module):
+            responses, full_input_ids, attention_mask, answers = execute_fastdream_generation(
+                idx_repeat=idx_repeat,
+                module=self.module,
+                attention_mask_repeat=attention_mask_repeat,
+                response_length=self.response_length,
+                tokenizer=self.tokenizer,
+                gen_kwargs=gen_kwargs,
+            )
 
         from verl.workers.rollout.dream_rollout_debug import log_rollout_batch
 
