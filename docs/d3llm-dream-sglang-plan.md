@@ -146,7 +146,7 @@ python recipe/d3llm/verify_sglang_engine_smoke.py --smoke
 
 - [x] **3A** Submodule 升级 + `verify_sglang_engine_smoke.py` PASS（2026-05-26，`c795ddb2e`，单卡 64 token ~11.5s，无 mask 残留）
 - [x] **3B** 4 卡并行 HF vs SGLang verify 已跑通（`logs/DARE/verify_3b_20260526_235050/`）；**严格 token 对齐 0/8**（实现路径不同，首 token 常一致后分叉）；无 mask 残留；SGLang 单 task 延迟更低（例 task0: 8.3s vs 20.9s，NFE 69 vs 129）
-- [ ] **3C** `SGLangDreamRollout` + worker 路由
+- [x] **3C** `SGLangDreamRollout` + worker 路由（`sglang_dream_rollout.py`；`dllm_fsdp_workers`：`rollout.name=sglang` + `model.name=dream` + `dllm_decode=multiblock` → `FSDPSGLangSDARShardingManager`）
 - [ ] **3D** 训练脚本 SGLang 模式
 - [ ] **3E** 4 卡 BGPO smoke PASS
 

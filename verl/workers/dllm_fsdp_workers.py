@@ -473,7 +473,42 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
-        elif rollout_name in ["sglang", "sglang_async"] and self.config.model.name != 'sdar':
+        elif rollout_name == "sglang" and self.config.model.name == "dream":
+            dllm_decode = self.config.rollout.get("dllm_decode", "entropy")
+            if dllm_decode != "multiblock":
+                raise NotImplementedError(
+                    "Dream + rollout.name=sglang requires rollout.dllm_decode=multiblock. "
+                    "Use rollout.name=hf for entropy decode."
+                )
+            from verl.workers.rollout.sglang_rollout.sglang_dream_rollout import SGLangDreamRollout
+            from verl.workers.sharding_manager.fsdp_sglang_sdar import FSDPSGLangSDARShardingManager
+
+            log_gpu_memory_usage("Before building sglang rollout for Dream", logger=logger)
+            local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
+            print(f"Initializing SGLang engine for Dream with model_path={local_path}")
+
+            rollout = SGLangDreamRollout(
+                actor_module=local_path,
+                config=self.config.rollout,
+                tokenizer=self.tokenizer,
+                model_hf_config=self.actor_model_config,
+                trust_remote_code=trust_remote_code,
+                device_mesh=rollout_device_mesh,
+            )
+
+            log_gpu_memory_usage("After building sglang rollout for Dream", logger=logger)
+
+            rollout_sharding_manager = FSDPSGLangSDARShardingManager(
+                module=self.actor_module_fsdp,
+                inference_engine=rollout._engine,
+                model_config=self.actor_model_config,
+                full_params="hf" in self.config.rollout.load_format,
+                device_mesh=rollout_device_mesh,
+                offload_param=self._is_offload_param,
+            )
+            log_gpu_memory_usage("After building Dream SGLang sharding manager", logger=logger)
+
+        elif rollout_name in ["sglang", "sglang_async"] and self.config.model.name not in ("sdar", "dream"):
             if rollout_name == "sglang_async":
                 warnings.warn(
                     "'sglang_async' has been deprecated and merged into 'sglang'. "
