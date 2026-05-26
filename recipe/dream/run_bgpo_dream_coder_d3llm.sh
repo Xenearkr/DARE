@@ -1,6 +1,10 @@
 #!/bin/bash
-# BGPO code RL for d3LLM Dream-Coder via Dream HF rollout + multiblock decode.
+# BGPO code RL for d3LLM Dream-Coder (HF or SGLang multiblock rollout).
 # model.name=dream (no d3llm_dream); path points to finetune_d3LLM weights.
+#
+# Usage:
+#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke [--engine hf|sglang]
+#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --engine sglang
 set -euo pipefail
 set -x
 
@@ -12,7 +16,6 @@ cleanup() {
 trap cleanup EXIT INT TERM ERR
 
 export HYDRA_FULL_ERROR=1
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export WANDB_PROJECT="${WANDB_PROJECT:-DARE}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
@@ -23,18 +26,25 @@ export TORCHDYNAMO_DISABLE=1
 
 smoke_test=0
 model_path=""
+engine=hf
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --model_path) model_path="$2"; shift 2 ;;
+    --engine) engine="$2"; shift 2 ;;
     --smoke) smoke_test=1; shift ;;
-    *) shift ;;
+    *) echo "[WARN] Unknown arg: $1"; shift ;;
   esac
 done
 
+valid_engines=(hf sglang)
+if [[ ! " ${valid_engines[*]} " =~ " ${engine} " ]]; then
+  echo "[ERROR] Invalid engine '${engine}'. Supported: ${valid_engines[*]}"
+  exit 1
+fi
+
 model=dream
 algorithm=bgpo
-engine=hf
 model_path=${model_path:-models/finetune_d3LLM}
 task=code
 baseline="${model}-${task}-d3llm-${algorithm}-${engine}"
@@ -42,6 +52,15 @@ baseline="${model}-${task}-d3llm-${algorithm}-${engine}"
 mask_token_id=151666
 pad_token_id=151643
 block_length=32
+
+# SGLang memory_saver conflicts with expandable_segments; set before ray start.
+sglang_mem_fraction_static=0.45
+sglang_gpu_memory_utilization=0.4
+sglang_attention_backend=fa3
+sglang_disable_cuda_graph=False
+actor_param_offload=False
+actor_optimizer_offload=False
+enable_activation_offload=False
 
 if [ "${smoke_test}" -eq 1 ]; then
   train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet']"
@@ -53,12 +72,21 @@ if [ "${smoke_test}" -eq 1 ]; then
   mc_num=4
   n_l=4
   ppo_max_token_len_per_gpu=2048
+  max_num_batched_tokens=4096
   val_batch_size=8
   save_freq=1
   test_freq=1
   val_before_train=False
   total_epoch=1
   trainer_logger='["console"]'
+  if [ "$engine" = "sglang" ]; then
+    sglang_mem_fraction_static=0.35
+    sglang_gpu_memory_utilization=0.35
+    sglang_attention_backend=torch_native
+    sglang_disable_cuda_graph=True
+    actor_param_offload=True
+    enable_activation_offload=True
+  fi
 else
   train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
   val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
@@ -69,12 +97,30 @@ else
   mc_num=16
   n_l=16
   ppo_max_token_len_per_gpu=5120
+  max_num_batched_tokens=11000
   val_batch_size=64
   save_freq=20
   test_freq=20
   val_before_train=False
   total_epoch=5
   trainer_logger='["console","wandb"]'
+  if [ "$engine" = "sglang" ]; then
+    echo "[INFO] SGLang full run: using smoke-style inference mem + activation offload"
+    sglang_mem_fraction_static=0.35
+    sglang_gpu_memory_utilization=0.35
+    sglang_attention_backend=torch_native
+    sglang_disable_cuda_graph=True
+    actor_param_offload=True
+    enable_activation_offload=True
+  fi
+fi
+
+if [ "$engine" = "sglang" ]; then
+  unset PYTORCH_CUDA_ALLOC_CONF
+  export CUDA_HOME="${CONDA_PREFIX:-}"
+  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+else
+  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 fi
 
 num_diffusion_steps=${max_response_length}
@@ -89,6 +135,7 @@ if [ $((batch_size * n_rollout % n_gpus_per_node)) -ne 0 ]; then
   exit 1
 fi
 
+echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node}"
 echo "[INFO] Ensure Dream modeling files exist (once): bash recipe/d3llm/setup_finetune_d3llm_model_code.sh"
 
 ray stop --force || true
@@ -107,6 +154,18 @@ export DREAM_ROLLOUT_VERBOSE="${DREAM_ROLLOUT_VERBOSE:-1}"
 export DREAM_ROLLOUT_LOG_DIR="${DREAM_ROLLOUT_LOG_DIR:-${log_dir}/rollout_debug}"
 mkdir -p "${DREAM_ROLLOUT_LOG_DIR}"
 echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR}"
+
+sglang_extra_args=()
+if [ "$engine" = "sglang" ]; then
+  sglang_extra_args+=(
+    "+actor_rollout_ref.rollout.dllm_algorithm=FullAttnMultiBlock"
+    "+actor_rollout_ref.rollout.attention_backend=${sglang_attention_backend}"
+    "+actor_rollout_ref.rollout.disable_cuda_graph=${sglang_disable_cuda_graph}"
+    "+actor_rollout_ref.rollout.mem_fraction_static=${sglang_mem_fraction_static}"
+    "+actor_rollout_ref.rollout.max_running_requests=1"
+    "actor_rollout_ref.rollout.gpu_memory_utilization=${sglang_gpu_memory_utilization}"
+  )
+fi
 
 python3 -m verl.trainer.dllm_main_ppo \
   algorithm.adv_estimator=grpo \
@@ -141,11 +200,12 @@ python3 -m verl.trainer.dllm_main_ppo \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
   actor_rollout_ref.actor.loss_agg_mode=token-mean \
   actor_rollout_ref.model.enable_gradient_checkpointing=False \
+  ++actor_rollout_ref.model.enable_activation_offload=${enable_activation_offload} \
   actor_rollout_ref.model.trust_remote_code=True \
   +actor_rollout_ref.model.attn_implementation="flash_attention_2" \
   +actor_rollout_ref.model.baseline=${baseline} \
-  actor_rollout_ref.actor.fsdp_config.param_offload=False \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+  actor_rollout_ref.actor.fsdp_config.param_offload=${actor_param_offload} \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_optimizer_offload} \
   +actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=[DreamDecoderLayer] \
   +actor_rollout_ref.actor.mc_num=${mc_num} \
   +actor_rollout_ref.actor.n_l=${n_l} \
@@ -173,7 +233,7 @@ python3 -m verl.trainer.dllm_main_ppo \
   actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
   actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
   +actor_rollout_ref.rollout.val_kwargs.num_diffusion_steps=${val_num_diffusion_steps} \
-  actor_rollout_ref.rollout.max_num_batched_tokens=11000 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
   actor_rollout_ref.rollout.enable_chunked_prefill=True \
   +actor_rollout_ref.rollout.num_diffusion_steps=${num_diffusion_steps} \
   +actor_rollout_ref.rollout.block_length=${block_length} \
@@ -195,4 +255,5 @@ python3 -m verl.trainer.dllm_main_ppo \
   trainer.total_epochs=${total_epoch} \
   custom_reward_function.path="verl/utils/reward_score/__init__.py" \
   custom_reward_function.name="dllm_rm" \
+  "${sglang_extra_args[@]}" \
   2>&1 | tee "${log_dir}/${exp_name}.log"

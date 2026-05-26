@@ -58,11 +58,17 @@ bash recipe/d3llm/run_verify_sglang_parallel.sh
 
 - **阶段 0（离线）**：`recipe/d3llm/d3llm_multiblock.py` 通过 `D3LLM_ROOT` 绑定，不 import verl。
 - **阶段 1（训练）**：`verl/workers/rollout/dream_multiblock.py` + vendored `d3llm_dream_generate_util.py`（源自 d3LLM 官方实现），`model.name=dream`，`rollout.dllm_decode=multiblock`。
-- 训练脚本：`bash recipe/dream/run_bgpo_dream_coder_d3llm.sh`（可加 `--smoke`）。
+- 训练脚本：`bash recipe/dream/run_bgpo_dream_coder_d3llm.sh`（`--smoke`，`--engine hf|sglang`）。
 
-### 阶段 1 训练
+### 阶段 1 训练（HF）
 
 ```bash
 bash recipe/d3llm/setup_finetune_d3llm_model_code.sh   # 若尚未执行
-bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke
+bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke --engine hf
+```
+
+### 阶段 3D/3E 训练（SGLang，推荐）
+
+```bash
+bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke --engine sglang
 ```
