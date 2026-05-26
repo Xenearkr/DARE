@@ -6,6 +6,8 @@
 
 后续 BGPO 训练计划见 [`docs/d3llm-dream-clean-plan.md`](../../docs/d3llm-dream-clean-plan.md)（阶段 1 起在 Dream HF rollout 上扩展 multiblock，不新增 `d3llm_dream` model name）。
 
+SGLang 独立推理规划见 [`docs/d3llm-dream-sglang-plan.md`](../../docs/d3llm-dream-sglang-plan.md)（阶段 3）。
+
 ### 一次性准备
 
 ```bash
@@ -35,6 +37,15 @@ python recipe/d3llm/verify_finetune_d3llm.py --mode all --max-new-tokens 128
 
 # LoRA 适配器冒烟（可选）
 python recipe/d3llm/verify_finetune_d3llm.py --mode multiblock --lora-path /path/to/adapter
+```
+
+### Phase 3A：SGLang Engine 离线 smoke
+
+需先将 `third_party/sglang` 切到 PR #20615 分支（见 `docs/d3llm-dream-sglang-plan.md` §9）。
+
+```bash
+unset PYTORCH_CUDA_ALLOC_CONF
+python recipe/d3llm/verify_sglang_engine_smoke.py --smoke
 ```
 
 ### 说明
