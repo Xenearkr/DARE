@@ -166,9 +166,20 @@ python -m verl.trainer.dllm_main_ppo \
 - [x] `verify_finetune_d3llm.py --mode vanilla` 通过
 - [x] `verify_finetune_d3llm.py --mode multiblock` 通过（NFE=21 @ max_new_tokens=64）
 
-### 阶段 1 成功标准
+### 阶段 1 完成状态（2026-05-26）
 
-- [ ] `verify_finetune_d3llm.py --mode multiblock` 通过（训练集成后复验）
+- [x] `verl/workers/rollout/d3llm_dream_generate_util.py`（vendored 自 d3LLM 官方）
+- [x] `verl/workers/rollout/dream_multiblock.py`（bind + rollout 执行）
+- [x] `rollout_utils.execute_fastdream_generation` 增加 `dllm_decode=multiblock` 分支
+- [x] `fast_dream_rollout.py` 读取 d3llm 超参 + `per_sample_seed`
+- [x] `verl/models/transformers/dream.py` DreamSdpaAttention guard
+- [x] `recipe/dream/run_bgpo_dream_coder_d3llm.sh`（HF smoke/full）
+- [x] verl multiblock 路径单卡验证通过
+
+### 阶段 1 成功标准（训练闭环）
+
+- [ ] BGPO smoke：`bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke` 跑通 1 epoch
+- [ ] 组内 reward 标准差 > 0（`n_rollout>=2`, `temperature>0`）
 - [ ] 同一 prompt：`entropy` vs `multiblock` 输出不同且 multiblock 更短 NFE
 - [ ] BGPO smoke：`n_rollout=4` 时组内 reward 标准差 > 0
 - [ ] 1 个 epoch smoke 无 Ray hang；`Training Progress` 持续推进

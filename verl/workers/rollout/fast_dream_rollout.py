@@ -64,6 +64,15 @@ class FASTDLLMRollout(BaseRollout):
         self.do_sample = config["do_sample"]  # Whether to sample during training
         self.val_kwargs = config["val_kwargs"]  # Validation generation parameters
 
+        # d3LLM multi-block decode (entropy_threshold); default entropy = vanilla Dream
+        self.dllm_decode = config.get("dllm_decode", "entropy")
+        self.d3llm_threshold = config.get("d3llm_threshold", 0.5)
+        self.d3llm_block_add_threshold = config.get("d3llm_block_add_threshold", 0.1)
+        self.d3llm_decoded_token_threshold = config.get("d3llm_decoded_token_threshold", 0.95)
+        self.d3llm_cache_delay_iter = config.get("d3llm_cache_delay_iter", 32)
+        self.d3llm_early_stop = config.get("d3llm_early_stop", True)
+        self.per_sample_seed = config.get("per_sample_seed", True)
+
     # from .auto_line_tracker import auto_track_lines
     # @auto_track_lines(interval=10.0)
     @torch.no_grad()
@@ -91,17 +100,28 @@ class FASTDLLMRollout(BaseRollout):
         
         # Select generation parameters based on mode
         n_rollout = 1 if is_validate else self.n_rollout  # In validation stage, the input has been repeated val_kwargs.n times in ray_trainer._validate
+        temperature = self.val_kwargs.get("temperature", self.temperature) if is_validate else self.temperature
+        do_sample = self.val_kwargs.get("do_sample", self.do_sample) if is_validate else self.do_sample
         gen_kwargs = {
             "steps": self.val_kwargs["num_diffusion_steps"] if is_validate else self.num_diffusion_steps,
             "gen_length": self.response_length,
             "block_length": self.block_length,
-            "temperature": self.val_kwargs.get("temperature", self.temperature) if is_validate else self.temperature,
+            "temperature": temperature,
             "cfg_scale": self.cfg_scale,
             "dual_cache": self.dual_cache,
             "remasking": "low_confidence",
             "mask_id": self.MASK_TOKEN_ID,
+            "pad_token_id": self.PAD_TOKEN_ID,
             "mode": "train" if not is_validate else "eval",
-            "do_sample": self.val_kwargs.get("do_sample", self.do_sample) if is_validate else self.do_sample,
+            "do_sample": do_sample,
+            "dllm_decode": self.dllm_decode,
+            "threshold": self.d3llm_threshold,
+            "block_add_threshold": self.d3llm_block_add_threshold,
+            "decoded_token_threshold": self.d3llm_decoded_token_threshold,
+            "cache_delay_iter": self.d3llm_cache_delay_iter,
+            "early_stop": self.d3llm_early_stop,
+            "per_sample_seed": self.per_sample_seed and not is_validate,
+            "base_seed": 42,
         }
         print(f"gen_kwargs: {gen_kwargs}")
 

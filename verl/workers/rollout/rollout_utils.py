@@ -775,6 +775,20 @@ def execute_fastdream_generation(
         batch_attention_masks: Batch attention masks (batch, seq_len)
         batch_answers: Batch answer lists
     """
+    dllm_decode = gen_kwargs.get("dllm_decode", "entropy")
+    if dllm_decode == "multiblock":
+        from .dream_multiblock import execute_dream_multiblock_generation
+
+        return execute_dream_multiblock_generation(
+            module=module,
+            gen_kwargs=gen_kwargs,
+            idx_repeat=idx_repeat,
+            attention_mask_repeat=attention_mask_repeat,
+            response_length=response_length,
+            tokenizer=tokenizer,
+            process_outputs_fn=process_fastdream_generation_outputs,
+        )
+
     import types
     from .generation_utils_block import DreamGenerationMixin
     module.diffusion_generate = types.MethodType(DreamGenerationMixin.diffusion_generate, module)

@@ -74,6 +74,9 @@ def apply_dream_ulysses_patch(model):
     so that all original behavior (output_attentions fallback, dual_cache, etc.) is retained.
     """
     module = sys.modules[model.__module__]
+    if not hasattr(module, "DreamFlashAttention"):
+        # e.g. d3LLM / Dream-Coder checkpoints ship DreamSdpaAttention only
+        return
     _original_forward = module.DreamFlashAttention.forward
 
     from flash_attn import flash_attn_varlen_func

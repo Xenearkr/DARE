@@ -39,5 +39,13 @@ python recipe/d3llm/verify_finetune_d3llm.py --mode multiblock --lora-path /path
 
 ### 说明
 
-- `recipe/d3llm/d3llm_multiblock.py`：离线 multiblock 绑定，**不修改 verl 训练代码**；阶段 1 会将同等逻辑 vendored 到 `verl/workers/rollout/dream_multiblock.py`。
-- multiblock 依赖 d3LLM 仓库中的 `d3llm.d3llm_DREAM.d3llm_dream_generate_util`（通过 `D3LLM_ROOT` 或 `--d3llm-root` 注入 `PYTHONPATH`）。
+- **阶段 0（离线）**：`recipe/d3llm/d3llm_multiblock.py` 通过 `D3LLM_ROOT` 绑定，不 import verl。
+- **阶段 1（训练）**：`verl/workers/rollout/dream_multiblock.py` + vendored `d3llm_dream_generate_util.py`（源自 d3LLM 官方实现），`model.name=dream`，`rollout.dllm_decode=multiblock`。
+- 训练脚本：`bash recipe/dream/run_bgpo_dream_coder_d3llm.sh`（可加 `--smoke`）。
+
+### 阶段 1 训练
+
+```bash
+bash recipe/d3llm/setup_finetune_d3llm_model_code.sh   # 若尚未执行
+bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke
+```
