@@ -234,3 +234,5 @@ __pycache__/
 outputs/
 ckpts/
 models/finetune_d3LLM
+converted_models/
+wandb/

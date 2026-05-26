@@ -286,7 +286,7 @@ else
     max_num_batched_tokens=6144
     val_batch_size=32
     enable_activation_offload=True
-    save_freq=10
+    save_freq=20
     test_freq=20
     val_before_train=True
     if [ "$engine" = "sglang" ]; then
