@@ -43,6 +43,10 @@ def run_ppo(config) -> None:
                 "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
             }
         }
+        for key in ("DREAM_ROLLOUT_VERBOSE", "DREAM_ROLLOUT_LOG_DIR", "D3LLM_ROLLOUT_VERBOSE", "D3LLM_ROLLOUT_LOG_DIR"):
+            val = os.environ.get(key, "")
+            if val:
+                runtime_env["env_vars"][key] = val
 
         # Detect if we're in a multi-node cluster environment
         # Check for Ray cluster address from environment or use auto-detection

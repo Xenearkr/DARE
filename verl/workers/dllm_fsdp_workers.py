@@ -399,6 +399,14 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                     rollout_config["model_name"] = self.config.model.name
                     rollout = DTreeRPORollout(module=self.actor_module_fsdp, config=rollout_config, tokenizer=self.tokenizer)
                     rollout_sharding_manager = BaseShardingManager()
+                elif not use_cache and self.config.rollout.get("dllm_decode", "entropy") == "multiblock":
+                    from verl.workers.rollout.fast_dream_rollout import FASTDLLMRollout
+                    from verl.workers.sharding_manager.base import BaseShardingManager
+
+                    rollout = FASTDLLMRollout(
+                        module=self.actor_module_fsdp, config=self.config.rollout, tokenizer=self.tokenizer
+                    )
+                    rollout_sharding_manager = BaseShardingManager()
                 elif not use_cache:
                     if self.config.algorithm.name == "cj-grpo":
                         from verl.workers.rollout.cj_dream_rollout import DLLMRollout

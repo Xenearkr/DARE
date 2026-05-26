@@ -4,6 +4,13 @@
 set -euo pipefail
 set -x
 
+cleanup() {
+    ray stop --force || true
+    pkill -u "$(whoami)" -f "dllm_main_ppo" 2>/dev/null || true
+    rm -rf /tmp/ray 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM ERR
+
 export HYDRA_FULL_ERROR=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
@@ -42,7 +49,7 @@ if [ "${smoke_test}" -eq 1 ]; then
   max_prompt_length=512
   max_response_length=256
   batch_size=4
-  n_rollout=2
+  n_rollout=4
   mc_num=4
   n_l=4
   ppo_max_token_len_per_gpu=2048
@@ -96,6 +103,10 @@ exp_name="${baseline}${smoke_tag}-bsz${batch_size}-n${n_rollout}-prompt${max_pro
 ckpt_dir=./ckpts/${WANDB_PROJECT}/${exp_name}
 log_dir=./logs/${WANDB_PROJECT}/${exp_name}
 mkdir -p "${ckpt_dir}" "${log_dir}"
+export DREAM_ROLLOUT_VERBOSE="${DREAM_ROLLOUT_VERBOSE:-1}"
+export DREAM_ROLLOUT_LOG_DIR="${DREAM_ROLLOUT_LOG_DIR:-${log_dir}/rollout_debug}"
+mkdir -p "${DREAM_ROLLOUT_LOG_DIR}"
+echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR}"
 
 python3 -m verl.trainer.dllm_main_ppo \
   algorithm.adv_estimator=grpo \
@@ -142,7 +153,7 @@ python3 -m verl.trainer.dllm_main_ppo \
   +actor_rollout_ref.actor.baseline=${baseline} \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.name=${engine} \
-  +actor_rollout_ref.rollout.use_cache=False \
+  +actor_rollout_ref.rollout.use_cache=True \
   +actor_rollout_ref.rollout.dual_cache=False \
   +actor_rollout_ref.rollout.dllm_decode=multiblock \
   +actor_rollout_ref.rollout.d3llm_threshold=0.5 \
@@ -152,6 +163,7 @@ python3 -m verl.trainer.dllm_main_ppo \
   +actor_rollout_ref.rollout.d3llm_early_stop=True \
   +actor_rollout_ref.rollout.mask_token_id=${mask_token_id} \
   +actor_rollout_ref.rollout.per_sample_seed=True \
+  +actor_rollout_ref.rollout.rollout_verbose=True \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
   actor_rollout_ref.rollout.n=${n_rollout} \
   actor_rollout_ref.rollout.temperature=${train_temperature} \

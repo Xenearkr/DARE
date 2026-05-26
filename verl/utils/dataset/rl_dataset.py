@@ -129,7 +129,15 @@ class RLHFDataset(Dataset):
         dataframes = []
         for parquet_file in self.data_files:
             # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            try:
+                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            except ValueError as e:
+                # Stale HF datasets cache may reference deprecated feature type "List" (use pandas fallback).
+                if "Feature type 'List' not found" not in str(e):
+                    raise
+                import pandas as pd
+
+                dataframe = datasets.Dataset.from_pandas(pd.read_parquet(parquet_file))
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 

@@ -183,6 +183,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                 )
                
                 gen_batch.non_tensor_batch["reward_model"] = batch.non_tensor_batch["reward_model"].copy()
+                gen_batch.meta_info["global_step"] = self.global_steps
 
                 is_last_step = self.global_steps >= self.total_training_steps
 

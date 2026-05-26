@@ -122,6 +122,9 @@ class FASTDLLMRollout(BaseRollout):
             "early_stop": self.d3llm_early_stop,
             "per_sample_seed": self.per_sample_seed and not is_validate,
             "base_seed": 42,
+            "n_rollout": n_rollout,
+            "rollout_verbose": self.config.get("rollout_verbose", False),
+            "global_step": prompts.meta_info.get("global_step", "?"),
         }
         print(f"gen_kwargs: {gen_kwargs}")
 
@@ -138,6 +141,18 @@ class FASTDLLMRollout(BaseRollout):
             response_length=self.response_length,
             tokenizer=self.tokenizer,
             gen_kwargs=gen_kwargs
+        )
+
+        from verl.workers.rollout.dream_rollout_debug import log_rollout_batch
+
+        log_rollout_batch(
+            prompts=prompts,
+            responses=responses,
+            idx_repeat=idx_repeat,
+            gen_kwargs=gen_kwargs,
+            tokenizer=self.tokenizer,
+            elapsed_s=time.time() - start_time,
+            is_validate=is_validate,
         )
     
         if not is_validate:
