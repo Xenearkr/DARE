@@ -172,6 +172,7 @@ def run_train_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
 
 
 def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
+    """Mirrors SGLangDreamRollout val: per-sample async_generate + val_kwargs (temp=0)."""
     from verl.workers.rollout.sglang_rollout.sglang_dream_rollout import (
         _dream_stop_token_ids,
         _finalize_dream_response_tensor,
@@ -179,13 +180,13 @@ def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
     from verl.workers.rollout.sglang_rollout.sglang_rollout import _post_process_outputs
 
     loop = asyncio.get_event_loop()
-    # Mirrors SGLangRollout._batch_level_generate_sequences when is_validate=True
     stop_ids = _dream_stop_token_ids(tokenizer, PAD_TOKEN_ID, PAD_TOKEN_ID, MASK_TOKEN_ID)
     val_kwargs = {
-        "top_p": 0.95,
-        "temperature": 0.0,
         "n": 1,
+        "top_p": 1.0,
+        "temperature": 0.0,
         "max_new_tokens": args.max_new_tokens,
+        "sampling_seed": args.train_seed,
         "stop_token_ids": sorted(stop_ids),
     }
     out = loop.run_until_complete(
@@ -198,16 +199,14 @@ def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
         )
     )
     if isinstance(out, list):
-        out_list = out
-    else:
-        out_list = [out]
-    resp, _ = _post_process_outputs(tokenizer, out_list)
-    raw_ids = resp[0].tolist()
-    meta = out_list[0].get("meta_info", {}) if isinstance(out_list[0], dict) else {}
+        out = out[0]
+    raw_resp, _ = _post_process_outputs(tokenizer, [out])
+    raw_ids = raw_resp[0].tolist()
+    meta = out.get("meta_info", {}) if isinstance(out, dict) else {}
     fr = meta.get("finish_reason")
     opening = tokenizer.encode("To solve this problem", add_special_tokens=False)
     finalized, _ = _finalize_dream_response_tensor(
-        resp,
+        raw_resp,
         None,
         stop_ids,
         PAD_TOKEN_ID,
@@ -217,7 +216,7 @@ def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
     )
     finalized_ids = finalized[0].tolist()
     return {
-        "path": "val_batch",
+        "path": "val_per_sample",
         "sampling": val_kwargs,
         "nfe": meta.get("nfe"),
         "finish_reason": fr,

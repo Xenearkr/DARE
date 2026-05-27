@@ -67,6 +67,7 @@ class WorkerArgs:
     train_seed: int
     shard_path: str
     hf_shard_path: str = ""
+    only_sglang_val: bool = False
 
 
 def build_training_aligned_engine(model_path: Path, max_new_tokens: int, threshold: float, mem_fraction: float):
@@ -81,8 +82,8 @@ def build_training_aligned_engine(model_path: Path, max_new_tokens: int, thresho
         "block_add_threshold": 0.1,
         "decoded_token_threshold": 0.95,
         "block_size": 32,
-        "temperature": 0.2,
-        "top_p": 0.95,
+        "temperature": 0.0,
+        "top_p": 1.0,
         "cache_delay_iter": 32,
         "refresh_interval": 10000,
         "early_stop": True,
@@ -96,6 +97,7 @@ def build_training_aligned_engine(model_path: Path, max_new_tokens: int, thresho
         trust_remote_code=True,
         tp_size=1,
         mem_fraction_static=mem_fraction,
+        enable_memory_saver=True,
         disable_cuda_graph=True,
         attention_backend="torch_native",
         max_running_requests=1,
@@ -257,9 +259,12 @@ def sglang_gpu_worker(wa: WorkerArgs) -> None:
 
     from transformers import AutoTokenizer
 
-    with open(wa.hf_shard_path, encoding="utf-8") as f:
-        rows_out: list[dict[str, Any]] = json.load(f)
+    shard_dir = Path(wa.hf_shard_path).parent
+    rows_out: list[dict[str, Any]] = []
+    for p in sorted(shard_dir.glob("rank*_hf.json")):
+        rows_out.extend(json.loads(p.read_text(encoding="utf-8")))
     by_row = {e["row"]: e for e in rows_out}
+    rows_out = [by_row[row] for row in wa.row_indices]
 
     model_path = Path(wa.model_path)
     parquet = Path(wa.parquet)
@@ -277,8 +282,11 @@ def sglang_gpu_worker(wa: WorkerArgs) -> None:
             gt = df.iloc[row]["reward_model"]["ground_truth"]
             prompt_ids, _ = load_prompt_ids(tokenizer, parquet, row, wa.max_prompt_length)
             val_r = run_val_path(engine, tokenizer, prompt_ids, bench_args)
-            train_r = run_train_path(engine, tokenizer, prompt_ids, bench_args)
-            for path_name, run_r in (("sglang_val", val_r), ("sglang_train", train_r)):
+            paths_to_run = [("sglang_val", val_r)]
+            if not wa.only_sglang_val:
+                train_r = run_train_path(engine, tokenizer, prompt_ids, bench_args)
+                paths_to_run.append(("sglang_train", train_r))
+            for path_name, run_r in paths_to_run:
                 text = run_r["finalized_text"]
                 entry[path_name] = {
                     "text": text,
@@ -288,6 +296,8 @@ def sglang_gpu_worker(wa: WorkerArgs) -> None:
                     "text_eq_raw": text == run_r["raw_text"],
                     **score_humaneval(gt, text),
                 }
+            if wa.only_sglang_val:
+                entry.pop("sglang_train", None)
             if (i + 1) % 5 == 0 or i + 1 == len(wa.row_indices):
                 n_pass = sum(1 for e in rows_out if e.get("sglang_val", {}).get("pass"))
                 print(
@@ -309,8 +319,25 @@ def sglang_gpu_worker(wa: WorkerArgs) -> None:
     print(f"[gpu{wa.gpu_rank}] merged shard {wa.shard_path}", flush=True)
 
 
-def run_phase(worker_fn, worker_args: list[WorkerArgs], phase_name: str) -> None:
-    print(f"\n=== Phase: {phase_name} ({len(worker_args)} workers) ===", flush=True)
+def run_phase_inprocess(worker_fn, worker_args: list[WorkerArgs], phase_name: str) -> None:
+    """Run workers in the parent process (no mp.spawn); one GPU job at a time."""
+    print(f"\n=== Phase: {phase_name} (in-process, {len(worker_args)} jobs) ===", flush=True)
+    for wa in worker_args:
+        worker_fn(wa)
+
+
+def run_phase(worker_fn, worker_args: list[WorkerArgs], phase_name: str, serial: bool = False) -> None:
+    print(f"\n=== Phase: {phase_name} ({len(worker_args)} workers, serial={serial}) ===", flush=True)
+    if serial:
+        for wa in worker_args:
+            ctx = mp.get_context("spawn")
+            p = ctx.Process(target=worker_fn, args=(wa,))
+            p.start()
+            p.join()
+            if p.exitcode != 0:
+                raise SystemExit(f"{phase_name} worker failed with exit code {p.exitcode}")
+            time.sleep(1)
+        return
     ctx = mp.get_context("spawn")
     procs = [ctx.Process(target=worker_fn, args=(wa,)) for wa in worker_args]
     for p in procs:
@@ -399,11 +426,32 @@ def parse_args():
     p.add_argument(
         "--mem-fraction-static",
         type=float,
-        default=0.32,
-        help="Match smoke training; single SGLang Engine per GPU",
+        default=0.55,
+        help="SGLang-only benchmark: ~0.55 on empty GPU; training smoke uses 0.32 beside FSDP",
     )
     p.add_argument("--train-seed", type=int, default=42)
     p.add_argument("--output-json", type=Path, default=DEFAULT_OUT)
+    p.add_argument(
+        "--only-sglang-val",
+        action="store_true",
+        help="Re-run aligned sglang_val only; requires existing rank*_hf.json shards",
+    )
+    p.add_argument(
+        "--serial-sglang",
+        action="store_true",
+        help="Start one SGLang worker at a time (avoids parallel Engine OOM)",
+    )
+    p.add_argument(
+        "--hf-shards-dir",
+        type=Path,
+        default=None,
+        help="Directory with rank*_hf.json when using --only-sglang-val",
+    )
+    p.add_argument(
+        "--inprocess",
+        action="store_true",
+        help="Run SGLang workers in parent process (no mp.spawn)",
+    )
     return p.parse_args()
 
 
@@ -416,7 +464,7 @@ def main():
     if ngpus < 1:
         raise RuntimeError("No CUDA devices visible")
 
-    shards_dir = args.output_json.parent / f"{args.output_json.stem}_shards"
+    shards_dir = args.hf_shards_dir or (args.output_json.parent / f"{args.output_json.stem}_shards")
     shards_dir.mkdir(parents=True, exist_ok=True)
 
     buckets: list[list[int]] = [[] for _ in range(ngpus)]
@@ -441,19 +489,35 @@ def main():
             threshold=args.threshold,
             mem_fraction_static=args.mem_fraction_static,
             train_seed=args.train_seed,
+            only_sglang_val=args.only_sglang_val,
         )
-        hf_workers.append(WorkerArgs(**base, shard_path=hf_shard))
-        sgl_workers.append(WorkerArgs(**base, shard_path=final_shard, hf_shard_path=hf_shard))
+        if not args.only_sglang_val:
+            hf_workers.append(WorkerArgs(**base, shard_path=hf_shard))
+        elif not Path(hf_shard).is_file():
+            raise FileNotFoundError(f"--only-sglang-val needs {hf_shard}")
+        sgl_workers.append(
+            WorkerArgs(**base, shard_path=final_shard, hf_shard_path=hf_shard)
+        )
 
     print(
-        f"HumanEval benchmark (2-phase, OOM-safe): rows={len(all_rows)} ngpus={ngpus} "
-        f"mem_fraction={args.mem_fraction_static}",
+        f"HumanEval benchmark: rows={len(all_rows)} ngpus={ngpus} "
+        f"mem_fraction={args.mem_fraction_static} only_sglang_val={args.only_sglang_val}",
         flush=True,
     )
     t0 = time.time()
 
-    run_phase(hf_gpu_worker, hf_workers, "HF multiblock")
-    run_phase(sglang_gpu_worker, sgl_workers, "SGLang train/val")
+    if not args.only_sglang_val:
+        run_phase(hf_gpu_worker, hf_workers, "HF multiblock")
+    sgl_phase = "SGLang val (per-sample)" if args.only_sglang_val else "SGLang train/val"
+    if args.inprocess:
+        run_phase_inprocess(sglang_gpu_worker, sgl_workers, sgl_phase)
+    else:
+        run_phase(
+            sglang_gpu_worker,
+            sgl_workers,
+            sgl_phase,
+            serial=args.serial_sglang or args.only_sglang_val,
+        )
 
     merged: list[dict[str, Any]] = []
     for wa in sgl_workers:
@@ -465,7 +529,7 @@ def main():
     report = {
         "config": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "paths": PATHS,
-        "oom_safe_two_phase": True,
+        "sglang_val_per_sample_aligned": True,
         "elapsed_s": round(time.time() - t0, 2),
         "analysis": analysis,
         "details": merged,

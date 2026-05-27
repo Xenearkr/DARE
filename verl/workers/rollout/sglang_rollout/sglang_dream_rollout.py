@@ -354,11 +354,12 @@ class SGLangDreamRollout(SGLangRollout):
         if eos_token_id is None:
             eos_token_id = self.pad_token_id
 
-        if not do_sample or is_validate:
-            out = super()._batch_level_generate_sequences(prompts, **kwargs)
-            return self._apply_dream_response_finalize(out, eos_token_id)
+        # Val uses the same per-sample async_generate path as train rollout (not parent batch).
+        if is_validate or do_sample:
+            return self._per_sample_generate_sequences(prompts, **kwargs)
 
-        return self._per_sample_generate_sequences(prompts, **kwargs)
+        out = super()._batch_level_generate_sequences(prompts, **kwargs)
+        return self._apply_dream_response_finalize(out, eos_token_id)
 
     @torch.no_grad()
     def _per_sample_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
@@ -373,7 +374,9 @@ class SGLangDreamRollout(SGLangRollout):
             eos_token_id = self.pad_token_id
 
         batch_size = idx.size(0)
-        n_rollout = self.config.n
+        is_validate = prompts.meta_info.get("validate", False)
+        # Val dataloader already repeats by val_kwargs.n; do not multiply by train n_rollout.
+        n_rollout = 1 if is_validate else self.config.n
         verbose = rollout_verbose_enabled() or bool(self.config.get("rollout_verbose", False))
 
         non_tensor_batch = prompts.non_tensor_batch
@@ -414,19 +417,30 @@ class SGLangDreamRollout(SGLangRollout):
         stop_ids = _dream_stop_token_ids(
             self.tokenizer, eos_token_id, self.pad_token_id, self._mask_token_id
         )
-        gen_kwargs = dict(
-            n=1,
-            top_p=self.config.top_p,
-            temperature=self.config.temperature,
-            max_new_tokens=self.config.response_length,
-        )
+        if is_validate:
+            val_temp = float(self.config.val_kwargs.temperature)
+            gen_kwargs = dict(
+                n=1,
+                # HF multiblock uses top_p=1 when temperature=0 (greedy).
+                top_p=1.0 if val_temp <= 0 else self.config.val_kwargs.top_p,
+                temperature=val_temp,
+                max_new_tokens=self.config.response_length,
+            )
+        else:
+            gen_kwargs = dict(
+                n=1,
+                top_p=self.config.top_p,
+                temperature=self.config.temperature,
+                max_new_tokens=self.config.response_length,
+            )
 
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
             merged_output = []
             for j, (input_ids, image) in enumerate(zip(idx_list, image_list)):
                 t0 = time.time()
-                if self._per_sample_seed and self.config.temperature > 0:
+                # Val (temp=0): fixed seed per sample; train: seed when temp>0 else random.
+                if is_validate or (self._per_sample_seed and gen_kwargs["temperature"] > 0):
                     seed = self._base_seed + j
                 else:
                     seed = random.randint(0, 2**31 - 1)
