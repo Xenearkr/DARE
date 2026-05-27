@@ -18,7 +18,7 @@ import logging
 import os
 import random
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -48,17 +48,109 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _strip_mask_pad_tokens(response: torch.Tensor, mask_id: int, pad_id: int) -> torch.Tensor:
+def _find_subseq_positions(haystack: Sequence[int], needle: Sequence[int]) -> List[int]:
+    if not needle or len(haystack) < len(needle):
+        return []
+    hits: List[int] = []
+    n = len(needle)
+    for i in range(len(haystack) - n + 1):
+        if list(haystack[i : i + n]) == list(needle):
+            hits.append(i)
+    return hits
+
+
+def _dream_stop_token_ids(
+    tokenizer: "PreTrainedTokenizer",
+    eos_token_id: Union[int, List[int], None],
+    pad_token_id: int,
+    mask_token_id: int,
+) -> Set[int]:
+    """Match SGLang stop handling used on the val path (pad/eos/im_end/mask)."""
+    stops = {int(pad_token_id), int(mask_token_id)}
+    if eos_token_id is not None:
+        if isinstance(eos_token_id, (list, tuple)):
+            stops.update(int(x) for x in eos_token_id)
+        else:
+            stops.add(int(eos_token_id))
+    for token in ("<|endoftext|>", "<|im_end|>"):
+        tid = tokenizer.convert_tokens_to_ids(token)
+        if tid is not None and tid != tokenizer.unk_token_id:
+            stops.add(int(tid))
+    return stops
+
+
+def _truncate_ids_like_sglang_stop(
+    token_ids: List[int],
+    stop_ids: Set[int],
+    finish_reason: Optional[dict],
+    opening_prefix_ids: Optional[List[int]],
+) -> List[int]:
+    """Mirror ``output_ids_through_stop``: cut at first stop token; trim tail re-openings."""
+    cut = len(token_ids)
+    fr_type = (finish_reason or {}).get("type")
+    if fr_type == "stop":
+        # Engine already applied output_ids_through_stop.
+        return token_ids
+
+    for j, tok in enumerate(token_ids):
+        if int(tok) in stop_ids:
+            cut = j + 1
+            break
+
+    # Train often ends with finish_reason=length (full max_new_tokens). Val ends earlier on pad.
+    if opening_prefix_ids and len(opening_prefix_ids) >= 4:
+        hits = _find_subseq_positions(token_ids[:cut], opening_prefix_ids)
+        if len(hits) >= 2 and hits[1] > 0:
+            cut = min(cut, hits[1])
+
+    return token_ids[:cut]
+
+
+def _finalize_dream_response_tensor(
+    response: torch.Tensor,
+    rollout_log_probs: Optional[torch.Tensor],
+    stop_ids: Set[int],
+    pad_token_id: int,
+    response_length: int,
+    finish_reasons: Optional[List[Optional[dict]]] = None,
+    opening_prefix_ids: Optional[List[int]] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Val path: no mask-strip; truncate at stop tokens then right-pad (same as parent SGLangRollout)."""
     from torch.nn.utils.rnn import pad_sequence
 
-    rows = []
+    rows: List[torch.Tensor] = []
+    lp_rows: List[torch.Tensor] = []
     for i in range(response.size(0)):
-        row = response[i]
-        keep = (row != mask_id) & (row != pad_id)
-        rows.append(row[keep] if keep.any() else row[:0])
-    if not rows:
-        return response
-    return pad_sequence(rows, batch_first=True, padding_value=pad_id)
+        fr = finish_reasons[i] if finish_reasons and i < len(finish_reasons) else None
+        ids = _truncate_ids_like_sglang_stop(
+            response[i].tolist(),
+            stop_ids,
+            fr,
+            opening_prefix_ids,
+        )
+        rows.append(
+            torch.tensor(ids, dtype=response.dtype, device=response.device)
+            if ids
+            else torch.zeros(0, dtype=response.dtype, device=response.device)
+        )
+        if rollout_log_probs is not None:
+            lp_rows.append(rollout_log_probs[i, : len(ids)])
+
+    padded = pad_sequence(rows, batch_first=True, padding_value=pad_token_id)
+    if padded.size(1) < response_length:
+        padded = pad_sequence_to_length(padded, response_length, pad_token_id)
+    elif padded.size(1) > response_length:
+        padded = padded[:, :response_length]
+
+    padded_lp = None
+    if rollout_log_probs is not None:
+        padded_lp = pad_sequence(lp_rows, batch_first=True, padding_value=0.0)
+        if padded_lp.size(1) < response_length:
+            padded_lp = pad_sequence_to_length(padded_lp, response_length, 0.0)
+        elif padded_lp.size(1) > response_length:
+            padded_lp = padded_lp[:, :response_length]
+
+    return padded, padded_lp
 
 
 class SGLangDreamRollout(SGLangRollout):
@@ -185,12 +277,75 @@ class SGLangDreamRollout(SGLangRollout):
             self._engine.release_memory_occupation()
         self.is_sleep = True
 
+    def _opening_prefix_ids(self) -> List[int]:
+        return self.tokenizer.encode("To solve this problem", add_special_tokens=False)
+
+    def _dream_sampling_extras(self, stop_ids: Set[int]) -> dict:
+        return {
+            "stop_token_ids": sorted(stop_ids),
+            "skip_special_tokens": self.sampling_params.get("skip_special_tokens", True),
+            "spaces_between_special_tokens": self.sampling_params.get(
+                "spaces_between_special_tokens", True
+            ),
+        }
+
+    def _apply_dream_response_finalize(
+        self,
+        data: DataProto,
+        eos_token_id: Union[int, List[int], None],
+        finish_reasons: Optional[List[Optional[dict]]] = None,
+    ) -> DataProto:
+        stop_ids = _dream_stop_token_ids(
+            self.tokenizer, eos_token_id, self.pad_token_id, self._mask_token_id
+        )
+        response = data.batch["responses"]
+        rollout_log_probs = data.batch.get("rollout_log_probs")
+        response, rollout_log_probs = _finalize_dream_response_tensor(
+            response,
+            rollout_log_probs,
+            stop_ids,
+            self.pad_token_id,
+            self.config.response_length,
+            finish_reasons=finish_reasons,
+            opening_prefix_ids=self._opening_prefix_ids(),
+        )
+        prompts = data.batch["prompts"]
+        prompt_width = prompts.size(1)
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=data.batch["attention_mask"].dtype
+        )
+        attention_mask_out = torch.cat(
+            (data.batch["attention_mask"][:, :prompt_width], response_attention_mask),
+            dim=-1,
+        )
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=data.batch["position_ids"].device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(response.size(0), -1)
+        response_position_ids = data.batch["position_ids"][:, -1:] + delta_position_id
+        position_ids_out = torch.cat(
+            (data.batch["position_ids"][:, :prompt_width], response_position_ids),
+            dim=-1,
+        )
+        data.batch["responses"] = response
+        data.batch["attention_mask"] = attention_mask_out
+        data.batch["position_ids"] = position_ids_out
+        data.batch["input_ids"] = torch.cat([prompts, response], dim=-1)
+        if rollout_log_probs is not None:
+            data.batch["rollout_log_probs"] = rollout_log_probs
+        return data
+
     @torch.no_grad()
     def _batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompts.meta_info.get("validate", False)
+        eos_token_id = prompts.meta_info.get("eos_token_id", self.eos_token_id)
+        if eos_token_id is None:
+            eos_token_id = self.pad_token_id
+
         if not do_sample or is_validate:
-            return super()._batch_level_generate_sequences(prompts, **kwargs)
+            out = super()._batch_level_generate_sequences(prompts, **kwargs)
+            return self._apply_dream_response_finalize(out, eos_token_id)
+
         return self._per_sample_generate_sequences(prompts, **kwargs)
 
     @torch.no_grad()
@@ -244,6 +399,9 @@ class SGLangDreamRollout(SGLangRollout):
 
         sample_meta = build_sample_meta(prompts, total_batch_size, n_rollout, self.tokenizer) if verbose else None
 
+        stop_ids = _dream_stop_token_ids(
+            self.tokenizer, eos_token_id, self.pad_token_id, self._mask_token_id
+        )
         gen_kwargs = dict(
             n=1,
             top_p=self.config.top_p,
@@ -260,7 +418,12 @@ class SGLangDreamRollout(SGLangRollout):
                     seed = self._base_seed + j
                 else:
                     seed = random.randint(0, 2**31 - 1)
-                per_call_params = {**self.sampling_params, **gen_kwargs, "sampling_seed": seed}
+                per_call_params = {
+                    **self.sampling_params,
+                    **gen_kwargs,
+                    **self._dream_sampling_extras(stop_ids),
+                    "sampling_seed": seed,
+                }
                 output = loop.run_until_complete(
                     self._engine.async_generate(
                         prompt=None,
@@ -302,16 +465,23 @@ class SGLangDreamRollout(SGLangRollout):
             force_cpu_device=False,
         )
 
+        finish_reasons = [
+            (out.get("meta_info", {}) or {}).get("finish_reason") if isinstance(out, dict) else None
+            for out in merged_output
+        ]
         response, rollout_log_probs = _post_process_outputs(self.tokenizer, merged_output)
-        response = _strip_mask_pad_tokens(response, self._mask_token_id, self.pad_token_id)
+        response, rollout_log_probs = _finalize_dream_response_tensor(
+            response,
+            rollout_log_probs,
+            stop_ids,
+            self.pad_token_id,
+            self.config.response_length,
+            finish_reasons=finish_reasons,
+            opening_prefix_ids=self._opening_prefix_ids(),
+        )
         response = response.to(idx.device)
         if rollout_log_probs is not None:
             rollout_log_probs = rollout_log_probs.to(idx.device)
-
-        if response.shape[1] < self.config.response_length:
-            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-            if rollout_log_probs is not None:
-                rollout_log_probs = pad_sequence_to_length(rollout_log_probs, self.config.response_length, 0.0)
 
         seq = torch.cat([idx_repeat, response], dim=-1)
         response_length = response.size(1)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare SGLang Dream rollout: train (_per_sample + strip) vs val (batch, no strip).
+"""Compare SGLang Dream rollout: train vs val with val-aligned stop/finalize.
 
 Uses the same prompt token ids for both paths (mirrors sglang_dream_rollout.py).
 """
@@ -116,17 +116,21 @@ def ids_stats(ids: list[int], label: str) -> dict:
 
 
 def run_train_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
-    from verl.workers.rollout.sglang_rollout.sglang_dream_rollout import _strip_mask_pad_tokens
+    from verl.workers.rollout.sglang_rollout.sglang_dream_rollout import (
+        _dream_stop_token_ids,
+        _finalize_dream_response_tensor,
+    )
     from verl.workers.rollout.sglang_rollout.sglang_rollout import _post_process_outputs
-    from verl.utils.torch_functional import pad_sequence_to_length
 
     loop = asyncio.get_event_loop()
+    stop_ids = _dream_stop_token_ids(tokenizer, PAD_TOKEN_ID, PAD_TOKEN_ID, MASK_TOKEN_ID)
     per_call = {
         "n": 1,
         "top_p": 0.95,
         "temperature": args.train_temperature,
         "max_new_tokens": args.max_new_tokens,
         "sampling_seed": args.train_seed,
+        "stop_token_ids": sorted(stop_ids),
     }
     out = loop.run_until_complete(
         engine.async_generate(
@@ -141,31 +145,49 @@ def run_train_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
         out = out[0]
     raw_resp, _ = _post_process_outputs(tokenizer, [out])
     raw_ids = raw_resp[0].tolist()
-    stripped = _strip_mask_pad_tokens(raw_resp, MASK_TOKEN_ID, PAD_TOKEN_ID)
-    if stripped.shape[1] < args.max_new_tokens:
-        stripped = pad_sequence_to_length(stripped, args.max_new_tokens, PAD_TOKEN_ID)
-    stripped_ids = stripped[0].tolist()
     meta = out.get("meta_info", {}) if isinstance(out, dict) else {}
+    fr = meta.get("finish_reason")
+    opening = tokenizer.encode("To solve this problem", add_special_tokens=False)
+    finalized, _ = _finalize_dream_response_tensor(
+        raw_resp,
+        None,
+        stop_ids,
+        PAD_TOKEN_ID,
+        args.max_new_tokens,
+        finish_reasons=[fr],
+        opening_prefix_ids=opening,
+    )
+    finalized_ids = finalized[0].tolist()
     return {
         "path": "train_per_sample",
         "sampling": per_call,
         "nfe": meta.get("nfe"),
-        "finish_reason": meta.get("finish_reason"),
+        "finish_reason": fr,
         "completion_tokens": meta.get("completion_tokens"),
         "raw": ids_stats(raw_ids, "raw"),
-        "after_strip": ids_stats(stripped_ids, "after_strip"),
+        "after_finalize": ids_stats(finalized_ids, "after_finalize"),
         "raw_text": tokenizer.decode(raw_ids, skip_special_tokens=True),
-        "stripped_text": tokenizer.decode(stripped_ids, skip_special_tokens=True),
+        "finalized_text": tokenizer.decode(finalized_ids, skip_special_tokens=True),
     }
 
 
 def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
+    from verl.workers.rollout.sglang_rollout.sglang_dream_rollout import (
+        _dream_stop_token_ids,
+        _finalize_dream_response_tensor,
+    )
     from verl.workers.rollout.sglang_rollout.sglang_rollout import _post_process_outputs
-    from verl.utils.torch_functional import pad_sequence_to_length
 
     loop = asyncio.get_event_loop()
     # Mirrors SGLangRollout._batch_level_generate_sequences when is_validate=True
-    val_kwargs = {"top_p": 0.95, "temperature": 0.0, "n": 1, "max_new_tokens": args.max_new_tokens}
+    stop_ids = _dream_stop_token_ids(tokenizer, PAD_TOKEN_ID, PAD_TOKEN_ID, MASK_TOKEN_ID)
+    val_kwargs = {
+        "top_p": 0.95,
+        "temperature": 0.0,
+        "n": 1,
+        "max_new_tokens": args.max_new_tokens,
+        "stop_token_ids": sorted(stop_ids),
+    }
     out = loop.run_until_complete(
         engine.async_generate(
             prompt=None,
@@ -181,20 +203,29 @@ def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
         out_list = [out]
     resp, _ = _post_process_outputs(tokenizer, out_list)
     raw_ids = resp[0].tolist()
-    if resp.shape[1] < args.max_new_tokens:
-        resp = pad_sequence_to_length(resp, args.max_new_tokens, PAD_TOKEN_ID)
-    padded_ids = resp[0].tolist()
     meta = out_list[0].get("meta_info", {}) if isinstance(out_list[0], dict) else {}
+    fr = meta.get("finish_reason")
+    opening = tokenizer.encode("To solve this problem", add_special_tokens=False)
+    finalized, _ = _finalize_dream_response_tensor(
+        resp,
+        None,
+        stop_ids,
+        PAD_TOKEN_ID,
+        args.max_new_tokens,
+        finish_reasons=[fr],
+        opening_prefix_ids=opening,
+    )
+    finalized_ids = finalized[0].tolist()
     return {
         "path": "val_batch",
         "sampling": val_kwargs,
         "nfe": meta.get("nfe"),
-        "finish_reason": meta.get("finish_reason"),
+        "finish_reason": fr,
         "completion_tokens": meta.get("completion_tokens"),
         "raw": ids_stats(raw_ids, "raw"),
-        "after_pad": ids_stats(padded_ids, "after_pad_no_strip"),
+        "after_finalize": ids_stats(finalized_ids, "after_finalize"),
         "raw_text": tokenizer.decode(raw_ids, skip_special_tokens=True),
-        "padded_text": tokenizer.decode(padded_ids, skip_special_tokens=True),
+        "finalized_text": tokenizer.decode(finalized_ids, skip_special_tokens=True),
     }
 
 
@@ -238,27 +269,23 @@ def main():
         "train": train_r,
         "val": val_r,
         "text_equal_raw": train_r["raw_text"] == val_r["raw_text"],
-        "text_equal_decoded": train_r["stripped_text"] == val_r["padded_text"],
+        "text_equal_finalized": train_r["finalized_text"] == val_r["finalized_text"],
     }
 
     print("\n--- token stats ---")
-    print(json.dumps({"train": {k: train_r[k] for k in ("path", "sampling", "nfe", "finish_reason", "completion_tokens", "raw", "after_strip")}}, indent=2))
-    print(json.dumps({"val": {k: val_r[k] for k in ("path", "sampling", "nfe", "finish_reason", "completion_tokens", "raw", "after_pad")}}, indent=2))
+    print(json.dumps({"train": {k: train_r[k] for k in ("path", "sampling", "nfe", "finish_reason", "completion_tokens", "raw", "after_finalize")}}, indent=2))
+    print(json.dumps({"val": {k: val_r[k] for k in ("path", "sampling", "nfe", "finish_reason", "completion_tokens", "raw", "after_finalize")}}, indent=2))
     print(f"\ntrain_raw == val_raw text: {result['text_equal_raw']}")
-    print(f"train_stripped == val_padded text: {result['text_equal_decoded']}")
+    print(f"train_finalized == val_finalized text: {result['text_equal_finalized']}")
 
-    print_section("TRAIN raw decode (before strip)", train_r["raw_text"])
-    print_section("TRAIN after _strip_mask_pad_tokens", train_r["stripped_text"])
-    print_section("VAL raw decode (no strip)", val_r["raw_text"])
-    print_section("VAL after pad only", val_r["padded_text"])
+    phrase = "To solve this problem"
+    for label, text in [("train_raw", train_r["raw_text"]), ("train_fin", train_r["finalized_text"])]:
+        print(f"{label} phrase count: {text.count(phrase)}")
 
-    raw = train_r["raw"]
-    if raw["n_mask"] > 0 and raw.get("first_mask_at") is not None and raw["first_mask_at"] < raw["len"] - 1:
-        print(
-            f"\n[note] train raw has {raw['n_mask']} mask tokens; "
-            f"first_mask_at={raw['first_mask_at']} last_mask_at={raw['last_mask_at']} "
-            "→ strip may splice segments."
-        )
+    print_section("TRAIN engine output_ids decode", train_r["raw_text"])
+    print_section("TRAIN after finalize (val-aligned)", train_r["finalized_text"])
+    print_section("VAL engine output_ids decode", val_r["raw_text"])
+    print_section("VAL after finalize", val_r["finalized_text"])
 
     if args.output_json:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
