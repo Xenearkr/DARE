@@ -28,7 +28,12 @@ from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
-from verl.workers.rollout.dream_rollout_debug import build_sample_meta, log, rollout_verbose_enabled
+from verl.workers.rollout.dream_rollout_debug import (
+    build_sample_meta,
+    log,
+    log_rollout_batch,
+    rollout_verbose_enabled,
+)
 from verl.workers.rollout.sglang_rollout.sglang_rollout import (
     SGLangRollout,
     _post_process_outputs,
@@ -344,6 +349,19 @@ class SGLangDreamRollout(SGLangRollout):
             log(
                 f"[dream-sglang][RANK{rank}] batch_done n_samples={total_batch_size} "
                 f"total={time.time() - t_batch:.2f}s"
+            )
+            log_rollout_batch(
+                prompts=prompts,
+                responses=response,
+                idx_repeat=idx_repeat,
+                gen_kwargs={
+                    **dict(self.config),
+                    "dllm_decode": self.config.get("dllm_decode", "multiblock"),
+                    "global_step": prompts.meta_info.get("global_step"),
+                },
+                tokenizer=self.tokenizer,
+                elapsed_s=time.time() - t_batch,
+                is_validate=prompts.meta_info.get("validate", False),
             )
 
         return DataProto(batch=batch, non_tensor_batch=_non_tensor_batch)

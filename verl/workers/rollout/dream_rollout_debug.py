@@ -38,6 +38,17 @@ def _rank() -> int:
     return 0
 
 
+def rollout_detail_log_enabled() -> bool:
+    """When DREAM_ROLLOUT_LOG_RANK is set, only that rank writes detailed rollout logs."""
+    spec = os.environ.get("DREAM_ROLLOUT_LOG_RANK", "").strip()
+    if spec == "":
+        return True
+    try:
+        return _rank() == int(spec)
+    except ValueError:
+        return True
+
+
 def _append_file(text: str) -> None:
     log_dir = rollout_log_dir()
     if not log_dir:
@@ -182,6 +193,8 @@ def log_rollout_batch(
     is_validate: bool = False,
 ) -> None:
     if not rollout_verbose_enabled(gen_kwargs):
+        return
+    if not rollout_detail_log_enabled():
         return
 
     batch_size = responses.size(0)

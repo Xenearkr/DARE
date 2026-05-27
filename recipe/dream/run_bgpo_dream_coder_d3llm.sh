@@ -18,7 +18,9 @@ trap cleanup EXIT INT TERM ERR
 export HYDRA_FULL_ERROR=1
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export WANDB_PROJECT="${WANDB_PROJECT:-DARE}"
+export WANDB_API_KEY="${WANDB_API_KEY:-wandb_v1_ZyTW8NCbOruLfue0ZyzHc7XoUoz}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
+# Default offline for non-smoke; smoke/full SGLang runs set online below (aligned with SDAR).
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_OFFLINE=1
@@ -75,16 +77,22 @@ if [ "${smoke_test}" -eq 1 ]; then
   max_num_batched_tokens=4096
   val_batch_size=8
   save_freq=1
-  test_freq=1
+  # Smoke focuses on train rollout path; skip slow full-set val (humaneval×256 diffusion steps).
+  test_freq=999
   val_before_train=False
   total_epoch=1
-  trainer_logger='["console"]'
+  trainer_logger='["console","wandb"]'
+  export WANDB_MODE="${WANDB_MODE:-online}"
+  # Enough steps to verify multi-step rollout+weight-sync without full 11-step epoch.
+  smoke_total_training_steps=3
   if [ "$engine" = "sglang" ]; then
-    sglang_mem_fraction_static=0.35
-    sglang_gpu_memory_utilization=0.35
+    # Leave headroom on 48GB for FSDP state_dict + weight sync beside SGLang static pool.
+    sglang_mem_fraction_static=0.32
+    sglang_gpu_memory_utilization=0.32
     sglang_attention_backend=torch_native
     sglang_disable_cuda_graph=True
     actor_param_offload=True
+    actor_optimizer_offload=True
     enable_activation_offload=True
   fi
 else
@@ -104,13 +112,16 @@ else
   val_before_train=False
   total_epoch=5
   trainer_logger='["console","wandb"]'
+  export WANDB_MODE="${WANDB_MODE:-online}"
+  smoke_total_training_steps=
   if [ "$engine" = "sglang" ]; then
     echo "[INFO] SGLang full run: using smoke-style inference mem + activation offload"
-    sglang_mem_fraction_static=0.35
-    sglang_gpu_memory_utilization=0.35
+    sglang_mem_fraction_static=0.32
+    sglang_gpu_memory_utilization=0.32
     sglang_attention_backend=torch_native
     sglang_disable_cuda_graph=True
     actor_param_offload=True
+    actor_optimizer_offload=True
     enable_activation_offload=True
   fi
 fi
@@ -152,8 +163,12 @@ log_dir=./logs/${WANDB_PROJECT}/${exp_name}
 mkdir -p "${ckpt_dir}" "${log_dir}"
 export DREAM_ROLLOUT_VERBOSE="${DREAM_ROLLOUT_VERBOSE:-1}"
 export DREAM_ROLLOUT_LOG_DIR="${DREAM_ROLLOUT_LOG_DIR:-${log_dir}/rollout_debug}"
-mkdir -p "${DREAM_ROLLOUT_LOG_DIR}"
-echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR}"
+# Each DP rank writes to rollout_debug/rank{N}.rollout.log (set DREAM_ROLLOUT_LOG_RANK=N to restrict).
+unset DREAM_ROLLOUT_LOG_RANK
+val_generations_dir="${log_dir}/val_generations"
+mkdir -p "${DREAM_ROLLOUT_LOG_DIR}" "${val_generations_dir}"
+echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR} (per-rank rank0..rank$((n_gpus_per_node - 1)).rollout.log)"
+echo "[INFO] WANDB_MODE=${WANDB_MODE} project=${WANDB_PROJECT} WANDB_DIR=${WANDB_DIR:-${log_dir}/wandb}"
 
 sglang_extra_args=()
 if [ "$engine" = "sglang" ]; then
@@ -164,7 +179,16 @@ if [ "$engine" = "sglang" ]; then
     "+actor_rollout_ref.rollout.mem_fraction_static=${sglang_mem_fraction_static}"
     "+actor_rollout_ref.rollout.max_running_requests=1"
     "actor_rollout_ref.rollout.gpu_memory_utilization=${sglang_gpu_memory_utilization}"
+    "actor_rollout_ref.rollout.free_cache_engine=True"
+    "actor_rollout_ref.rollout.enforce_eager=True"
   )
+fi
+
+# Isolate wandb from repo-root offline runs; force online when logger includes wandb.
+export WANDB_DIR="${WANDB_DIR:-${log_dir}/wandb}"
+mkdir -p "${WANDB_DIR}"
+if [[ "${trainer_logger}" == *wandb* ]]; then
+  export WANDB_MODE="${WANDB_MODE:-online}"
 fi
 
 python3 -m verl.trainer.dllm_main_ppo \
@@ -253,6 +277,8 @@ python3 -m verl.trainer.dllm_main_ppo \
   trainer.save_freq=${save_freq} \
   trainer.test_freq=${test_freq} \
   trainer.total_epochs=${total_epoch} \
+  +trainer.validation_data_dir="${val_generations_dir}" \
+  ${smoke_total_training_steps:+trainer.total_training_steps=${smoke_total_training_steps}} \
   custom_reward_function.path="verl/utils/reward_score/__init__.py" \
   custom_reward_function.name="dllm_rm" \
   "${sglang_extra_args[@]}" \

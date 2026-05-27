@@ -16,15 +16,35 @@ A Ray logger will receive logging info from different processes.
 """
 
 import logging
+import math
 import numbers
 from typing import Dict
+
+
+def format_metric_value(v: numbers.Number) -> str:
+    """Format scalars for console logging without collapsing small values to 0.000."""
+    if isinstance(v, bool):
+        return str(v)
+    if isinstance(v, numbers.Integral) and not isinstance(v, bool):
+        return str(v)
+    fv = float(v)
+    if not math.isfinite(fv):
+        return str(fv)
+    if fv == 0.0:
+        return "0"
+    av = abs(fv)
+    # Scientific notation for very small/large magnitudes (e.g. lr=5e-7, grad_norm=1e-5).
+    if av < 1e-3 or av >= 1e4:
+        return f"{fv:.6e}"
+    s = f"{fv:.8f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
 
 def concat_dict_to_str(dict: Dict, step):
     output = [f"step:{step}"]
     for k, v in dict.items():
         if isinstance(v, numbers.Number):
-            output.append(f"{k}:{v:.3f}")
+            output.append(f"{k}:{format_metric_value(v)}")
     output_str = " - ".join(output)
     return output_str
 
