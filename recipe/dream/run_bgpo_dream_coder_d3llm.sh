@@ -77,14 +77,13 @@ if [ "${smoke_test}" -eq 1 ]; then
   max_num_batched_tokens=4096
   val_batch_size=8
   save_freq=1
-  # Smoke focuses on train rollout path; skip slow full-set val (humaneval×256 diffusion steps).
-  test_freq=999
-  val_before_train=False
+  # HumanEval before/after 1 train step: val_generations/0.jsonl (base) vs 1.jsonl (step1).
+  test_freq=1
+  val_before_train=True
   total_epoch=1
   trainer_logger='["console","wandb"]'
   export WANDB_MODE="${WANDB_MODE:-online}"
-  # Enough steps to verify multi-step rollout+weight-sync without full 11-step epoch.
-  smoke_total_training_steps=3
+  smoke_total_training_steps=1
   if [ "$engine" = "sglang" ]; then
     # Leave headroom on 48GB for FSDP state_dict + weight sync beside SGLang static pool.
     sglang_mem_fraction_static=0.32
@@ -168,6 +167,10 @@ unset DREAM_ROLLOUT_LOG_RANK
 val_generations_dir="${log_dir}/val_generations"
 mkdir -p "${DREAM_ROLLOUT_LOG_DIR}" "${val_generations_dir}"
 echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR} (per-rank rank0..rank$((n_gpus_per_node - 1)).rollout.log)"
+if [ "${smoke_test}" -eq 1 ]; then
+  echo "[INFO] Smoke val: val_before_train=True test_freq=1 steps=1"
+  echo "[INFO] HumanEval dumps: ${val_generations_dir}/0.jsonl (pre-train) -> ${val_generations_dir}/1.jsonl (post step1)"
+fi
 echo "[INFO] WANDB_MODE=${WANDB_MODE} project=${WANDB_PROJECT} WANDB_DIR=${WANDB_DIR:-${log_dir}/wandb}"
 
 sglang_extra_args=()

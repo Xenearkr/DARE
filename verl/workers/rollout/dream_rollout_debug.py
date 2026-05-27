@@ -19,6 +19,28 @@ def rollout_verbose_enabled(gen_kwargs: Optional[Dict[str, Any]] = None) -> bool
     return False
 
 
+def format_nfe_for_log(nfe: Any) -> str:
+    """Format SGLang meta_info['nfe'] for rollout logs.
+
+    Dream + needs_full_prefill may run multiple DLLM scheduler rounds; each round
+    appends one element. len(nfe)>1 usually means staging was truncated (KV/token
+    budget) and rollout time scales roughly with the number of rounds.
+    """
+    if nfe is None:
+        return "nfe=n/a"
+    if isinstance(nfe, (list, tuple)):
+        if len(nfe) == 0:
+            return "nfe=[]"
+        if len(nfe) == 1:
+            return f"nfe={nfe[0]}"
+        total = sum(int(x) for x in nfe)
+        return (
+            f"nfe_rounds={len(nfe)} nfe={list(nfe)} nfe_total={total} "
+            f"(WARN: multi-round DLLM; expect ~{len(nfe)}x forward cost)"
+        )
+    return f"nfe={nfe}"
+
+
 def rollout_log_dir() -> Optional[str]:
     for key in ("DREAM_ROLLOUT_LOG_DIR", "D3LLM_ROLLOUT_LOG_DIR"):
         path = os.environ.get(key, "").strip()

@@ -30,6 +30,7 @@ from verl import DataProto
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.rollout.dream_rollout_debug import (
     build_sample_meta,
+    format_nfe_for_log,
     log,
     log_rollout_batch,
     rollout_verbose_enabled,
@@ -443,12 +444,10 @@ class SGLangDreamRollout(SGLangRollout):
                     resp, _ = _post_process_outputs(self.tokenizer, [last_out])
                     meta = last_out.get("meta_info", {}) if isinstance(last_out, dict) else {}
                     plen = len(input_ids)
-                    nfe = meta.get("nfe")
-                    if isinstance(nfe, (list, tuple)) and len(nfe) == 1:
-                        nfe = nfe[0]
+                    nfe_str = format_nfe_for_log(meta.get("nfe"))
                     log(
                         f"[dream-sglang] sample {j + 1}/{total_batch_size} "
-                        f"prompt_tokens={plen} done elapsed={time.time() - t0:.2f}s nfe={nfe}"
+                        f"prompt_tokens={plen} done elapsed={time.time() - t0:.2f}s {nfe_str}"
                     )
                     if sample_meta and j < len(sample_meta):
                         sm = sample_meta[j]

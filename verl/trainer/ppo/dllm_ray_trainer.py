@@ -46,6 +46,9 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
+            for _key in ("reward_model", "data_source", "extra_info", "index"):
+                if _key in test_batch.non_tensor_batch:
+                    test_gen_batch.non_tensor_batch[_key] = test_batch.non_tensor_batch[_key].copy()
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,

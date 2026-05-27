@@ -2,7 +2,8 @@
 
 > 前置：阶段 1 HF multiblock 已跑通（`20260526_231907` smoke：4 rank `batch_done`，FSDP NFE sync 修复生效）。  
 > 分支：`feat/d3llm-dream-clean`  
-> 关联文档：[d3llm-dream-clean-plan.md](./d3llm-dream-clean-plan.md)
+> 关联文档：[d3llm-dream-clean-plan.md](./d3llm-dream-clean-plan.md)  
+> **待解决问题（NFE 双值 / HumanEval 基线偏低）**：[d3llm-dream-open-issues.md](./d3llm-dream-open-issues.md)
 
 ---
 
