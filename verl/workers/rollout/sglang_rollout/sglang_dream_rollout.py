@@ -417,30 +417,23 @@ class SGLangDreamRollout(SGLangRollout):
         stop_ids = _dream_stop_token_ids(
             self.tokenizer, eos_token_id, self.pad_token_id, self._mask_token_id
         )
-        if is_validate:
-            val_temp = float(self.config.val_kwargs.temperature)
-            gen_kwargs = dict(
-                n=1,
-                # HF multiblock uses top_p=1 when temperature=0 (greedy).
-                top_p=1.0 if val_temp <= 0 else self.config.val_kwargs.top_p,
-                temperature=val_temp,
-                max_new_tokens=self.config.response_length,
-            )
-        else:
-            gen_kwargs = dict(
-                n=1,
-                top_p=self.config.top_p,
-                temperature=self.config.temperature,
-                max_new_tokens=self.config.response_length,
-            )
+        # Val and train share rollout temperature/top_p (val_kwargs only controls trainer repeat/n).
+        # Previously val-only branch:
+        #   val_temp = float(self.config.val_kwargs.temperature)
+        #   top_p = 1.0 if val_temp <= 0 else self.config.val_kwargs.top_p
+        gen_kwargs = dict(
+            n=1,
+            top_p=float(self.config.get("top_p", 1.0)),
+            temperature=float(self.config.temperature),
+            max_new_tokens=self.config.response_length,
+        )
 
         if self._tp_rank == 0:
             loop = asyncio.get_event_loop()
             merged_output = []
             for j, (input_ids, image) in enumerate(zip(idx_list, image_list)):
                 t0 = time.time()
-                # Val (temp=0): fixed seed per sample; train: seed when temp>0 else random.
-                if is_validate or (self._per_sample_seed and gen_kwargs["temperature"] > 0):
+                if self._per_sample_seed and gen_kwargs["temperature"] > 0:
                     seed = self._base_seed + j
                 else:
                     seed = random.randint(0, 2**31 - 1)

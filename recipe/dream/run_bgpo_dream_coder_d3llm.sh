@@ -74,6 +74,8 @@ actor_optimizer_offload=False
 enable_activation_offload=False
 
 if [ "${smoke_test}" -eq 1 ]; then
+  # Override stale single-GPU env left by benchmark scripts (default smoke uses 4 GPUs).
+  export CUDA_VISIBLE_DEVICES="${DARE_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
   train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet']"
   val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
   max_prompt_length=1024
@@ -204,6 +206,9 @@ if [[ "${trainer_logger}" == *wandb* ]]; then
 fi
 
 echo "[INFO] PYTHON=${PYTHON}"
+# Previous val-only sampling overrides (now val matches train temperature/top_p):
+#   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
+#   actor_rollout_ref.rollout.val_kwargs.top_p=0.95
 "${PYTHON}" -m verl.trainer.dllm_main_ppo \
   algorithm.adv_estimator=grpo \
   +algorithm.name=${algorithm} \
@@ -267,8 +272,8 @@ echo "[INFO] PYTHON=${PYTHON}"
   actor_rollout_ref.rollout.do_sample=True \
   actor_rollout_ref.rollout.val_kwargs.do_sample=True \
   actor_rollout_ref.rollout.val_kwargs.n=1 \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-  actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+  actor_rollout_ref.rollout.val_kwargs.temperature=${train_temperature} \
+  actor_rollout_ref.rollout.top_p=1.0 \
   +actor_rollout_ref.rollout.val_kwargs.num_diffusion_steps=${val_num_diffusion_steps} \
   actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
   actor_rollout_ref.rollout.enable_chunked_prefill=False \
