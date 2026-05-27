@@ -67,8 +67,8 @@ enable_activation_offload=False
 if [ "${smoke_test}" -eq 1 ]; then
   train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet']"
   val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
-  max_prompt_length=512
-  max_response_length=256
+  max_prompt_length=1024
+  max_response_length=512
   batch_size=4
   n_rollout=4
   mc_num=4
