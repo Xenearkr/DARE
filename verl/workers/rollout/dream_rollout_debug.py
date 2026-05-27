@@ -85,6 +85,22 @@ def extract_code_preview(text: str, max_chars: int = 800) -> str:
     return "(no ``` code block)"
 
 
+def _unwrap_non_tensor_obj(value: Any) -> Any:
+    if value is None:
+        return None
+    if hasattr(value, "item") and not isinstance(value, (dict, list, str, bytes)):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def _as_mapping(value: Any) -> Optional[Dict[str, Any]]:
+    value = _unwrap_non_tensor_obj(value)
+    return value if isinstance(value, dict) else None
+
+
 def evaluate_code_reward(
     response_text: str,
     data_source: str,
@@ -92,13 +108,14 @@ def evaluate_code_reward(
     extra_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run the same code reward path as training (best-effort, never raises)."""
+    reward_model = _as_mapping(reward_model)
     if not reward_model:
         return {"skipped": True, "reason": "no reward_model"}
     ground_truth = reward_model.get("ground_truth")
     if ground_truth is None:
         return {"skipped": True, "reason": "no ground_truth"}
 
-    extra = dict(extra_info or {})
+    extra = dict(_as_mapping(extra_info) or {})
     extra.setdefault("task", "code")
 
     try:
@@ -127,9 +144,10 @@ def build_sample_meta(
     batch_size: int,
     n_rollout: int,
     tokenizer,
+    non_tensor_batch: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     meta_list: List[Dict[str, Any]] = []
-    nt = getattr(prompts, "non_tensor_batch", None) or {}
+    nt = non_tensor_batch if non_tensor_batch is not None else (getattr(prompts, "non_tensor_batch", None) or {})
 
     def _repeat_field(key: str, default: Any = None):
         if key not in nt:
@@ -153,7 +171,7 @@ def build_sample_meta(
     reward_models = _repeat_field("reward_model", None)
 
     for i in range(batch_size):
-        extra = extras[i] if isinstance(extras[i], dict) else {}
+        extra = _as_mapping(extras[i]) or {}
         task = extra.get("task", "?") if extra else "?"
         prompt_preview = ""
         rp = raw_prompts[i]
@@ -176,10 +194,22 @@ def build_sample_meta(
                 "task": task,
                 "prompt_preview": prompt_preview,
                 "extra_info": extra,
-                "reward_model": reward_models[i],
+                "reward_model": _as_mapping(reward_models[i]),
             }
         )
     return meta_list
+
+
+def _format_reward_log_line(reward_info: Dict[str, Any]) -> str:
+    if reward_info.get("skipped"):
+        return f"n/a (skipped: {reward_info.get('reason', '?')})"
+    if "error" in reward_info:
+        err = str(reward_info["error"])
+        if len(err) > 120:
+            err = err[:120] + "..."
+        return f"n/a (error: {err})"
+    acc = reward_info.get("is_correct", "n/a")
+    return f"reward={reward_info.get('reward', 'n/a')} acc={acc}"
 
 
 def log_rollout_batch(
@@ -191,6 +221,8 @@ def log_rollout_batch(
     tokenizer,
     elapsed_s: float,
     is_validate: bool = False,
+    attention_mask: Optional[torch.Tensor] = None,
+    non_tensor_batch: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not rollout_verbose_enabled(gen_kwargs):
         return
@@ -205,10 +237,18 @@ def log_rollout_batch(
     mode = "val" if is_validate else "train"
     rank = _rank()
 
-    sample_meta = build_sample_meta(prompts, batch_size, n_rollout, tokenizer)
+    sample_meta = build_sample_meta(
+        prompts,
+        batch_size,
+        n_rollout,
+        tokenizer,
+        non_tensor_batch=non_tensor_batch,
+    )
     n_correct = 0
     n_scored = 0
+    n_errors = 0
     rewards: List[float] = []
+    prompt_length = idx_repeat.size(1)
 
     log(
         f"[dream][RANK{rank}] batch_start step={step} mode={mode} "
@@ -221,6 +261,9 @@ def log_rollout_batch(
         uid = meta.get("uid", meta.get("index", i))
         ds = meta.get("data_source", "?")
         response_ids = responses[i]
+        if attention_mask is not None:
+            valid_len = int(attention_mask[i, prompt_length:].sum().item())
+            response_ids = response_ids[:valid_len]
         response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
 
         reward_info = evaluate_code_reward(
@@ -234,11 +277,12 @@ def log_rollout_batch(
             rewards.append(float(reward_info.get("reward", 0.0)))
             if reward_info.get("is_correct"):
                 n_correct += 1
+        elif "error" in reward_info:
+            n_errors += 1
 
         log(
             f"[dream][RANK{rank}] sample[{i}] uid={uid} data_source={ds} "
-            f"reward={reward_info.get('reward', 'n/a')} "
-            f"acc={reward_info.get('is_correct', 'n/a')}"
+            f"{_format_reward_log_line(reward_info)}"
         )
         if reward_info.get("pred_preview"):
             log(f"[dream][RANK{rank}] sample[{i}] extracted_code:\n{reward_info['pred_preview']}")
@@ -261,7 +305,10 @@ def log_rollout_batch(
             f"avg_reward={avg_reward:.4f}"
         )
     else:
+        reason = "no code reward scored"
+        if n_errors:
+            reason += f"; {n_errors} eval error(s) (check data_source/extra_info on gen batch)"
         log(
             f"[dream][RANK{rank}] batch_done step={step} mode={mode} "
-            f"n_samples={batch_size} (no code reward scored)"
+            f"n_samples={batch_size} ({reason})"
         )

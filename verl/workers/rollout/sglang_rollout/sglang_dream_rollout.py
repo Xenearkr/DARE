@@ -444,6 +444,8 @@ class SGLangDreamRollout(SGLangRollout):
                     meta = last_out.get("meta_info", {}) if isinstance(last_out, dict) else {}
                     plen = len(input_ids)
                     nfe = meta.get("nfe")
+                    if isinstance(nfe, (list, tuple)) and len(nfe) == 1:
+                        nfe = nfe[0]
                     log(
                         f"[dream-sglang] sample {j + 1}/{total_batch_size} "
                         f"prompt_tokens={plen} done elapsed={time.time() - t0:.2f}s nfe={nfe}"
@@ -532,6 +534,8 @@ class SGLangDreamRollout(SGLangRollout):
                 tokenizer=self.tokenizer,
                 elapsed_s=time.time() - t_batch,
                 is_validate=prompts.meta_info.get("validate", False),
+                attention_mask=attention_mask_out,
+                non_tensor_batch=_non_tensor_batch,
             )
 
         return DataProto(batch=batch, non_tensor_batch=_non_tensor_batch)
