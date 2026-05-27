@@ -26,6 +26,15 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_OFFLINE=1
 export TORCHDYNAMO_DISABLE=1
 
+# Prefer active conda env (DARE); system python3 often lacks hydra/sglang deps.
+if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+  PYTHON="${PYTHON:-${CONDA_PREFIX}/bin/python}"
+elif [[ -x "${HOME}/anaconda3/envs/DARE/bin/python" ]]; then
+  PYTHON="${PYTHON:-${HOME}/anaconda3/envs/DARE/bin/python}"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
+
 smoke_test=0
 model_path=""
 engine=hf
@@ -76,7 +85,7 @@ if [ "${smoke_test}" -eq 1 ]; then
   ppo_max_token_len_per_gpu=2048
   max_num_batched_tokens=4096
   val_batch_size=8
-  save_freq=1
+  save_freq=0
   # HumanEval before/after 1 train step: val_generations/0.jsonl (base) vs 1.jsonl (step1).
   test_freq=1
   val_before_train=True
@@ -194,7 +203,8 @@ if [[ "${trainer_logger}" == *wandb* ]]; then
   export WANDB_MODE="${WANDB_MODE:-online}"
 fi
 
-python3 -m verl.trainer.dllm_main_ppo \
+echo "[INFO] PYTHON=${PYTHON}"
+"${PYTHON}" -m verl.trainer.dllm_main_ppo \
   algorithm.adv_estimator=grpo \
   +algorithm.name=${algorithm} \
   reward_model.reward_manager=dllm \
@@ -261,7 +271,7 @@ python3 -m verl.trainer.dllm_main_ppo \
   actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
   +actor_rollout_ref.rollout.val_kwargs.num_diffusion_steps=${val_num_diffusion_steps} \
   actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
-  actor_rollout_ref.rollout.enable_chunked_prefill=True \
+  actor_rollout_ref.rollout.enable_chunked_prefill=False \
   +actor_rollout_ref.rollout.num_diffusion_steps=${num_diffusion_steps} \
   +actor_rollout_ref.rollout.block_length=${block_length} \
   +actor_rollout_ref.rollout.mc_num=${mc_num} \

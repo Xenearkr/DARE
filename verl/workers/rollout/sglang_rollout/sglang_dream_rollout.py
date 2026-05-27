@@ -230,6 +230,14 @@ class SGLangDreamRollout(SGLangRollout):
             rank = self._rank
             os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
 
+            max_prompt = int(self.config.get("prompt_length", 1024))
+            max_response = int(self.config.get("response_length", 512))
+            max_seq_tokens = max_prompt + max_response + 64
+            max_prefill_tokens = int(
+                self.config.get("max_num_batched_tokens", max_seq_tokens)
+            )
+            max_prefill_tokens = max(max_prefill_tokens, max_seq_tokens)
+
             engine_kwargs = dict(
                 model_path=actor_module,
                 dtype=self.config.dtype,
@@ -245,6 +253,9 @@ class SGLangDreamRollout(SGLangRollout):
                 trust_remote_code=trust_remote_code,
                 port=30000 + rank,
                 max_running_requests=self.config.get("max_running_requests", 1),
+                max_prefill_tokens=max_prefill_tokens,
+                # Avoid chunked prefill splitting Dream full-length DLLM extends.
+                chunked_prefill_size=-1,
             )
 
             engine_kwargs["dllm_algorithm"] = self._dllm_algorithm
