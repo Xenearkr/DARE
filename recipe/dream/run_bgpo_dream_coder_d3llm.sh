@@ -20,8 +20,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export WANDB_PROJECT="${WANDB_PROJECT:-DARE}"
 export WANDB_API_KEY="${WANDB_API_KEY:-wandb_v1_ZyTW8NCbOruLfue0ZyzHc7XoUoz}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
-# Default offline for non-smoke; smoke/full SGLang runs set online below (aligned with SDAR).
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_OFFLINE=1
 export TORCHDYNAMO_DISABLE=1
@@ -93,8 +92,9 @@ if [ "${smoke_test}" -eq 1 ]; then
   val_before_train=True
   total_epoch=1
   trainer_logger='["console","wandb"]'
-  export WANDB_MODE="${WANDB_MODE:-online}"
+  enable_gradient_checkpointing=False
   smoke_total_training_steps=1
+  train_temperature=0.2
   if [ "$engine" = "sglang" ]; then
     # Leave headroom on 48GB for FSDP state_dict + weight sync beside SGLang static pool.
     sglang_mem_fraction_static=0.32
@@ -106,24 +106,25 @@ if [ "${smoke_test}" -eq 1 ]; then
     enable_activation_offload=True
   fi
 else
+  # Full training (aligned with recipe/sdar/run_bgpo_sdar_8b_chat.sh sglang branch).
   train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
   val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
   max_prompt_length=1024
+  # Dream d3LLM multiblock: keep 512 (SDAR code full uses 1536; too costly per-sample here).
   max_response_length=512
-  batch_size=16
-  n_rollout=8
-  mc_num=16
-  n_l=16
-  ppo_max_token_len_per_gpu=5120
-  max_num_batched_tokens=11000
-  val_batch_size=64
-  save_freq=20
-  test_freq=20
+  batch_size=8
+  n_rollout=4
+  mc_num=8
+  n_l=8
+  ppo_max_token_len_per_gpu=3072
+  max_num_batched_tokens=6144
+  val_batch_size=32
+  save_freq=50
+  test_freq=25
   val_before_train=False
   total_epoch=5
   trainer_logger='["console","wandb"]'
-  export WANDB_MODE="${WANDB_MODE:-online}"
-  smoke_total_training_steps=
+  enable_gradient_checkpointing=True
   if [ "$engine" = "sglang" ]; then
     echo "[INFO] SGLang full run: using smoke-style inference mem + activation offload"
     sglang_mem_fraction_static=0.32
@@ -148,11 +149,17 @@ num_diffusion_steps=${max_response_length}
 val_num_diffusion_steps=${max_response_length}
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1
-train_temperature=0.2
+# Full train: 1.0 for BGPO rollout diversity (SDAR default). Smoke overrides to 0.2 above.
+train_temperature="${train_temperature:-1.0}"
 
 n_gpus_per_node=$(echo "$CUDA_VISIBLE_DEVICES" | tr "," "\n" | wc -l)
-if [ $((batch_size * n_rollout % n_gpus_per_node)) -ne 0 ]; then
-  echo "[ERROR] batch_size * n_rollout must be divisible by GPU count (${n_gpus_per_node})"
+real_train_batch_size=$((batch_size * n_rollout))
+if [ $((real_train_batch_size % n_gpus_per_node)) -ne 0 ]; then
+  echo "[ERROR] batch_size(${batch_size}) * n_rollout(${n_rollout}) = ${real_train_batch_size} must be divisible by GPU count (${n_gpus_per_node})"
+  exit 1
+fi
+if [ $((mc_num % n_l)) -ne 0 ]; then
+  echo "[ERROR] mc_num(${mc_num}) must be divisible by n_l(${n_l})"
   exit 1
 fi
 
@@ -206,9 +213,8 @@ if [[ "${trainer_logger}" == *wandb* ]]; then
 fi
 
 echo "[INFO] PYTHON=${PYTHON}"
-# Previous val-only sampling overrides (now val matches train temperature/top_p):
-#   actor_rollout_ref.rollout.val_kwargs.temperature=0.0
-#   actor_rollout_ref.rollout.val_kwargs.top_p=0.95
+# Val greedy (train keeps train_temperature); previously aligned val to train:
+#   actor_rollout_ref.rollout.val_kwargs.temperature=${train_temperature}
 "${PYTHON}" -m verl.trainer.dllm_main_ppo \
   algorithm.adv_estimator=grpo \
   +algorithm.name=${algorithm} \
@@ -241,7 +247,7 @@ echo "[INFO] PYTHON=${PYTHON}"
   actor_rollout_ref.actor.entropy_coeff=0.0 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
   actor_rollout_ref.actor.loss_agg_mode=token-mean \
-  actor_rollout_ref.model.enable_gradient_checkpointing=False \
+  actor_rollout_ref.model.enable_gradient_checkpointing=${enable_gradient_checkpointing:-False} \
   ++actor_rollout_ref.model.enable_activation_offload=${enable_activation_offload} \
   actor_rollout_ref.model.trust_remote_code=True \
   +actor_rollout_ref.model.attn_implementation="flash_attention_2" \
@@ -269,11 +275,14 @@ echo "[INFO] PYTHON=${PYTHON}"
   actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
   actor_rollout_ref.rollout.n=${n_rollout} \
   actor_rollout_ref.rollout.temperature=${train_temperature} \
-  actor_rollout_ref.rollout.do_sample=True \
-  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-  actor_rollout_ref.rollout.val_kwargs.n=1 \
-  actor_rollout_ref.rollout.val_kwargs.temperature=${train_temperature} \
+  actor_rollout_ref.rollout.top_k=50 \
   actor_rollout_ref.rollout.top_p=1.0 \
+  actor_rollout_ref.rollout.do_sample=True \
+  actor_rollout_ref.rollout.val_kwargs.n=1 \
+  actor_rollout_ref.rollout.val_kwargs.temperature=0. \
+  actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+  actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=False \
   +actor_rollout_ref.rollout.val_kwargs.num_diffusion_steps=${val_num_diffusion_steps} \
   actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
   actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -289,6 +298,7 @@ echo "[INFO] PYTHON=${PYTHON}"
   trainer.project_name=${WANDB_PROJECT} \
   trainer.experiment_name=${exp_name} \
   trainer.val_before_train=${val_before_train} \
+  +trainer.val_only=False \
   trainer.n_gpus_per_node=${n_gpus_per_node} \
   trainer.nnodes=1 \
   trainer.default_local_dir=${ckpt_dir} \
