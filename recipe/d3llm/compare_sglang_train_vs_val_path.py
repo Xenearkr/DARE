@@ -150,6 +150,8 @@ def run_train_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
         "path": "train_per_sample",
         "sampling": per_call,
         "nfe": meta.get("nfe"),
+        "finish_reason": meta.get("finish_reason"),
+        "completion_tokens": meta.get("completion_tokens"),
         "raw": ids_stats(raw_ids, "raw"),
         "after_strip": ids_stats(stripped_ids, "after_strip"),
         "raw_text": tokenizer.decode(raw_ids, skip_special_tokens=True),
@@ -187,6 +189,8 @@ def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
         "path": "val_batch",
         "sampling": val_kwargs,
         "nfe": meta.get("nfe"),
+        "finish_reason": meta.get("finish_reason"),
+        "completion_tokens": meta.get("completion_tokens"),
         "raw": ids_stats(raw_ids, "raw"),
         "after_pad": ids_stats(padded_ids, "after_pad_no_strip"),
         "raw_text": tokenizer.decode(raw_ids, skip_special_tokens=True),
@@ -238,8 +242,8 @@ def main():
     }
 
     print("\n--- token stats ---")
-    print(json.dumps({"train": {k: train_r[k] for k in ("path", "sampling", "nfe", "raw", "after_strip")}}, indent=2))
-    print(json.dumps({"val": {k: val_r[k] for k in ("path", "sampling", "nfe", "raw", "after_pad")}}, indent=2))
+    print(json.dumps({"train": {k: train_r[k] for k in ("path", "sampling", "nfe", "finish_reason", "completion_tokens", "raw", "after_strip")}}, indent=2))
+    print(json.dumps({"val": {k: val_r[k] for k in ("path", "sampling", "nfe", "finish_reason", "completion_tokens", "raw", "after_pad")}}, indent=2))
     print(f"\ntrain_raw == val_raw text: {result['text_equal_raw']}")
     print(f"train_stripped == val_padded text: {result['text_equal_decoded']}")
 
