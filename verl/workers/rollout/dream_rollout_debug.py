@@ -274,9 +274,11 @@ def log_rollout_batch(
 
     log(
         f"[dream][RANK{rank}] batch_start step={step} mode={mode} "
-        f"n_samples={batch_size} dllm_decode={gen_kwargs.get('dllm_decode', 'entropy')} "
-        f"elapsed={elapsed_s:.2f}s"
+        f"n_prompts={prompt_bs} n_rollout={n_rollout} n_samples={batch_size} "
+        f"dllm_decode={gen_kwargs.get('dllm_decode', 'entropy')} elapsed={elapsed_s:.2f}s"
     )
+
+    per_sample_records: List[Dict[str, Any]] = []
 
     for i in range(batch_size):
         meta = sample_meta[i] if i < len(sample_meta) else {}
@@ -302,8 +304,10 @@ def log_rollout_batch(
         elif "error" in reward_info:
             n_errors += 1
 
+        rollout_idx = i % n_rollout if n_rollout else 0
         log(
-            f"[dream][RANK{rank}] sample[{i}] uid={uid} data_source={ds} "
+            f"[dream][RANK{rank}] sample[{i}] prompt_idx={i // n_rollout if n_rollout else i} "
+            f"rollout_idx={rollout_idx} uid={uid} data_source={ds} "
             f"{_format_reward_log_line(reward_info)}"
         )
         if reward_info.get("pred_preview"):
@@ -317,6 +321,57 @@ def log_rollout_batch(
             except Exception:
                 meta_str = str(reward_info["metadata"])
             log(f"[dream][RANK{rank}] sample[{i}] test_metadata: {truncate_text(meta_str, 800)}")
+
+        per_sample_records.append(
+            {
+                "i": i,
+                "prompt_idx": i // n_rollout if n_rollout else i,
+                "rollout_idx": rollout_idx,
+                "uid": uid,
+                "data_source": ds,
+                "reward_info": reward_info,
+            }
+        )
+
+    # Train: one line per prompt summarizing all n_rollout responses (e.g. 4/4 acc).
+    if n_rollout > 1 and mode == "train" and per_sample_records:
+        for pidx in range(prompt_bs):
+            group = [r for r in per_sample_records if r["prompt_idx"] == pidx]
+            if not group:
+                continue
+            g_rewards: List[float] = []
+            g_correct = 0
+            g_scored = 0
+            for r in group:
+                ri = r["reward_info"]
+                if ri.get("skipped") or "error" in ri:
+                    continue
+                g_scored += 1
+                rew = float(ri.get("reward", 0.0))
+                g_rewards.append(rew)
+                if ri.get("is_correct"):
+                    g_correct += 1
+            uid0 = group[0]["uid"]
+            ds0 = group[0]["data_source"]
+            if g_scored:
+                avg_r = sum(g_rewards) / len(g_rewards)
+                log(
+                    f"[dream][RANK{rank}] prompt_group step={step} mode={mode} "
+                    f"prompt_idx={pidx} uid={uid0} data_source={ds0} "
+                    f"n_rollout={len(group)} rollout_acc={g_correct}/{g_scored} "
+                    f"({100.0 * g_correct / g_scored:.1f}%) avg_reward={avg_r:.4f}"
+                )
+            else:
+                log(
+                    f"[dream][RANK{rank}] prompt_group step={step} mode={mode} "
+                    f"prompt_idx={pidx} uid={uid0} data_source={ds0} n_rollout={len(group)} (not scored)"
+                )
+            for r in group:
+                ri = r["reward_info"]
+                log(
+                    f"[dream][RANK{rank}]   rollout[{r['rollout_idx']}] sample[{r['i']}] "
+                    f"{_format_reward_log_line(ri)}"
+                )
 
     if n_scored:
         avg_reward = sum(rewards) / len(rewards)

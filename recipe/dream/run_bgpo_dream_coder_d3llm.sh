@@ -95,6 +95,8 @@ if [ "${smoke_test}" -eq 1 ]; then
   enable_gradient_checkpointing=False
   smoke_total_training_steps=1
   train_temperature=0.2
+  val_temperature=0.2
+  val_do_sample=True
   if [ "$engine" = "sglang" ]; then
     # Leave headroom on 48GB for FSDP state_dict + weight sync beside SGLang static pool.
     sglang_mem_fraction_static=0.32
@@ -119,9 +121,9 @@ else
   ppo_max_token_len_per_gpu=3072
   max_num_batched_tokens=6144
   val_batch_size=32
-  save_freq=50
-  test_freq=25
-  val_before_train=False
+  save_freq=40
+  test_freq=20
+  val_before_train=True
   total_epoch=5
   trainer_logger='["console","wandb"]'
   enable_gradient_checkpointing=True
@@ -149,8 +151,12 @@ num_diffusion_steps=${max_response_length}
 val_num_diffusion_steps=${max_response_length}
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1
-# Full train: 1.0 for BGPO rollout diversity (SDAR default). Smoke overrides to 0.2 above.
-train_temperature="${train_temperature:-1.0}"
+# Train rollout temperature (smoke block may override).
+train_temperature="${train_temperature:-0.2}"
+# HumanEval eval (aligned with train / smoke 143755).
+val_temperature="${val_temperature:-${train_temperature}}"
+val_top_p="${val_top_p:-1.0}"
+val_do_sample="${val_do_sample:-True}"
 
 n_gpus_per_node=$(echo "$CUDA_VISIBLE_DEVICES" | tr "," "\n" | wc -l)
 real_train_batch_size=$((batch_size * n_rollout))
@@ -163,7 +169,9 @@ if [ $((mc_num % n_l)) -ne 0 ]; then
   exit 1
 fi
 
-echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node}"
+echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node} train_temperature=${train_temperature}"
+echo "[INFO] HumanEval eval: temperature=${val_temperature} top_p=${val_top_p} do_sample=${val_do_sample}"
+echo "[INFO] W&B val metric: val-core/humaneval/acc/mean@1; val_before_train=${val_before_train}"
 echo "[INFO] Ensure Dream modeling files exist (once): bash recipe/d3llm/setup_finetune_d3llm_model_code.sh"
 
 ray stop --force || true
@@ -205,16 +213,14 @@ if [ "$engine" = "sglang" ]; then
   )
 fi
 
-# Isolate wandb from repo-root offline runs; force online when logger includes wandb.
-export WANDB_DIR="${WANDB_DIR:-${log_dir}/wandb}"
+# Per-run WANDB_DIR; force cloud sync when logger includes wandb (do not inherit offline).
+export WANDB_DIR="${log_dir}/wandb"
 mkdir -p "${WANDB_DIR}"
 if [[ "${trainer_logger}" == *wandb* ]]; then
-  export WANDB_MODE="${WANDB_MODE:-online}"
+  export WANDB_MODE=online
 fi
 
 echo "[INFO] PYTHON=${PYTHON}"
-# Val greedy (train keeps train_temperature); previously aligned val to train:
-#   actor_rollout_ref.rollout.val_kwargs.temperature=${train_temperature}
 "${PYTHON}" -m verl.trainer.dllm_main_ppo \
   algorithm.adv_estimator=grpo \
   +algorithm.name=${algorithm} \
@@ -272,17 +278,17 @@ echo "[INFO] PYTHON=${PYTHON}"
   +actor_rollout_ref.rollout.mask_token_id=${mask_token_id} \
   +actor_rollout_ref.rollout.per_sample_seed=True \
   +actor_rollout_ref.rollout.rollout_verbose=True \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=${sglang_gpu_memory_utilization:-0.4} \
   actor_rollout_ref.rollout.n=${n_rollout} \
   actor_rollout_ref.rollout.temperature=${train_temperature} \
-  actor_rollout_ref.rollout.top_k=50 \
+  actor_rollout_ref.rollout.top_k=-1 \
   actor_rollout_ref.rollout.top_p=1.0 \
   actor_rollout_ref.rollout.do_sample=True \
   actor_rollout_ref.rollout.val_kwargs.n=1 \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0. \
-  actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+  actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
+  actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
   actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
-  actor_rollout_ref.rollout.val_kwargs.do_sample=False \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=${val_do_sample} \
   +actor_rollout_ref.rollout.val_kwargs.num_diffusion_steps=${val_num_diffusion_steps} \
   actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
   actor_rollout_ref.rollout.enable_chunked_prefill=False \
