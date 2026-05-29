@@ -41,7 +41,6 @@ class DLLMRewardManager(DAPORewardManager):
         overlong_buffer_cfg=None,
         enable_tpf_efficiency: bool = False,
         tpf_efficiency_coef: float = 0.1,
-        tpf_baseline_ema_alpha: float = 0.1,
         tpf_baseline_initial: float = 2.0,
         tpf_efficiency_max_bonus: float = 0.25,
         tpf_efficiency_max_penalty: float = 0.25,
@@ -58,7 +57,6 @@ class DLLMRewardManager(DAPORewardManager):
             TpfEfficiencyConfig(
                 enable=enable_tpf_efficiency,
                 coef=tpf_efficiency_coef,
-                ema_alpha=tpf_baseline_ema_alpha,
                 initial_baseline=tpf_baseline_initial,
                 max_bonus=tpf_efficiency_max_bonus,
                 max_penalty=tpf_efficiency_max_penalty,
@@ -146,8 +144,6 @@ class DLLMRewardManager(DAPORewardManager):
         passed_tpfs = [
             row["tpf"] for row in decoded if row["tpf"] > 0 and self._result_acc(row["result"])
         ]
-        for tpf in passed_tpfs:
-            self._tpf_tracker.observe_passed(tpf)
         baseline = self._tpf_tracker.baseline
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
@@ -223,6 +219,9 @@ class DLLMRewardManager(DAPORewardManager):
                 print("[efficiency_reward]", efficiency_reward)
                 print("[reward]", score)
                 print("[tpf]", row["tpf"], "baseline", baseline, "nfe", row["nfe"])
+
+        for tpf in passed_tpfs:
+            self._tpf_tracker.observe_passed(tpf)
 
         if return_dict:
             return {

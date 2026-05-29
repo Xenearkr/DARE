@@ -250,7 +250,6 @@ echo "[INFO] PYTHON=${PYTHON}"
   +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
   +reward_model.reward_kwargs.enable_tpf_efficiency=True \
   +reward_model.reward_kwargs.tpf_efficiency_coef=0.1 \
-  +reward_model.reward_kwargs.tpf_baseline_ema_alpha=0.1 \
   +reward_model.reward_kwargs.tpf_baseline_initial=2.0 \
   data.train_files="${train_files}" \
   data.val_files="${val_files}" \

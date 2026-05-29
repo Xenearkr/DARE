@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 
 def normalize_rollout_nfe(nfe: Any) -> int:
@@ -27,33 +27,34 @@ def compute_tpf(gen_tokens: int, nfe: int) -> float:
 class TpfEfficiencyConfig:
     enable: bool = False
     coef: float = 0.1
-    ema_alpha: float = 0.1
     initial_baseline: float = 2.0
     max_bonus: float = 0.25
     max_penalty: float = 0.25
 
 
 class TpfBaselineTracker:
-    """EMA baseline updated only from **passed** samples."""
+    """Arithmetic-mean baseline over **passed** samples seen so far in training."""
 
     def __init__(self, cfg: TpfEfficiencyConfig):
         self.cfg = cfg
-        self._ema: Optional[float] = None
+        self._sum: float = 0.0
+        self._count: int = 0
 
     @property
     def baseline(self) -> float:
-        if self._ema is not None and self._ema > 0:
-            return self._ema
+        if self._count > 0:
+            return self._sum / self._count
         return max(self.cfg.initial_baseline, 1e-6)
+
+    @property
+    def num_observations(self) -> int:
+        return self._count
 
     def observe_passed(self, tpf: float) -> None:
         if tpf <= 0:
             return
-        if self._ema is None:
-            self._ema = tpf
-        else:
-            a = self.cfg.ema_alpha
-            self._ema = a * tpf + (1.0 - a) * self._ema
+        self._sum += tpf
+        self._count += 1
 
     def efficiency_reward(self, tpf: float, *, passed: bool) -> float:
         if not self.cfg.enable or not passed or tpf <= 0:
