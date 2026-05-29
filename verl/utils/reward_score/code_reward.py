@@ -17,34 +17,66 @@ from .code_utils.humanevalplus import run_test as humanevalplus_run_test
 from .code_utils.livecodebench import run_test as lcb_run_test
 from .code_utils.opencompass_evaluator import HumanEvalEvaluator, HumanEvalPlusEvaluator, MBPPEvaluator
 
+_FENCED_BLOCK_RE = re.compile(r"```(?:\w+)?\s*\n?(.*?)```", re.DOTALL)
+_OPENING_FENCE_RE = re.compile(r"^```(?:\w+)?\s*\n?(.*)$", re.DOTALL)
+_PYTHON_DEF_RE = re.compile(r"def\s+\w+\s*\(")
+
+
+def _pick_best_code_block(code_blocks: list[str]) -> str:
+    blocks = [b.strip() for b in code_blocks if b and b.strip()]
+    if not blocks:
+        return ""
+    if len(blocks) == 1:
+        return blocks[0]
+    for block in blocks:
+        if _PYTHON_DEF_RE.search(block):
+            return block
+    return blocks[-1]
+
+
+def _extract_evalplus_completion(text: str) -> str | None:
+    """EvalPlus instruct: opening ```python is in the prompt; response is a continuation."""
+    body = text.strip()
+    if not body:
+        return None
+
+    if body.endswith("```"):
+        body = body[: body.rfind("```")].rstrip()
+
+    # Drop trailing markdown close when model repeats the fence without an opener.
+    if _PYTHON_DEF_RE.search(body) or re.search(r"^(from|import)\s+\w+", body, re.MULTILINE):
+        return body.strip()
+    return None
+
 
 def extract_code_from_model(model_response: str):
     """
-    Extracts the code from a Markdown-style code block in an LLM output.
-    Prioritizes code blocks that contain function definitions.
+    Extract Python code from an LLM response.
 
-    Parameters:
-        model_response (str): The text output from the LLM.
-
-    Returns:
-        str: The extracted code, or an empty string if no code block is found.
+    Supports:
+    - Full markdown fences in the response (```python ... ```)
+    - EvalPlus/Dream-Coder instruct continuations (fence opened in prompt; response
+      is raw code, optionally with a trailing ``` only)
     """
-    code_blocks = re.findall(r"```(?:\w+)?\s*\n(.*?)```", model_response, re.DOTALL)  # TODO: Allow empty characters after ```python
-    if not code_blocks:
+    if not model_response or not model_response.strip():
         return None
-    
-    # If there's only one code block, return it
-    if len(code_blocks) == 1:
-        return code_blocks[0].strip()
-    
-    # Find the code block that contains function definitions
-    for block in code_blocks:
-        block = block.strip()
-        if re.search(r"def\s+\w+\s*\(", block):
-            return block
-    
-    # If no function blocks found, return the last block
-    return code_blocks[-1].strip()
+
+    text = model_response.strip()
+    code_blocks = _FENCED_BLOCK_RE.findall(text)
+    if code_blocks:
+        picked = _pick_best_code_block(code_blocks)
+        return picked or None
+
+    opening = _OPENING_FENCE_RE.match(text)
+    if opening:
+        picked = _pick_best_code_block([opening.group(1)])
+        return picked or None
+
+    completion = _extract_evalplus_completion(text)
+    if completion:
+        return completion
+
+    return None
 
 
 def extract_code_from_model_mbpp(model_response: str):
@@ -420,7 +452,13 @@ class RewardCodeFn:
 
         if tests is None:
             print("No tests found in task_info")
-            return dict(reward=self.config.format_error_reward, is_correct=False, metadata={"error": "No tests found in task_info"}, pred="")
+            return dict(
+                reward=self.config.format_error_reward,
+                pass_reward=self.config.format_error_reward,
+                is_correct=False,
+                metadata={"error": "No tests found in task_info"},
+                pred="",
+            )
 
         if dataset_name == "mbpp":
             model_code = extract_code_from_model_mbpp(model_response)
@@ -430,7 +468,13 @@ class RewardCodeFn:
             
         if model_code is None:
             # print("No code found in model response")
-            return dict(reward=self.config.format_error_reward, is_correct=False, metadata={"error": "No code found in model response"}, pred="")
+            return dict(
+                reward=self.config.format_error_reward,
+                pass_reward=self.config.format_error_reward,
+                is_correct=False,
+                metadata={"error": "No code found in model response"},
+                pred="",
+            )
 
         # Tests: List[Dictionary] - Codeforces, LiveCodeBench
         # Tests: Dictionary[Lists] - CodeContests, Taco/Apps
@@ -490,9 +534,22 @@ class RewardCodeFn:
         # print(f"Total reward function execution time: {total_time:.2f} seconds")
 
         if is_correct:
-            return dict(reward=self.config.correct_reward, is_correct=True, metadata=test_details, pred=model_code)
-        else:
-            return dict(reward=self.config.incorrect_reward, is_correct=False, metadata=test_details, pred=model_code)
+            pass_reward = self.config.correct_reward
+            return dict(
+                reward=pass_reward,
+                pass_reward=pass_reward,
+                is_correct=True,
+                metadata=test_details,
+                pred=model_code,
+            )
+        pass_reward = self.config.incorrect_reward
+        return dict(
+            reward=pass_reward,
+            pass_reward=pass_reward,
+            is_correct=False,
+            metadata=test_details,
+            pred=model_code,
+        )
 
 
 def rllm_reward_fn_code(data_source: str, llm_solution: str, ground_truth: dict, extra_info: dict):

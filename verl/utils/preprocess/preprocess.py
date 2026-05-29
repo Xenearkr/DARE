@@ -1,10 +1,17 @@
 import argparse
 import os
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 import pandas as pd
 import json
 import uuid
 import random
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT / "recipe" / "d3llm") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "recipe" / "d3llm"))
+from evalplus_prompt import format_evalplus_messages  # noqa: E402
 
 seed = 42
 random.seed(seed)
@@ -63,8 +70,8 @@ def process_single_example(example: Dict[str, Any], idx: int, data_source: str, 
                 "content": "[BEGIN]\n",
             },
         ]
-    elif data_source == "humaneval":
-        prompt_messages[0]["content"] = f"Complete the following python code:\n{question}"
+    elif data_source in ("humaneval", "humanevalplus"):
+        prompt_messages = format_evalplus_messages(question, include_assistant_prefix=True)
     
     data = {
         "data_source": data_source,

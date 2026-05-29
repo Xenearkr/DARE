@@ -1,4 +1,46 @@
+import numpy as np
+
 from verl.trainer.ppo.metric_utils import *
+
+
+def compute_reward_extra_metrics(batch) -> dict[str, float]:
+    """Aggregate pass_reward, reward, TPF and efficiency terms for W&B."""
+    nt = getattr(batch, "non_tensor_batch", None) or {}
+    metrics: dict[str, float] = {}
+
+    def _collect(key: str, prefix: str):
+        if key not in nt:
+            return
+        vals = np.asarray(nt[key], dtype=np.float64)
+        if vals.size == 0:
+            return
+        metrics[f"{prefix}/mean"] = float(np.mean(vals))
+        metrics[f"{prefix}/max"] = float(np.max(vals))
+        metrics[f"{prefix}/min"] = float(np.min(vals))
+
+    _collect("pass_reward", "pass_reward")
+    _collect("reward", "reward")
+    _collect("efficiency_reward", "efficiency_reward")
+    _collect("tpf", "tpf")
+    _collect("rollout_nfe", "rollout_nfe")
+    _collect("rollout_gen_tokens", "rollout_gen_tokens")
+    _collect("tpf_baseline", "tpf_baseline")
+
+    if "tpf" in nt and "acc" in nt:
+        tpf = np.asarray(nt["tpf"], dtype=np.float64)
+        acc = np.asarray(nt["acc"], dtype=np.float64)
+        passed = tpf[(acc > 0) & (tpf > 0)]
+        if passed.size > 0:
+            metrics["tpf_passed/mean"] = float(np.mean(passed))
+
+    if "rollout_nfe" in nt and "rollout_gen_tokens" in nt:
+        nfe = np.asarray(nt["rollout_nfe"], dtype=np.float64)
+        gen = np.asarray(nt["rollout_gen_tokens"], dtype=np.float64)
+        valid = (nfe > 0) & (gen > 0)
+        if np.any(valid):
+            metrics["rollout_tpf/mean"] = float(np.mean(gen[valid] / nfe[valid]))
+
+    return metrics
 
 
 def calc_pass_at_k(var_vals, k, n_bootstrap=10, seed=42):

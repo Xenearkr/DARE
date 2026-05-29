@@ -28,9 +28,13 @@ from torch import nn
 import re
 import time
 
+import numpy as np
+
 from verl.utils.fsdp_utils import fsdp_rollout_inference_context
 
 from verl import DataProto
+
+from verl.utils.torch_functional import get_response_mask
 
 from verl.workers.rollout.base import BaseRollout
 from .rollout_utils import execute_fastdream_generation
@@ -184,4 +188,18 @@ class FASTDLLMRollout(BaseRollout):
         total_time = time.time() - start_time
         print(f"[RANK{dist.get_rank()}] generate_sequences total time: {total_time:.2f}s")
 
-        return DataProto(batch=batch)
+        response_attention_mask = get_response_mask(
+            response_id=responses, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
+        rollout_gen_tokens = response_attention_mask.sum(dim=-1).cpu().numpy()
+        sample_nfes = gen_kwargs.get("_sample_nfes")
+        if not sample_nfes or len(sample_nfes) != total_batch_size:
+            sample_nfes = [0] * total_batch_size
+        non_tensor_batch = {}
+        src_nt = getattr(prompts, "non_tensor_batch", None) or {}
+        for key, val in src_nt.items():
+            non_tensor_batch[key] = np.repeat(val, n_rollout, axis=0)
+        non_tensor_batch["rollout_nfe"] = np.array(sample_nfes, dtype=np.int64)
+        non_tensor_batch["rollout_gen_tokens"] = rollout_gen_tokens.astype(np.int64)
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)

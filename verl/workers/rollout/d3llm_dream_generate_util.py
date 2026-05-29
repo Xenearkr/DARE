@@ -1227,6 +1227,7 @@ class DreamGenerationMixin:
             if rightmost_active_bid == 0:
                 if _FSDP_ROLLOUT_SYNC and dist.is_initialized() and dist.get_world_size() > 1:
                     _fsdp_dummy_forward(self, x.device)
+                if local_active:
                     continue
                 break
             
@@ -1285,6 +1286,7 @@ class DreamGenerationMixin:
             if forward_start_pos >= active_end:
                 if _FSDP_ROLLOUT_SYNC and dist.is_initialized() and dist.get_world_size() > 1:
                     _fsdp_dummy_forward(self, x.device)
+                if local_active:
                     continue
                 break
             

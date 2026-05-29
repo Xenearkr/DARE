@@ -27,6 +27,7 @@ from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh
 
 from verl import DataProto
+from verl.utils.reward_score.code_efficiency import normalize_rollout_nfe
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.rollout.dream_rollout_debug import (
     build_sample_meta,
@@ -517,6 +518,19 @@ class SGLangDreamRollout(SGLangRollout):
             response_id=response, eos_token=eos_token_id, dtype=attention_mask_repeat.dtype
         )
         attention_mask_out = torch.cat((attention_mask_repeat, response_attention_mask), dim=-1)
+
+        rollout_nfe = np.array(
+            [
+                normalize_rollout_nfe(
+                    (out.get("meta_info", {}) or {}).get("nfe") if isinstance(out, dict) else 0
+                )
+                for out in merged_output
+            ],
+            dtype=np.int64,
+        )
+        rollout_gen_tokens = response_attention_mask.sum(dim=-1).cpu().numpy().astype(np.int64)
+        _non_tensor_batch["rollout_nfe"] = rollout_nfe
+        _non_tensor_batch["rollout_gen_tokens"] = rollout_gen_tokens
 
         batch_tensors = {
             "prompts": idx_repeat,

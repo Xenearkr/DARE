@@ -3,7 +3,8 @@
 # model.name=dream (no d3llm_dream); path points to finetune_d3LLM weights.
 #
 # Usage:
-#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke [--engine hf|sglang]
+#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke              # default engine: sglang
+#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke --engine hf
 #   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --engine sglang
 set -euo pipefail
 set -x
@@ -36,7 +37,7 @@ fi
 
 smoke_test=0
 model_path=""
-engine=hf
+engine=sglang
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -75,17 +76,28 @@ enable_activation_offload=False
 if [ "${smoke_test}" -eq 1 ]; then
   # Override stale single-GPU env left by benchmark scripts (default smoke uses 4 GPUs).
   export CUDA_VISIBLE_DEVICES="${DARE_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-  train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet']"
-  val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
+  train_files="['data/preprocessed/rl/train/code_evalplus_mix_1.parquet']"
+  EVALPLUS_SMOKE_VAL_PARQUET="data/preprocessed/rl/test/humaneval_evalplus_smoke_8.parquet"
+  if [ ! -f "${EVALPLUS_SMOKE_VAL_PARQUET}" ]; then
+    echo "[INFO] Building smoke val subset (8 samples): ${EVALPLUS_SMOKE_VAL_PARQUET}"
+    "${PYTHON}" - <<'PY'
+import pandas as pd
+src = "data/preprocessed/rl/test/humaneval_evalplus_1.parquet"
+dst = "data/preprocessed/rl/test/humaneval_evalplus_smoke_8.parquet"
+pd.read_parquet(src).head(8).to_parquet(dst, index=False)
+print(f"wrote {dst}")
+PY
+  fi
+  val_files="['${EVALPLUS_SMOKE_VAL_PARQUET}']"
   max_prompt_length=1024
-  max_response_length=512
+  max_response_length=1024
   batch_size=4
   n_rollout=4
   mc_num=4
   n_l=4
   ppo_max_token_len_per_gpu=2048
   max_num_batched_tokens=4096
-  val_batch_size=8
+  val_batch_size=32
   save_freq=0
   # HumanEval before/after 1 train step: val_generations/0.jsonl (base) vs 1.jsonl (step1).
   test_freq=1
@@ -109,22 +121,22 @@ if [ "${smoke_test}" -eq 1 ]; then
   fi
 else
   # Full training (aligned with recipe/sdar/run_bgpo_sdar_8b_chat.sh sglang branch).
-  train_files="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
-  val_files="['data/preprocessed/rl/test/humaneval_1.parquet']"
+  train_files="['data/preprocessed/rl/train/code_evalplus_mix_1.parquet']"
+  val_files="['data/preprocessed/rl/test/humaneval_evalplus_1.parquet']"
   max_prompt_length=1024
   # Dream d3LLM multiblock: keep 512 (SDAR code full uses 1536; too costly per-sample here).
-  max_response_length=512
+  max_response_length=1024
   batch_size=8
-  n_rollout=4
-  mc_num=8
-  n_l=8
+  n_rollout=8
+  mc_num=16
+  n_l=16
   ppo_max_token_len_per_gpu=3072
   max_num_batched_tokens=6144
   val_batch_size=32
   save_freq=40
   test_freq=20
   val_before_train=True
-  total_epoch=5
+  total_epoch=2
   trainer_logger='["console","wandb"]'
   enable_gradient_checkpointing=True
   if [ "$engine" = "sglang" ]; then
@@ -173,6 +185,15 @@ echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node} train_
 echo "[INFO] HumanEval eval: temperature=${val_temperature} top_p=${val_top_p} do_sample=${val_do_sample}"
 echo "[INFO] W&B val metric: val-core/humaneval/acc/mean@1; val_before_train=${val_before_train}"
 echo "[INFO] Ensure Dream modeling files exist (once): bash recipe/d3llm/setup_finetune_d3llm_model_code.sh"
+EVALPLUS_TRAIN_PARQUET="data/preprocessed/rl/train/code_evalplus_mix_1.parquet"
+EVALPLUS_VAL_PARQUET="data/preprocessed/rl/test/humaneval_evalplus_1.parquet"
+if [[ ! -f "${EVALPLUS_TRAIN_PARQUET}" || ! -f "${EVALPLUS_VAL_PARQUET}" ]]; then
+  echo "[INFO] Building EvalPlus parquets: ${PYTHON} recipe/d3llm/build_evalplus_code_mix.py"
+  "${PYTHON}" recipe/d3llm/build_evalplus_code_mix.py || {
+    echo "[ERROR] Failed to build EvalPlus parquets."
+    exit 1
+  }
+fi
 
 ray stop --force || true
 rm -rf /tmp/ray 2>/dev/null || true
@@ -227,6 +248,10 @@ echo "[INFO] PYTHON=${PYTHON}"
   reward_model.reward_manager=dllm \
   +reward_model.reward_kwargs.overlong_buffer_cfg.enable=False \
   +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+  +reward_model.reward_kwargs.enable_tpf_efficiency=True \
+  +reward_model.reward_kwargs.tpf_efficiency_coef=0.1 \
+  +reward_model.reward_kwargs.tpf_baseline_ema_alpha=0.1 \
+  +reward_model.reward_kwargs.tpf_baseline_initial=2.0 \
   data.train_files="${train_files}" \
   data.val_files="${val_files}" \
   data.train_batch_size=${batch_size} \

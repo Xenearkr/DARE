@@ -2,6 +2,7 @@ import numpy as np
 from verl.trainer.ppo.ray_trainer import *
 from verl.trainer.ppo.ray_trainer import _timer
 from verl.trainer.ppo.dllm_metric_utils import (
+    compute_reward_extra_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.mdpo_algos import compute_step_wise_advantage, select_top_k_steps
@@ -71,12 +72,13 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
 
+            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
+
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
@@ -86,7 +88,10 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
 
             reward_extra_infos_dict["reward"].extend(scores)
             if "reward_extra_info" in result:
+                _skip_dup_keys = frozenset({"reward", "score"})
                 for key, lst in result["reward_extra_info"].items():
+                    if key in _skip_dup_keys:
+                        continue
                     reward_extra_infos_dict[key].extend(lst)
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
@@ -752,6 +757,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                 )
                 # collect metrics
                 if self.config.algorithm.name != "dtreerpo":
+                    metrics.update(compute_reward_extra_metrics(batch=batch))
                     metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                     metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                     # TODO: implement actual tflpo and theoretical tflpo

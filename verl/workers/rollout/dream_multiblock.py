@@ -271,6 +271,15 @@ def _run_multiblock(
     return _extract_sequences(out), nfe
 
 
+def _fsdp_sync_samples_barrier(module) -> None:
+    """Keep ranks on the same sample index inside fsdp_rollout_inference_context."""
+    try:
+        if dist.is_initialized() and dist.get_world_size() > 1 and fsdp_version(module) > 0:
+            dist.barrier()
+    except Exception:
+        pass
+
+
 def execute_dream_multiblock_generation(
     module,
     gen_kwargs: dict,
@@ -307,11 +316,20 @@ def execute_dream_multiblock_generation(
     )
     bind_multiblock(module, cfg=mb_cfg)
 
-    use_fsdp_sync = False
-    try:
-        use_fsdp_sync = dist.is_initialized() and dist.get_world_size() > 1 and fsdp_version(module) > 0
-    except Exception:
-        pass
+    # fast_dream_rollout wraps this in fsdp_rollout_inference_context, which unshards
+    # weights for independent per-rank forwards. Per-NFE dist.barrier sync deadlocks when
+    # ranks finish samples at different times: fast ranks hit the inference-context exit
+    # barrier while slow ranks are still inside NFE barriers.
+    use_fsdp_sync = bool(gen_kwargs.get("fsdp_rollout_sync", False))
+    if use_fsdp_sync:
+        try:
+            use_fsdp_sync = (
+                dist.is_initialized()
+                and dist.get_world_size() > 1
+                and fsdp_version(module) > 0
+            )
+        except Exception:
+            use_fsdp_sync = False
     set_fsdp_rollout_sync(use_fsdp_sync)
 
     device = idx_repeat.device
@@ -331,6 +349,7 @@ def execute_dream_multiblock_generation(
     max_nfe = gen_kwargs.get("max_nfe") or _estimate_max_nfe(gen_length, block_length)
 
     seq_list = []
+    sample_nfes: list[int] = []
     try:
         for i in range(batch_size):
             plen = int(prompt_lengths[i].item())
@@ -350,10 +369,13 @@ def execute_dream_multiblock_generation(
                 max_nfe=max_nfe,
             )
             total_nfe += nfe
+            sample_nfes.append(nfe)
             _log_sample_progress(i, batch_size, plen, "done", time.time() - t_sample, nfe)
             seq_list.append(_pad_sequences_to_length(seq, compact_target_len, pad_token_id))
+            _fsdp_sync_samples_barrier(module)
     finally:
         set_fsdp_rollout_sync(False)
+    gen_kwargs["_sample_nfes"] = sample_nfes
     compact_outputs = torch.cat(seq_list, dim=0)
 
     outputs = _restore_padded_outputs(

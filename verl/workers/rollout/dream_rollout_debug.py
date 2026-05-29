@@ -98,13 +98,12 @@ def truncate_text(text: str, max_chars: int = 1200) -> str:
 
 
 def extract_code_preview(text: str, max_chars: int = 800) -> str:
-    blocks = re.findall(r"```(?:\w+)?\s*\n(.*?)```", text, re.DOTALL)
-    if blocks:
-        code = blocks[0].strip()
-        if len(blocks) > 1:
-            code += f"\n... (+{len(blocks) - 1} more code blocks)"
+    from verl.utils.reward_score.code_reward import extract_code_from_model
+
+    code = extract_code_from_model(text)
+    if code:
         return truncate_text(code, max_chars)
-    return "(no ``` code block)"
+    return "(no extractable code)"
 
 
 def _unwrap_non_tensor_obj(value: Any) -> Any:

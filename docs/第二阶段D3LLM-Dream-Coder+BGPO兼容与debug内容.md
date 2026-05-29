@@ -229,3 +229,68 @@ bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --engine sglang
 ```
 
 更细的 open issue 与 HumanEval 分析见同目录 `d3llm-dream-*.md`。
+
+---
+
+## 11. 第一次全量 BGPO 训练复盘（效果不佳）
+
+> 日志目录：`logs/DARE/1st_try_dream-code-d3llm-bgpo-sglang-bsz8-n4-prompt1024-response512-bl32-lr5e-7-temp0.2-gpu4-20260527_164839/`  
+> 启动时间：2026-05-27 16:48；约训练至 step 380+（2 epoch 未完成即停止分析）。
+
+### 11.1 运行配置（与当前脚本差异大）
+
+| 项 | 第一次全量 | 当前推荐（2026-05-29 后） |
+|----|-----------|---------------------------|
+| 训练数据 | `lcbv5-K8_1` + `primeintellect-K8_1` + `taco-K8_1`（1816 行，**非 EvalPlus prompt 格式**） | `code_evalplus_mix_1.parquet`（811 行，EvalPlus 续写格式） |
+| 验证数据 | `humaneval_1.parquet`（**非 EvalPlus+**） | `humaneval_evalplus_1.parquet` |
+| `batch_size × n_rollout` | 8 × 8 = 64 | 8 × 8（全量）/ smoke 4 × 4 |
+| `max_response_length` | 512 | 1024（全量/smoke 均已拉长） |
+| `use_kl_loss` | **False** | 待试 True（coef 0.005–0.01） |
+| TPF 效率奖励 | 无 | 有（见 `docs/d3llm-dream-tpf-reward与联合监控.md`） |
+| 代码提取 | 旧逻辑（EvalPlus 续写易 `pred=""`） | 已修 `extract_code_from_model` |
+
+引擎：SGLang + `FullAttnMultiBlock`；`train_temperature=0.2`，`val_temperature=0.2`，`val_do_sample=True`；`lr=5e-7`；`test_freq=20`。
+
+### 11.2 HumanEval `val-core/acc/mean@1` 曲线
+
+| Step | Acc | 备注 |
+|------|-----|------|
+| 0 | **59.1%** | 训练前基线 |
+| 40 | 64.0% | 前期缓升 |
+| 60 | 65.2% | |
+| **120** | **67.1%** | **峰值** |
+| 140–200 | 62–65% | 平台震荡 |
+| 240 | 59.8% | 开始回落 |
+| 280 | 60.4% | |
+| 300–340 | **54.9%** | 明显下跌 |
+| 360 | 57.3% | 略反弹 |
+| **380** | **53.0%** | 低于 step 0 |
+
+**结论**：acc 先升后跌，step 120 后长期低于峰值，step 300+ 跌破训练前基线；不能视为有效收敛。
+
+### 11.3 问题归因（按优先级）
+
+1. **训练/验证任务错配**  
+   训练集为旧 taco/lcbv5/primeintellect 填空/补全风格，验证为 HumanEval；模型在训练分布上学到的格式与评测不一致，泛化上限受限。
+
+2. **评测集与提取 bug**  
+   使用 `humaneval_1` 而非 EvalPlus+；且当时 `extract_code_from_model` 对「prompt 已含开围栏、response 仅尾部闭围栏」的 EvalPlus 续写提取失败，部分样本 `pred=""` 被判 0 分（smoke 修复后 step0 25%→100% 即证）。
+
+3. **无 KL 锚定 + BGPO 随机 mask**  
+   `use_kl_loss=False`，ELBO 与 multiblock 块解码目标不对齐，易出现「acc 略升但解码置信度/TPF 下降」的退化（见 TPF 文档）。
+
+4. **仅优化 pass/fail 二元奖励**  
+   未约束 tokens-per-forward（TPF），模型可能用更多 NFE 换略高的 pass rate，实际推理效率变差。
+
+5. **非 infra 问题**  
+   双 nfe、val double rollout、FSDP 死锁等已在阶段 1–3 修掉；本次 run 能稳定跑完数百 step，瓶颈在 **数据 + 奖励 + 算法信号**，非 crash。
+
+### 11.4 后续改进方向（已部分落地）
+
+- [x] EvalPlus 混训数据 `code_evalplus_mix_1.parquet` + `humaneval_evalplus_*` 验证集  
+- [x] 代码提取修复（`code_reward.py`）  
+- [x] TPF 效率塑形 + W&B 联合监控 `pass_reward` / `reward` / `tpf`  
+- [ ] 尝试 `use_kl_loss=True` + 更低 val/train temperature（0.0）  
+- [ ] 全量重训并对比 acc **与** TPF 曲线  
+
+详细设计与实现见：**[d3llm-dream-tpf-reward与联合监控.md](./d3llm-dream-tpf-reward与联合监控.md)**。

@@ -119,10 +119,17 @@ def dllm_rm(data_source, solution_str, ground_truth, extra_info=None) -> dict:
         return res
     elif extra_info["task"] == "code":
         res = rllm_reward_fn_code(data_source, solution_str, ground_truth, extra_info)
+        pass_reward = float(res.get("pass_reward", res["reward"]))
         return {
             "score": res["reward"],
-            "acc": 1 if res["is_correct"] else 0,
-            "pred": res["pred"]
+            "pass_reward": pass_reward,
+            "efficiency_reward": float(res.get("efficiency_reward", 0.0)),
+            "acc": 1 if res.get("is_correct") else 0,
+            "pred": res.get("pred", ""),
+            "tpf": float(res.get("tpf", 0.0)),
+            "rollout_nfe": int(res.get("rollout_nfe", 0)),
+            "rollout_gen_tokens": int(res.get("rollout_gen_tokens", 0)),
+            "tpf_baseline": float(res.get("tpf_baseline", 0.0)),
         }
     else:
         raise ValueError(f"Unknown task type: {extra_info['task']}")
