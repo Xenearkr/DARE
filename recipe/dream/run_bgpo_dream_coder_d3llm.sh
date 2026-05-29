@@ -26,6 +26,11 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_OFFLINE=1
 export TORCHDYNAMO_DISABLE=1
 
+# Suppress known noisy third-party warnings in long training logs.
+export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO="${RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO:-0}"
+DARE_SUPPRESS_WARNINGS="ignore:pkg_resources is deprecated:UserWarning,ignore:The pynvml package is deprecated:FutureWarning"
+export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}${DARE_SUPPRESS_WARNINGS}"
+
 # Prefer active conda env (DARE); system python3 often lacks hydra/sglang deps.
 if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   PYTHON="${PYTHON:-${CONDA_PREFIX}/bin/python}"

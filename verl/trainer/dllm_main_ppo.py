@@ -41,6 +41,10 @@ def run_ppo(config) -> None:
                 "WANDB_RESUME": os.environ.get("WANDB_RESUME", "allow"),
                 "WANDB_MODE": os.environ.get("WANDB_MODE", "offline"),
                 "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+                "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": os.environ.get(
+                    "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO", "0"
+                ),
+                "PYTHONWARNINGS": os.environ.get("PYTHONWARNINGS", ""),
             }
         }
         for key in ("DREAM_ROLLOUT_VERBOSE", "DREAM_ROLLOUT_LOG_DIR", "D3LLM_ROLLOUT_VERBOSE", "D3LLM_ROLLOUT_LOG_DIR"):
