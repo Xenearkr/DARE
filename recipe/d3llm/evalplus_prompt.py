@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # d3LLM evalplus/prepare_instruct_prompts.py + provider/utility.py (run_code_eval.sh dream_coder)
 INSTRUCTION_PREFIX = (
@@ -20,7 +21,60 @@ MBPP_TASK_RE = re.compile(
     r"here is your task:\s*(.*?)\s*Your code should pass these tests:",
     re.DOTALL | re.IGNORECASE,
 )
+MBPP_TASK_AND_TESTS_RE = re.compile(
+    r"here is your task:\s*(.*?)\s*Your code should pass these tests:\s*(.*)",
+    re.DOTALL | re.IGNORECASE,
+)
 CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+
+def _mbpp_user_messages(prompt: Any) -> List[Dict[str, str]]:
+    return [m for m in _as_list(prompt) if m.get("role") == "user"]
+
+
+def extract_mbpp_task_and_tests(
+    row: Dict[str, Any],
+) -> Optional[Tuple[str, List[str]]]:
+    """Parse task text and assertion lines from the **last** MBPP user turn."""
+    users = _mbpp_user_messages(row.get("prompt"))
+    if not users:
+        return None
+
+    content = users[-1].get("content", "")
+    match = MBPP_TASK_AND_TESTS_RE.search(content)
+    if match:
+        task = match.group(1).strip()
+        tests = [ln.strip() for ln in match.group(2).splitlines() if ln.strip()]
+        if task and tests:
+            return task, tests
+
+    # Fallback: task from regex + tests from reward_model.ground_truth
+    task_only = MBPP_TASK_RE.search(content)
+    if not task_only:
+        return None
+    task = task_only.group(1).strip()
+    reward_model = row.get("reward_model") or {}
+    if hasattr(reward_model, "to_dict"):
+        reward_model = reward_model.to_dict()
+    gt = reward_model.get("ground_truth")
+    if gt is None:
+        return None
+    if isinstance(gt, str):
+        tests = json.loads(gt)
+    else:
+        tests = list(gt)
+    if not task or not tests:
+        return None
+    return task, [str(t).strip() for t in tests]
+
+
+def format_mbpp_evalplus_task_body(task: str, tests: List[str]) -> str:
+    """EvalPlus-style body with task + assertions (function names / arity)."""
+    task = task.strip()
+    if task and not task.endswith((".", "!", "?")):
+        task += "."
+    tests_block = "\n".join(t.strip() for t in tests if t.strip())
+    return f"{task}\n\nYour code should pass these tests:\n{tests_block}"
 
 
 def format_evalplus_user_content(task_body: str) -> str:
@@ -62,9 +116,11 @@ def extract_task_body_from_row(row: Dict[str, Any]) -> Optional[str]:
         return None
 
     if data_source == "mbpp":
-        for msg in reversed(prompt):
-            if msg.get("role") != "user":
-                continue
+        parsed = extract_mbpp_task_and_tests(row)
+        if parsed:
+            task, _tests = parsed
+            return task
+        for msg in reversed(_mbpp_user_messages(prompt)):
             content = msg.get("content", "")
             m = MBPP_TASK_RE.search(content)
             if m:
@@ -98,16 +154,27 @@ def extract_taco_codeblock(content: str) -> Optional[str]:
 def convert_row_to_evalplus(row: Dict[str, Any], *, index: int, split: str) -> Optional[Dict[str, Any]]:
     """Convert one RL parquet row to EvalPlus prompt format; preserve reward fields."""
     data_source = row.get("data_source", "")
-    task_body = extract_task_body_from_row(row)
-    if not task_body:
-        return None
-
     reward_model = row.get("reward_model")
     if hasattr(reward_model, "to_dict"):
         reward_model = reward_model.to_dict()
     extra_info = row.get("extra_info") or {}
     if hasattr(extra_info, "to_dict"):
         extra_info = extra_info.to_dict()
+
+    entry_point = None
+    if data_source == "mbpp":
+        parsed = extract_mbpp_task_and_tests(row)
+        if not parsed:
+            return None
+        task, tests = parsed
+        task_body = format_mbpp_evalplus_task_body(task, tests)
+        m = re.search(r"assert\s+(\w+)", tests[0])
+        if m:
+            entry_point = m.group(1)
+    else:
+        task_body = extract_task_body_from_row(row)
+        if not task_body:
+            return None
 
     new_row = {
         "data_source": data_source,
@@ -118,4 +185,6 @@ def convert_row_to_evalplus(row: Dict[str, Any], *, index: int, split: str) -> O
     new_row["extra_info"]["split"] = split
     new_row["extra_info"]["index"] = index
     new_row["extra_info"]["prompt_style"] = "evalplus"
+    if entry_point:
+        new_row["extra_info"]["entry_point"] = entry_point
     return new_row

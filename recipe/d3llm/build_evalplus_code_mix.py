@@ -169,6 +169,11 @@ def validate_row(row: Dict[str, Any], tokenizer=None) -> List[str]:
         errors.append("user content missing EvalPlus instruction prefix")
     if "```\n" not in user or user.rstrip().endswith("```") is False:
         errors.append("user content missing task ``` fence")
+    if row.get("data_source") == "mbpp":
+        if "Your code should pass these tests:" not in user:
+            errors.append("mbpp user content missing test assertions")
+        if "assert " not in user:
+            errors.append("mbpp user content missing assert lines")
     assistant = prompt[1].get("content", "")
     if "Below is a Python script" not in assistant or not assistant.endswith("```python\n"):
         errors.append("assistant content missing EvalPlus response prefix")
@@ -207,6 +212,56 @@ def validate_parquet(path: Path, tokenizer=None, sample: int = 5) -> None:
     print("  sample validation OK")
 
 
+def dump_review_samples(
+    rows: List[Dict[str, Any]],
+    out_path: Path,
+    *,
+    uids: Optional[List[int]] = None,
+    per_bucket: int = 2,
+) -> None:
+    """Write human-readable JSONL samples for manual review."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    selected: List[Dict[str, Any]] = []
+    if uids:
+        uid_set = set(uids)
+        for row in rows:
+            idx = (row.get("extra_info") or {}).get("index")
+            if idx in uid_set:
+                selected.append(row)
+    buckets: Dict[str, int] = {}
+    for row in rows:
+        if uids and (row.get("extra_info") or {}).get("index") in set(uids):
+            continue
+        bucket = (row.get("extra_info") or {}).get("mix_bucket", row.get("data_source", "?"))
+        if buckets.get(bucket, 0) >= per_bucket:
+            continue
+        selected.append(row)
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+
+    with out_path.open("w", encoding="utf-8") as f:
+        for row in selected:
+            prompt = _as_list(row.get("prompt"))
+            user = prompt[0]["content"] if prompt else ""
+            assistant = prompt[1]["content"] if len(prompt) > 1 else ""
+            gt = (row.get("reward_model") or {}).get("ground_truth")
+            f.write(
+                json.dumps(
+                    {
+                        "index": (row.get("extra_info") or {}).get("index"),
+                        "data_source": row.get("data_source"),
+                        "mix_bucket": (row.get("extra_info") or {}).get("mix_bucket"),
+                        "entry_point": (row.get("extra_info") or {}).get("entry_point"),
+                        "user_prompt": user,
+                        "assistant_prefix": assistant,
+                        "ground_truth_tests": gt,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    print(f"Wrote review samples: {out_path} ({len(selected)} rows)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build EvalPlus-aligned code RL parquets")
     parser.add_argument("--train-out", type=Path, default=DEFAULT_TRAIN_OUT)
@@ -214,6 +269,8 @@ def main() -> None:
     parser.add_argument("--competition-cap", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model-path", type=str, default="models/finetune_d3LLM")
+    parser.add_argument("--samples-out", type=Path, default=RL_DIR / "train" / "code_evalplus_mix_samples.jsonl")
+    parser.add_argument("--sample-uids", type=str, default="208,669,150,356,414")
     parser.add_argument("--skip-tokenizer-check", action="store_true")
     args = parser.parse_args()
 
@@ -240,6 +297,9 @@ def main() -> None:
 
     validate_parquet(args.val_out, tokenizer=tokenizer)
     validate_parquet(args.train_out, tokenizer=tokenizer)
+
+    sample_uids = [int(x.strip()) for x in args.sample_uids.split(",") if x.strip()]
+    dump_review_samples(train_rows, args.samples_out, uids=sample_uids, per_bucket=2)
 
     summary = {
         "train_out": str(args.train_out),

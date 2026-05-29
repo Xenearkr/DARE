@@ -169,9 +169,9 @@ val_num_diffusion_steps=${max_response_length}
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1
 # Train rollout temperature (smoke block may override).
-train_temperature="${train_temperature:-0.2}"
-# HumanEval eval (aligned with train / smoke 143755).
-val_temperature="${val_temperature:-${train_temperature}}"
+train_temperature="${train_temperature:-0.4}"
+# Keep validation slightly cooler for stable HumanEval monitoring.
+val_temperature="${val_temperature:-0.2}"
 val_top_p="${val_top_p:-1.0}"
 val_do_sample="${val_do_sample:-True}"
 
