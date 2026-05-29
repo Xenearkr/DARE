@@ -246,7 +246,7 @@ bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --engine sglang
 | `batch_size × n_rollout` | 8 × 8 = 64 | 8 × 8（全量）/ smoke 4 × 4 |
 | `max_response_length` | 512 | 1024（全量/smoke 均已拉长） |
 | `use_kl_loss` | **False** | 待试 True（coef 0.005–0.01） |
-| TPF 效率奖励 | 无 | 有（见 `docs/d3llm-dream-tpf-reward与联合监控.md`） |
+| TPF 效率奖励 | 无 | 有（见 [第三阶段文档](./第三阶段D3LLM-Dream-Coder-TPF效率奖励与联合监控.md)） |
 | 代码提取 | 旧逻辑（EvalPlus 续写易 `pred=""`） | 已修 `extract_code_from_model` |
 
 引擎：SGLang + `FullAttnMultiBlock`；`train_temperature=0.2`，`val_temperature=0.2`，`val_do_sample=True`；`lr=5e-7`；`test_freq=20`。
@@ -293,4 +293,4 @@ bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --engine sglang
 - [ ] 尝试 `use_kl_loss=True` + 更低 val/train temperature（0.0）  
 - [ ] 全量重训并对比 acc **与** TPF 曲线  
 
-详细设计与实现见：**[d3llm-dream-tpf-reward与联合监控.md](./d3llm-dream-tpf-reward与联合监控.md)**。
+详细设计与实现见：**[第三阶段D3LLM-Dream-Coder-TPF效率奖励与联合监控.md](./第三阶段D3LLM-Dream-Coder-TPF效率奖励与联合监控.md)**。
