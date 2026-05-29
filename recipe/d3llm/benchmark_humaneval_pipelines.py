@@ -51,6 +51,32 @@ if str(SGLANG_PYTHON) not in sys.path:
     sys.path.insert(0, str(SGLANG_PYTHON))
 
 PATHS = ("hf_val", "hf_train", "sglang_val", "sglang_train")
+MASK_TOKEN_ID = 151666
+
+
+def resolve_hf_path_specs(hf_paths: str, train_temperature: float) -> list[tuple[str, float]]:
+    """Map --hf-paths to (path_name, temperature) pairs."""
+    if hf_paths == "both":
+        return [("hf_val", 0.0), ("hf_train", train_temperature)]
+    if hf_paths == "train":
+        return [("hf_train", train_temperature)]
+    if hf_paths == "val":
+        return [("hf_val", 0.0)]
+    raise ValueError(f"Unknown hf_paths={hf_paths!r}")
+
+
+def resolve_hf_path_names(hf_paths: str) -> tuple[str, ...]:
+    return tuple(name for name, _ in resolve_hf_path_specs(hf_paths, train_temperature=0.0))
+
+
+def _count_response_tokens(resp_ids: list[int], pad_token_id: int) -> int:
+    """Non-pad response tokens (excludes trailing padding and unrevealed masks)."""
+    return sum(1 for tid in resp_ids if tid not in (pad_token_id, MASK_TOKEN_ID))
+
+
+def _tpf(gen_tokens: int, nfe: int) -> float:
+    """Tokens per forward pass (diffusion efficiency metric)."""
+    return round(gen_tokens / nfe, 4) if nfe > 0 else 0.0
 
 
 @dataclass
@@ -68,6 +94,7 @@ class WorkerArgs:
     shard_path: str
     hf_shard_path: str = ""
     only_sglang_val: bool = False
+    hf_paths: str = "both"
 
 
 def build_training_aligned_engine(model_path: Path, max_new_tokens: int, threshold: float, mem_fraction: float):
@@ -171,8 +198,15 @@ def run_hf_row(
         max_nfe,
     )
     resp_ids = out[0, plen:].tolist()
+    gen_tokens = _count_response_tokens(resp_ids, pad_token_id)
     text = tokenizer.decode(resp_ids, skip_special_tokens=True)
-    return {"text": text, "nfe": nfe, "temperature": temperature}
+    return {
+        "text": text,
+        "nfe": nfe,
+        "gen_tokens": gen_tokens,
+        "tpf": _tpf(gen_tokens, nfe),
+        "temperature": temperature,
+    }
 
 
 def score_humaneval(ground_truth: str, text: str) -> dict[str, Any]:
@@ -219,21 +253,33 @@ def hf_gpu_worker(wa: WorkerArgs) -> None:
 
     rows_out: list[dict[str, Any]] = []
     t0 = time.time()
+    path_specs = resolve_hf_path_specs(wa.hf_paths, wa.train_temperature)
+    primary_path = path_specs[0][0]
     hf_model = load_hf_model(model_path, device)
     try:
         for i, row in enumerate(wa.row_indices):
             gt = df.iloc[row]["reward_model"]["ground_truth"]
             prompt_ids, _ = load_prompt_ids(tokenizer, parquet, row, wa.max_prompt_length)
             entry: dict[str, Any] = {"row": row}
-            for path_name, temp in (("hf_val", 0.0), ("hf_train", wa.train_temperature)):
+            for path_name, temp in path_specs:
+                t_row = time.time()
                 gen = run_hf_row(hf_model, tokenizer, prompt_ids, wa.max_new_tokens, temp, pad_id)
                 entry[path_name] = {**gen, **score_humaneval(gt, gen["text"])}
+                print(
+                    f"[gpu{wa.gpu_rank}] row={row} {path_name} "
+                    f"pass={entry[path_name]['pass']} nfe={gen['nfe']} "
+                    f"gen_tokens={gen['gen_tokens']} tpf={gen['tpf']:.4f} "
+                    f"elapsed={time.time() - t_row:.1f}s",
+                    flush=True,
+                )
             rows_out.append(entry)
             if (i + 1) % 5 == 0 or i + 1 == len(wa.row_indices):
-                n_pass = sum(1 for e in rows_out if e.get("hf_val", {}).get("pass"))
+                n_pass = sum(1 for e in rows_out if e.get(primary_path, {}).get("pass"))
+                avg_tpf = sum(e.get(primary_path, {}).get("tpf", 0) for e in rows_out) / len(rows_out)
                 print(
                     f"[gpu{wa.gpu_rank}] HF {i + 1}/{len(wa.row_indices)} "
-                    f"hf_val_pass={n_pass}/{len(rows_out)} elapsed={time.time() - t0:.0f}s",
+                    f"{primary_path}_pass={n_pass}/{len(rows_out)} avg_tpf={avg_tpf:.4f} "
+                    f"elapsed={time.time() - t0:.0f}s",
                     flush=True,
                 )
     finally:
@@ -349,9 +395,24 @@ def run_phase(worker_fn, worker_args: list[WorkerArgs], phase_name: str, serial:
     time.sleep(2)
 
 
-def analyze(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _tpf_summary(rows: list[dict[str, Any]], path_name: str) -> dict[str, float]:
+    tpfs = [r[path_name]["tpf"] for r in rows if path_name in r and "tpf" in r[path_name]]
+    nfes = [r[path_name]["nfe"] for r in rows if path_name in r and "nfe" in r[path_name]]
+    if not tpfs:
+        return {}
+    return {
+        "mean": round(sum(tpfs) / len(tpfs), 4),
+        "min": round(min(tpfs), 4),
+        "max": round(max(tpfs), 4),
+        "mean_nfe": round(sum(nfes) / len(nfes), 2),
+    }
+
+
+def analyze(rows: list[dict[str, Any]], active_paths: tuple[str, ...] | None = None) -> dict[str, Any]:
+    paths = active_paths or PATHS
     n = len(rows)
-    pass_rates = {p: sum(1 for r in rows if r.get(p, {}).get("pass")) / n if n else 0.0 for p in PATHS}
+    pass_rates = {p: sum(1 for r in rows if r.get(p, {}).get("pass")) / n if n else 0.0 for p in paths}
+    tpf_stats = {p: _tpf_summary(rows, p) for p in paths if p.startswith("hf_")}
 
     def cross(a: str, b: str) -> dict[str, int]:
         both = a_only = b_only = neither = 0
@@ -389,7 +450,7 @@ def analyze(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
     verdict = []
     gap = pass_rates.get("hf_val", 0) - pass_rates.get("sglang_val", 0)
-    if gap > 0.15:
+    if "sglang_val" in pass_rates and gap > 0.15:
         verdict.append(
             f"主因：SGLang val 比 HF multiblock 低 {gap:.1%} "
             f"({pass_rates['hf_val']:.1%} vs {pass_rates['sglang_val']:.1%})，问题在 SGLang 解码/后处理。"
@@ -402,6 +463,7 @@ def analyze(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "n": n,
         "pass_at_1": pass_rates,
+        "tpf": tpf_stats,
         "cross_hf_val_vs_sglang_val": cross("hf_val", "sglang_val"),
         "cross_hf_val_vs_sglang_train": cross("hf_val", "sglang_train"),
         "cross_sglang_train_vs_val": cross("sglang_train", "sglang_val"),
@@ -431,6 +493,17 @@ def parse_args():
     )
     p.add_argument("--train-seed", type=int, default=42)
     p.add_argument("--output-json", type=Path, default=DEFAULT_OUT)
+    p.add_argument(
+        "--only-hf",
+        action="store_true",
+        help="Run HF multiblock only (skip SGLang phase)",
+    )
+    p.add_argument(
+        "--hf-paths",
+        choices=("both", "train", "val"),
+        default="both",
+        help="HF decode paths to run: both (default), train (hf_train T=train_temperature only), val",
+    )
     p.add_argument(
         "--only-sglang-val",
         action="store_true",
@@ -490,46 +563,62 @@ def main():
             mem_fraction_static=args.mem_fraction_static,
             train_seed=args.train_seed,
             only_sglang_val=args.only_sglang_val,
+            hf_paths=args.hf_paths,
         )
         if not args.only_sglang_val:
             hf_workers.append(WorkerArgs(**base, shard_path=hf_shard))
         elif not Path(hf_shard).is_file():
             raise FileNotFoundError(f"--only-sglang-val needs {hf_shard}")
-        sgl_workers.append(
-            WorkerArgs(**base, shard_path=final_shard, hf_shard_path=hf_shard)
-        )
+        if not args.only_hf:
+            sgl_workers.append(
+                WorkerArgs(**base, shard_path=final_shard, hf_shard_path=hf_shard)
+            )
 
     print(
         f"HumanEval benchmark: rows={len(all_rows)} ngpus={ngpus} "
-        f"mem_fraction={args.mem_fraction_static} only_sglang_val={args.only_sglang_val}",
+        f"mem_fraction={args.mem_fraction_static} only_hf={args.only_hf} "
+        f"hf_paths={args.hf_paths} only_sglang_val={args.only_sglang_val}",
         flush=True,
     )
     t0 = time.time()
 
     if not args.only_sglang_val:
         run_phase(hf_gpu_worker, hf_workers, "HF multiblock")
-    sgl_phase = "SGLang val (per-sample)" if args.only_sglang_val else "SGLang train/val"
-    if args.inprocess:
-        run_phase_inprocess(sglang_gpu_worker, sgl_workers, sgl_phase)
-    else:
-        run_phase(
-            sglang_gpu_worker,
-            sgl_workers,
-            sgl_phase,
-            serial=args.serial_sglang or args.only_sglang_val,
-        )
+    if not args.only_hf:
+        sgl_phase = "SGLang val (per-sample)" if args.only_sglang_val else "SGLang train/val"
+        if args.inprocess:
+            run_phase_inprocess(sglang_gpu_worker, sgl_workers, sgl_phase)
+        else:
+            run_phase(
+                sglang_gpu_worker,
+                sgl_workers,
+                sgl_phase,
+                serial=args.serial_sglang or args.only_sglang_val,
+            )
 
     merged: list[dict[str, Any]] = []
-    for wa in sgl_workers:
-        with open(wa.shard_path, encoding="utf-8") as f:
-            merged.extend(json.load(f))
+    if args.only_hf:
+        for wa in hf_workers:
+            with open(wa.shard_path, encoding="utf-8") as f:
+                merged.extend(json.load(f))
+    else:
+        for wa in sgl_workers:
+            with open(wa.shard_path, encoding="utf-8") as f:
+                merged.extend(json.load(f))
     merged.sort(key=lambda x: x["row"])
 
-    analysis = analyze(merged)
+    hf_active = resolve_hf_path_names(args.hf_paths)
+    if args.only_hf:
+        active_paths = hf_active
+    elif args.only_sglang_val:
+        active_paths = hf_active + ("sglang_val",)
+    else:
+        active_paths = hf_active + ("sglang_val", "sglang_train")
+    analysis = analyze(merged, active_paths=active_paths)
     report = {
         "config": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-        "paths": PATHS,
-        "sglang_val_per_sample_aligned": True,
+        "paths": list(active_paths),
+        "sglang_val_per_sample_aligned": not args.only_hf,
         "elapsed_s": round(time.time() - t0, 2),
         "analysis": analysis,
         "details": merged,
@@ -542,12 +631,18 @@ def main():
     print("\n--- pass@1 ---")
     for k, v in analysis["pass_at_1"].items():
         print(f"  {k}: {v:.1%}")
-    print("\n--- hf_val vs sglang_val ---")
-    print(json.dumps(analysis["cross_hf_val_vs_sglang_val"], indent=2))
-    print(f"\nhf_val pass & sglang_val fail: {analysis['hf_val_pass_sglang_val_fail_count']}")
-    print("\n--- 结论 ---")
-    for line in analysis["verdict_zh"]:
-        print(f"  • {line}")
+    if analysis.get("tpf"):
+        print("\n--- TPF (tokens per forward) ---")
+        for k, v in analysis["tpf"].items():
+            if v:
+                print(f"  {k}: mean={v['mean']:.4f} nfe_mean={v['mean_nfe']:.1f} (min={v['min']}, max={v['max']})")
+    if not args.only_hf:
+        print("\n--- hf_val vs sglang_val ---")
+        print(json.dumps(analysis["cross_hf_val_vs_sglang_val"], indent=2))
+        print(f"\nhf_val pass & sglang_val fail: {analysis['hf_val_pass_sglang_val_fail_count']}")
+        print("\n--- 结论 ---")
+        for line in analysis["verdict_zh"]:
+            print(f"  • {line}")
 
 
 if __name__ == "__main__":
