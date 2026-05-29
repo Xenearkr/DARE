@@ -111,7 +111,7 @@ PY
   trainer_logger='["console","wandb"]'
   enable_gradient_checkpointing=False
   smoke_total_training_steps=1
-  train_temperature=0.2
+  train_temperature=0.4
   val_temperature=0.2
   val_do_sample=True
   if [ "$engine" = "sglang" ]; then

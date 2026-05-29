@@ -127,6 +127,10 @@ def evaluate_code_reward(
     data_source: str,
     reward_model: Optional[Dict[str, Any]],
     extra_info: Optional[Dict[str, Any]] = None,
+    *,
+    rollout_nfe: Any = None,
+    rollout_gen_tokens: Optional[int] = None,
+    valid_response_length: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run the same code reward path as training (best-effort, never raises)."""
     reward_model = _as_mapping(reward_model)
@@ -139,6 +143,24 @@ def evaluate_code_reward(
     extra = dict(_as_mapping(extra_info) or {})
     extra.setdefault("task", "code")
 
+    rollout_stats: Dict[str, Any] = {}
+    if rollout_nfe is not None or rollout_gen_tokens is not None or valid_response_length is not None:
+        from verl.utils.reward_score.code_efficiency import compute_tpf, normalize_rollout_nfe
+
+        nfe = normalize_rollout_nfe(rollout_nfe if rollout_nfe is not None else extra.get("rollout_nfe", 0))
+        gen_tokens = rollout_gen_tokens if rollout_gen_tokens is not None else extra.get("rollout_gen_tokens")
+        if gen_tokens is None or int(gen_tokens) <= 0:
+            gen_tokens = int(valid_response_length or 0)
+        else:
+            gen_tokens = int(gen_tokens)
+        tpf = compute_tpf(gen_tokens, nfe)
+        rollout_stats = {
+            "rollout_nfe": nfe,
+            "rollout_gen_tokens": gen_tokens,
+            "tpf": tpf,
+        }
+        extra.update(rollout_stats)
+
     try:
         from verl.utils.reward_score import dllm_rm
 
@@ -149,11 +171,14 @@ def evaluate_code_reward(
             extra_info=extra,
         )
         if isinstance(result, dict):
+            metadata = {k: v for k, v in result.items() if k not in ("score", "acc", "pred")}
+            for key, value in rollout_stats.items():
+                metadata[key] = value
             return {
                 "reward": float(result.get("score", result.get("reward", 0.0))),
                 "is_correct": bool(result.get("acc", result.get("is_correct", False))),
                 "pred_preview": truncate_text(str(result.get("pred", "")), 600),
-                "metadata": {k: v for k, v in result.items() if k not in ("score", "acc", "pred")},
+                "metadata": metadata,
             }
         return {"reward": float(result), "is_correct": bool(result > 0)}
     except Exception as exc:
@@ -190,6 +215,8 @@ def build_sample_meta(
     indices = _repeat_field("index", None)
     raw_prompts = _repeat_field("raw_prompt", None)
     reward_models = _repeat_field("reward_model", None)
+    rollout_nfes = _repeat_field("rollout_nfe", 0)
+    rollout_gen_tokens = _repeat_field("rollout_gen_tokens", 0)
 
     for i in range(batch_size):
         extra = _as_mapping(extras[i]) or {}
@@ -216,6 +243,8 @@ def build_sample_meta(
                 "prompt_preview": prompt_preview,
                 "extra_info": extra,
                 "reward_model": _as_mapping(reward_models[i]),
+                "rollout_nfe": rollout_nfes[i],
+                "rollout_gen_tokens": rollout_gen_tokens[i],
             }
         )
     return meta_list
@@ -284,6 +313,7 @@ def log_rollout_batch(
         uid = meta.get("uid", meta.get("index", i))
         ds = meta.get("data_source", "?")
         response_ids = responses[i]
+        valid_len = responses[i].numel()
         if attention_mask is not None:
             valid_len = int(attention_mask[i, prompt_length:].sum().item())
             response_ids = response_ids[:valid_len]
@@ -294,6 +324,9 @@ def log_rollout_batch(
             data_source=ds,
             reward_model=meta.get("reward_model"),
             extra_info=meta.get("extra_info"),
+            rollout_nfe=meta.get("rollout_nfe"),
+            rollout_gen_tokens=meta.get("rollout_gen_tokens"),
+            valid_response_length=valid_len,
         )
         if not reward_info.get("skipped") and "error" not in reward_info:
             n_scored += 1
