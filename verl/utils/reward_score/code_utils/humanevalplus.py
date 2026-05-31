@@ -5,10 +5,10 @@ import sys
 from tempfile import TemporaryDirectory
 
 from .sandbox_guard import (
-    build_guarded_runner_script,
-    repo_root_for_imports,
+    guarded_solution_preamble,
     restore_shutil_rmtree,
     snapshot_shutil_rmtree,
+    write_standalone_guard_module,
 )
 from .utils import BASE_IMPORTS
 
@@ -48,10 +48,9 @@ def run_test(code, test: str = None, timeout=_DEFAULT_TIMEOUT_SECONDS):
     if not test:
         raise ValueError("No test provided.")
 
-    code_to_run = f"""
-{BASE_IMPORTS}
+    code_to_run = f"""{BASE_IMPORTS}
 
-{code}
+{guarded_solution_preamble()}{code}
 
 {test}
 
@@ -59,26 +58,18 @@ def run_test(code, test: str = None, timeout=_DEFAULT_TIMEOUT_SECONDS):
     saved_rmtree = snapshot_shutil_rmtree()
     try:
         with TemporaryDirectory() as tmpdir:
+            write_standalone_guard_module(tmpdir)
             solution_path = os.path.join(tmpdir, "solution.py")
-            with open(solution_path, "w") as f:
+            with open(solution_path, "w", encoding="utf-8") as f:
                 f.write(code_to_run)
 
-            env = os.environ.copy()
-            repo_root = repo_root_for_imports()
-            env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
-
-            command = [
-                sys.executable,
-                "-c",
-                build_guarded_runner_script(solution_path),
-            ]
+            command = [sys.executable, "solution.py"]
             try:
                 result = subprocess.run(
                     command,
                     cwd=tmpdir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    env=env,
                     check=False,
                     timeout=timeout,
                 )

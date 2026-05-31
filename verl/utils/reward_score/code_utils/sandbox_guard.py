@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import faulthandler
+import inspect
 import os
 import platform
 import shutil
@@ -81,6 +82,31 @@ def snapshot_shutil_rmtree() -> Callable[..., None]:
 def restore_shutil_rmtree(saved_rmtree: Callable[..., None]) -> None:
     if shutil.rmtree is None:
         shutil.rmtree = saved_rmtree
+
+
+def standalone_guard_module_source() -> str:
+    """Minimal guard module for subprocess execution (no verl/torch imports)."""
+    return (
+        "from typing import Optional\n"
+        "import faulthandler\n"
+        "import os\n"
+        "import platform\n"
+        "import shutil\n"
+        "import subprocess\n"
+        "import sys\n\n"
+        + inspect.getsource(reliability_guard)
+    )
+
+
+def guarded_solution_preamble() -> str:
+    return "import _sandbox_guard\n_sandbox_guard.reliability_guard()\n\n"
+
+
+def write_standalone_guard_module(tmpdir: str) -> str:
+    path = os.path.join(tmpdir, "_sandbox_guard.py")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(standalone_guard_module_source())
+    return path
 
 
 def repo_root_for_imports() -> str:

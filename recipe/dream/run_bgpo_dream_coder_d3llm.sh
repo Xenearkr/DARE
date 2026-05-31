@@ -135,11 +135,11 @@ else
   val_files="['data/preprocessed/rl/test/humaneval_evalplus_1.parquet']"
   max_prompt_length=1024
   # Dream d3LLM multiblock: keep 512 (SDAR code full uses 1536; too costly per-sample here).
-  max_response_length=1024
+  max_response_length=768
   batch_size=8
-  n_rollout=8
-  mc_num=16
-  n_l=16
+  n_rollout=4
+  mc_num=8
+  n_l=8
   ppo_max_token_len_per_gpu=3072
   max_num_batched_tokens=6144
   val_batch_size=32
