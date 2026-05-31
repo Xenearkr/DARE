@@ -3,8 +3,22 @@ import numpy as np
 from verl.trainer.ppo.metric_utils import *
 
 
+def configure_wandb_dllm_metrics(tracking) -> None:
+    """Group related DLLM training metrics into shared W&B panels."""
+    wandb = getattr(tracking, "logger", {}).get("wandb")
+    if wandb is None:
+        return
+    step = "training/global_step"
+    wandb.define_metric(step)
+    wandb.define_metric("rollout/*", step_metric=step)
+    wandb.define_metric("cfl/*", step_metric=step)
+    wandb.define_metric("pass_reward/*", step_metric=step)
+    wandb.define_metric("reward/*", step_metric=step)
+    wandb.define_metric("tpf/*", step_metric=step)
+
+
 def compute_reward_extra_metrics(batch) -> dict[str, float]:
-    """Aggregate pass_reward, reward, TPF and efficiency terms for W&B."""
+    """Aggregate pass_reward, reward, TPF and rollout decode stats for W&B."""
     nt = getattr(batch, "non_tensor_batch", None) or {}
     metrics: dict[str, float] = {}
 
@@ -22,8 +36,6 @@ def compute_reward_extra_metrics(batch) -> dict[str, float]:
     _collect("reward", "reward")
     _collect("efficiency_reward", "efficiency_reward")
     _collect("tpf", "tpf")
-    _collect("rollout_nfe", "rollout_nfe")
-    _collect("rollout_gen_tokens", "rollout_gen_tokens")
     _collect("tpf_baseline", "tpf_baseline")
 
     if "tpf" in nt and "acc" in nt:
@@ -33,12 +45,15 @@ def compute_reward_extra_metrics(batch) -> dict[str, float]:
         if passed.size > 0:
             metrics["tpf_passed/mean"] = float(np.mean(passed))
 
-    if "rollout_nfe" in nt and "rollout_gen_tokens" in nt:
+    # Shared W&B panel "rollout": nfe and gen_tokens as two series (no rollout_tpf).
+    if "rollout_nfe" in nt:
         nfe = np.asarray(nt["rollout_nfe"], dtype=np.float64)
+        if nfe.size > 0:
+            metrics["rollout/nfe"] = float(np.mean(nfe))
+    if "rollout_gen_tokens" in nt:
         gen = np.asarray(nt["rollout_gen_tokens"], dtype=np.float64)
-        valid = (nfe > 0) & (gen > 0)
-        if np.any(valid):
-            metrics["rollout_tpf/mean"] = float(np.mean(gen[valid] / nfe[valid]))
+        if gen.size > 0:
+            metrics["rollout/gen_tokens"] = float(np.mean(gen))
 
     return metrics
 

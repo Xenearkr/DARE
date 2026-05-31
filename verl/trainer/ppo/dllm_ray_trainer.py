@@ -2,6 +2,7 @@ import numpy as np
 from verl.trainer.ppo.ray_trainer import *
 from verl.trainer.ppo.ray_trainer import _timer
 from verl.trainer.ppo.dllm_metric_utils import (
+    configure_wandb_dllm_metrics,
     compute_reward_extra_metrics,
     process_validation_metrics,
 )
@@ -147,6 +148,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        configure_wandb_dllm_metrics(logger)
 
         self.global_steps = 0
 

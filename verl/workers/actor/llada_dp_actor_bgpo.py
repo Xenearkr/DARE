@@ -20,7 +20,7 @@ Single Process Actor
 import itertools
 import logging
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
@@ -28,7 +28,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.dllm_core_algos import agg_loss, compute_policy_loss_bgpo, kl_penalty  # NOTE: Our core algorithms
+from verl.trainer.ppo.dllm_core_algos import agg_loss, compute_cfl_loss, compute_policy_loss_bgpo, kl_penalty  # NOTE: Our core algorithms
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_name, get_torch_device, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -63,13 +63,25 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         self.n_l = config["n_l"]  # Number of random masks
         self.cfg_scale = config["cfg_scale"]  # Whether to use CFG
         
-    def _forward_micro_batch(self, micro_batch, temperature, n_l, mc_num, calculate_entropy=False, call_fn_name="") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(
+        self,
+        micro_batch,
+        temperature,
+        n_l,
+        mc_num,
+        calculate_entropy=False,
+        calculate_cfl=False,
+        cfl_temperature=0.5,
+        sample_keep_mask=None,
+        call_fn_name="",
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Calculate log_probs and entropy for micro_batch
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
             loss_per_sample: # (bs, mc_num)
+            cfl_loss: scalar tensor or None
         """
         batch_size, seq_length = micro_batch["input_ids"].size(0), micro_batch["input_ids"].size(-1)
         response_length = micro_batch["responses"].size(-1)
@@ -90,6 +102,7 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
             attention_mask = micro_batch["attention_mask"]  # (bs, mc_num, seq_len)
 
             loss_per_sample = torch.zeros((batch_size, mc_num), device=device)
+            cfl_losses = []
             for i in range(mc_num):
                 cur_perturbed_seq = perturbed_seq[:, i, :]  # (batch_size, seq_len)
                 cur_mask_indices = mask_indices[:, i, :]
@@ -109,15 +122,32 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                 logits = self._get_logits(model=self.actor_module, packed_input=packed_perturbed_seq, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, prompt_len=attention_mask[:, :prompt_length].sum(dim=1), cfg_scale=0.0, MASK_TOKEN_ID=self.MASK_TOKEN_ID)  # (1, total_seqlen)
                 
                 # Restore logits for each sample
+                batch_logits = []
                 for b in range(batch_size):
                     start, end = cu_seqlens[b], cu_seqlens[b + 1]
                     
                     logits_b = torch.zeros(seq_length, logits.size(-1), device=device, dtype=logits.dtype)
                     logits_b[attention_mask[b] == 1] = logits[0, start:end]
+                    batch_logits.append(logits_b)
                     
                     mask = cur_mask_indices[b]  # (seq_len,)
                     loss_per_sample[b, i] = - (F.cross_entropy(logits_b[mask], seq[b][mask], reduction="none") / cur_p_mask[b][mask]).sum()  
                     # cross_entropy returns negative log likelihood, - cross_entropy convert it to elbo
+
+                if calculate_cfl:
+                    logits_batch = torch.stack(batch_logits, dim=0)
+                    keep_mask = None
+                    if sample_keep_mask is not None:
+                        keep_mask = sample_keep_mask.to(device=device, dtype=torch.bool)
+                    cfl_losses.append(
+                        compute_cfl_loss(
+                            logits=logits_batch,
+                            labels=seq,
+                            masked_indices=cur_mask_indices,
+                            temperature=cfl_temperature,
+                            sample_keep_mask=keep_mask,
+                        )
+                    )
             log_likelihood = loss_per_sample.sum(dim=1) / mc_num # (batch_size,)
             log_prob = log_likelihood.unsqueeze(-1).expand(-1, response_length) # (batch_size, response_length)
             loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, -1, response_length).contiguous() # (batch_size, mc_num, response_length)
@@ -126,8 +156,12 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         if calculate_entropy:
             prob = log_prob.exp()
             entropy = -prob * log_prob  # (bs, mc_num, response_length) entropy of each token
+
+        cfl_loss = None
+        if calculate_cfl:
+            cfl_loss = torch.stack(cfl_losses).mean() if cfl_losses else loss_per_sample.sum() * 0.0
             
-        return entropy, log_prob, loss_per_sample
+        return entropy, log_prob, loss_per_sample, cfl_loss
     
     def _get_logits(self, model, packed_input, cu_seqlens, max_seqlen, prompt_len, cfg_scale=0.0, MASK_TOKEN_ID=126336):
         """
@@ -199,7 +233,7 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_prob, loss_per_sample = self._forward_micro_batch(micro_batch, temperature=temperature, n_l=self.n_l, mc_num=self.mc_num, calculate_entropy=calculate_entropy, call_fn_name="compute_log_prob")
+                entropy, log_prob, loss_per_sample, _ = self._forward_micro_batch(micro_batch, temperature=temperature, n_l=self.n_l, mc_num=self.mc_num, calculate_entropy=calculate_entropy, call_fn_name="compute_log_prob")
             log_prob_lst.append(log_prob)
             loss_per_sample_lst.append(loss_per_sample)
             if calculate_entropy:
@@ -227,6 +261,10 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "old_loss_per_sample", "advantages", "perturbed_seq", "mask_indices", "p_mask"]
+        if self.config.get("enable_cfl", False) and (
+            self.config.get("cfl_gate_passed_only", False) or self.config.get("cfl_gate_positive_adv_only", False)
+        ):
+            select_keys.append("token_level_scores")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -286,6 +324,21 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                     clip_ratio_c = self.config.get("clip_ratio_c", 3.0)
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
+                    enable_cfl = self.config.get("enable_cfl", False)
+                    cfl_coef = self.config.get("cfl_coef", 1.0)
+                    cfl_temperature = self.config.get("cfl_temperature", 0.5)
+                    cfl_gate_passed_only = self.config.get("cfl_gate_passed_only", False)
+                    cfl_gate_positive_adv_only = self.config.get("cfl_gate_positive_adv_only", False)
+
+                    sample_keep_mask = None
+                    if enable_cfl and (cfl_gate_passed_only or cfl_gate_positive_adv_only):
+                        if cfl_gate_passed_only:
+                            if "token_level_scores" not in data:
+                                raise KeyError("cfl_gate_passed_only requires token_level_scores in actor batch")
+                            sample_keep_mask = data["token_level_scores"].sum(dim=-1) > 0
+                        if cfl_gate_positive_adv_only:
+                            positive_adv = advantages.sum(dim=-1) > 0
+                            sample_keep_mask = positive_adv if sample_keep_mask is None else (sample_keep_mask & positive_adv)
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
@@ -297,6 +350,7 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                     accumulated_pg_clipfrac = 0.0
                     accumulated_ppo_kl = 0.0
                     accumulated_pg_clipfrac_lower = 0.0
+                    accumulated_cfl_loss = 0.0
                     
                     input_ids = data["input_ids"]
                     perturbed_seq = data["perturbed_seq"]  # (1, mc_num, seq_len)
@@ -310,7 +364,17 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                             "mask_indices": mask_indices[:, i:i+1],
                             "p_mask": p_mask[:, i:i+1],
                         }
-                        entropy, log_prob, loss_per_example = self._forward_micro_batch(micro_batch=data, temperature=temperature, n_l=1, mc_num=1, calculate_entropy=calculate_entropy, call_fn_name="update_policy")
+                        entropy, log_prob, loss_per_example, cfl_loss = self._forward_micro_batch(
+                            micro_batch=data,
+                            temperature=temperature,
+                            n_l=1,
+                            mc_num=1,
+                            calculate_entropy=calculate_entropy,
+                            calculate_cfl=enable_cfl,
+                            cfl_temperature=cfl_temperature,
+                            sample_keep_mask=sample_keep_mask,
+                            call_fn_name="update_policy",
+                        )
                         print(f"\nloss_per_sample: {loss_per_example[0, 0, 0]}")
                         
                         # Compute policy loss
@@ -333,6 +397,10 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
                             policy_loss = pg_loss
+
+                        if enable_cfl and cfl_loss is not None:
+                            policy_loss = policy_loss + cfl_coef * cfl_loss
+                            accumulated_cfl_loss += cfl_loss.detach().item()
 
                         if self.config.use_kl_loss:  # NOTE: Currently not considering KL
                             ref_log_probs = data["ref_log_probs"]
@@ -364,6 +432,9 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                         "actor/ppo_kl": accumulated_ppo_kl / mc_num,
                         "actor/pg_clipfrac_lower": accumulated_pg_clipfrac_lower / mc_num,
                     }
+                    if enable_cfl:
+                        data["actor/cfl_loss"] = accumulated_cfl_loss / mc_num
+                        data["actor/cfl_coef"] = cfl_coef
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()  # Update gradients after each mini-batch

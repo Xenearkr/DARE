@@ -15,6 +15,33 @@
 from verl.trainer.ppo.core_algos import *
 import random
 from accelerate.utils import set_seed
+import torch.nn.functional as F
+
+
+def compute_cfl_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    masked_indices: torch.Tensor,
+    temperature: float = 0.5,
+    sample_keep_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Certainty-Forcing Loss (d3LLM distill): minimize entropy on masked, correct tokens."""
+    if sample_keep_mask is not None:
+        masked_indices = masked_indices & sample_keep_mask.unsqueeze(-1)
+
+    if masked_indices.sum().item() == 0:
+        return logits.sum() * 0.0
+
+    logits_f = logits.float()
+    probs = F.softmax(logits_f / temperature, dim=-1)
+    token_entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)
+    pred_ids = logits_f.argmax(dim=-1)
+    correct_mask = (pred_ids == labels) & masked_indices
+
+    num_correct = correct_mask.sum()
+    if num_correct.item() == 0:
+        return logits.sum() * 0.0
+    return (token_entropy * correct_mask).sum() / num_correct.clamp_min(1)
 
 def compute_policy_loss_bgpo(
     old_l_theta,

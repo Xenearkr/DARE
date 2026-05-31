@@ -181,9 +181,22 @@ ppo_micro_batch_size_per_gpu=1
 # Train rollout temperature (smoke block may override).
 train_temperature="${train_temperature:-0.4}"
 # Keep validation slightly cooler for stable HumanEval monitoring.
-val_temperature="${val_temperature:-0.2}"
+val_temperature="${val_temperature:-0.0}"
 val_top_p="${val_top_p:-1.0}"
-val_do_sample="${val_do_sample:-True}"
+val_do_sample="${val_do_sample:-False}"
+
+# Certainty-Forcing Loss (d3LLM distill alignment)
+enable_cfl=True
+cfl_coef=1.0
+cfl_temperature=0.5
+cfl_gate_positive_adv_only=False
+if [ "${smoke_test}" -eq 1 ]; then
+  # Smoke: gate A — all rollout samples, verify plumbing and metrics.
+  cfl_gate_passed_only=False
+else
+  # Full: gate B — only passed rollouts (requires token_level_scores).
+  cfl_gate_passed_only=True
+fi
 
 n_gpus_per_node=$(echo "$CUDA_VISIBLE_DEVICES" | tr "," "\n" | wc -l)
 real_train_batch_size=$((batch_size * n_rollout))
@@ -197,6 +210,7 @@ if [ $((mc_num % n_l)) -ne 0 ]; then
 fi
 
 echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node} train_temperature=${train_temperature}"
+echo "[INFO] CFL: enable=${enable_cfl} coef=${cfl_coef} temperature=${cfl_temperature} gate_passed=${cfl_gate_passed_only}"
 echo "[INFO] HumanEval eval: max_response=${max_response_length} temperature=${val_temperature} top_p=${val_top_p} do_sample=${val_do_sample}"
 echo "[INFO] W&B val metric: val-core/humaneval/acc/mean@1; val_before_train=${val_before_train}"
 echo "[INFO] Ensure Dream modeling files exist (once): bash recipe/d3llm/setup_finetune_d3llm_model_code.sh"
@@ -286,6 +300,11 @@ echo "[INFO] PYTHON=${PYTHON}"
   actor_rollout_ref.actor.kl_loss_coef=0.0 \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
   actor_rollout_ref.actor.entropy_coeff=0.0 \
+  +actor_rollout_ref.actor.enable_cfl=${enable_cfl} \
+  +actor_rollout_ref.actor.cfl_coef=${cfl_coef} \
+  +actor_rollout_ref.actor.cfl_temperature=${cfl_temperature} \
+  +actor_rollout_ref.actor.cfl_gate_passed_only=${cfl_gate_passed_only} \
+  +actor_rollout_ref.actor.cfl_gate_positive_adv_only=${cfl_gate_positive_adv_only} \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
   actor_rollout_ref.actor.loss_agg_mode=token-mean \
   actor_rollout_ref.model.enable_gradient_checkpointing=${enable_gradient_checkpointing:-False} \
