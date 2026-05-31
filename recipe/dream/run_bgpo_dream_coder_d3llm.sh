@@ -187,7 +187,7 @@ val_do_sample="${val_do_sample:-False}"
 
 # Certainty-Forcing Loss (d3LLM distill alignment)
 enable_cfl=True
-cfl_coef=1.0
+cfl_coef=0.5
 cfl_temperature=0.5
 cfl_gate_positive_adv_only=False
 if [ "${smoke_test}" -eq 1 ]; then

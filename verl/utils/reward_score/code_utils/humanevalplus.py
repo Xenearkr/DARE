@@ -6,8 +6,7 @@ from tempfile import TemporaryDirectory
 
 from .sandbox_guard import (
     guarded_solution_preamble,
-    restore_shutil_rmtree,
-    snapshot_shutil_rmtree,
+    restore_guard_state,
     write_standalone_guard_module,
 )
 from .utils import BASE_IMPORTS
@@ -55,7 +54,6 @@ def run_test(code, test: str = None, timeout=_DEFAULT_TIMEOUT_SECONDS):
 {test}
 
 """
-    saved_rmtree = snapshot_shutil_rmtree()
     try:
         with TemporaryDirectory() as tmpdir:
             write_standalone_guard_module(tmpdir)
@@ -85,7 +83,7 @@ def run_test(code, test: str = None, timeout=_DEFAULT_TIMEOUT_SECONDS):
             except Exception as e:
                 return False, _ERROR_MSG_PREFIX + f"An Exception occurred in the code: {str(e)}"
     finally:
-        restore_shutil_rmtree(saved_rmtree)
+        restore_guard_state()
 
 
 # Backward-compatible re-export for callers/tests that import from humanevalplus.

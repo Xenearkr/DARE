@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import faulthandler
 import inspect
 import os
@@ -9,8 +10,64 @@ import platform
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Iterator, Optional
+
+_GUARD_OS_ATTRS = (
+    "kill",
+    "system",
+    "putenv",
+    "remove",
+    "removedirs",
+    "rmdir",
+    "fchdir",
+    "setuid",
+    "fork",
+    "forkpty",
+    "killpg",
+    "rename",
+    "renames",
+    "truncate",
+    "replace",
+    "unlink",
+    "fchmod",
+    "fchown",
+    "chmod",
+    "chown",
+    "chroot",
+    "lchflags",
+    "lchmod",
+    "lchown",
+    "getcwd",
+    "chdir",
+)
+_GUARD_SHUTIL_ATTRS = ("rmtree", "move", "chown")
+_GUARD_MODULE_KEYS = ("ipdb", "joblib", "resource", "psutil", "tkinter")
+_MISSING = object()
+
+
+def _get_os_attr(name: str) -> Any:
+    if hasattr(os, name):
+        return getattr(os, name)
+    return _MISSING
+
+
+def _capture_guard_state() -> dict[str, Any]:
+    return {
+        "builtins.exit": builtins.exit,
+        "builtins.quit": builtins.quit,
+        "builtins.help": builtins.help,
+        "subprocess.Popen": subprocess.Popen,
+        "faulthandler_enabled": faulthandler.is_enabled(),
+        "os.environ.OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"),
+        **{f"os.{name}": _get_os_attr(name) for name in _GUARD_OS_ATTRS},
+        **{f"shutil.{name}": getattr(shutil, name) for name in _GUARD_SHUTIL_ATTRS},
+        **{f"sys.modules.{name}": sys.modules.get(name) for name in _GUARD_MODULE_KEYS},
+    }
+
+
+_ORIGINAL_GUARD_STATE = _capture_guard_state()
 
 
 def reliability_guard(maximum_memory_bytes: Optional[int] = None) -> None:
@@ -24,8 +81,6 @@ def reliability_guard(maximum_memory_bytes: Optional[int] = None) -> None:
             resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
 
     faulthandler.disable()
-
-    import builtins
 
     builtins.exit = None
     builtins.quit = None
@@ -53,7 +108,6 @@ def reliability_guard(maximum_memory_bytes: Optional[int] = None) -> None:
     os.chmod = None
     os.chown = None
     os.chroot = None
-    os.fchdir = None
     os.lchflags = None
     os.lchmod = None
     os.lchown = None
@@ -66,7 +120,7 @@ def reliability_guard(maximum_memory_bytes: Optional[int] = None) -> None:
 
     subprocess.Popen = None  # type: ignore[assignment]
 
-    __builtins__["help"] = None
+    builtins.help = None
 
     sys.modules["ipdb"] = None
     sys.modules["joblib"] = None
@@ -75,19 +129,73 @@ def reliability_guard(maximum_memory_bytes: Optional[int] = None) -> None:
     sys.modules["tkinter"] = None
 
 
+def snapshot_guard_state() -> dict[str, Any]:
+    """Capture current process globals before applying reliability_guard()."""
+    return _capture_guard_state()
+
+
+def restore_guard_state(state: dict[str, Any] | None = None) -> None:
+    """Restore process globals mutated by reliability_guard()."""
+    saved = _ORIGINAL_GUARD_STATE if state is None else state
+
+    builtins.exit = saved["builtins.exit"]
+    builtins.quit = saved["builtins.quit"]
+    builtins.help = saved["builtins.help"]
+    subprocess.Popen = saved["subprocess.Popen"]
+
+    for name in _GUARD_OS_ATTRS:
+        original = saved[f"os.{name}"]
+        if original is _MISSING:
+            if hasattr(os, name):
+                delattr(os, name)
+        else:
+            setattr(os, name, original)
+    for name in _GUARD_SHUTIL_ATTRS:
+        setattr(shutil, name, saved[f"shutil.{name}"])
+
+    omp_threads = saved["os.environ.OMP_NUM_THREADS"]
+    if omp_threads is None:
+        os.environ.pop("OMP_NUM_THREADS", None)
+    else:
+        os.environ["OMP_NUM_THREADS"] = omp_threads
+
+    for name in _GUARD_MODULE_KEYS:
+        module_value = saved[f"sys.modules.{name}"]
+        if module_value is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module_value
+
+    if saved["faulthandler_enabled"]:
+        faulthandler.enable()
+    else:
+        faulthandler.disable()
+
+
+@contextmanager
+def guard_context() -> Iterator[None]:
+    """Apply reliability_guard() and always restore on exit."""
+    saved = snapshot_guard_state()
+    try:
+        reliability_guard()
+        yield
+    finally:
+        restore_guard_state(saved)
+
+
 def snapshot_shutil_rmtree() -> Callable[..., None]:
-    return shutil.rmtree
+    return _ORIGINAL_GUARD_STATE["shutil.rmtree"]
 
 
-def restore_shutil_rmtree(saved_rmtree: Callable[..., None]) -> None:
-    if shutil.rmtree is None:
-        shutil.rmtree = saved_rmtree
+def restore_shutil_rmtree(saved_rmtree: Callable[..., None] | None = None) -> None:
+    restore_guard_state()
 
 
 def standalone_guard_module_source() -> str:
     """Minimal guard module for subprocess execution (no verl/torch imports)."""
     return (
         "from typing import Optional\n"
+        "import builtins\n"
         "import faulthandler\n"
         "import os\n"
         "import platform\n"
