@@ -33,15 +33,18 @@ def compute_cfl_loss(
         return logits.sum() * 0.0
 
     logits_f = logits.float()
-    probs = F.softmax(logits_f / temperature, dim=-1)
-    token_entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)
-    pred_ids = logits_f.argmax(dim=-1)
-    correct_mask = (pred_ids == labels) & masked_indices
+    masked_logits = logits_f[masked_indices]
+    masked_labels = labels[masked_indices]
 
-    num_correct = correct_mask.sum()
-    if num_correct.item() == 0:
+    pred_ids = masked_logits.argmax(dim=-1)
+    correct = pred_ids == masked_labels
+    if correct.sum().item() == 0:
         return logits.sum() * 0.0
-    return (token_entropy * correct_mask).sum() / num_correct.clamp_min(1)
+
+    correct_logits = masked_logits[correct]
+    probs = F.softmax(correct_logits / temperature, dim=-1)
+    token_entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1)
+    return token_entropy.mean()
 
 def compute_policy_loss_bgpo(
     old_l_theta,

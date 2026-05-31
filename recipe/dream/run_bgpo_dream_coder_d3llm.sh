@@ -146,7 +146,7 @@ else
   save_freq=40
   test_freq=20
   val_before_train=True
-  total_epoch=2
+  total_epoch=1
   trainer_logger='["console","wandb"]'
   enable_gradient_checkpointing=True
   if [ "$engine" = "sglang" ]; then
