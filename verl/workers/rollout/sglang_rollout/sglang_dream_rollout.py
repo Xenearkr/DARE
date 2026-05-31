@@ -81,23 +81,65 @@ def _dream_stop_token_ids(
     return stops
 
 
+def _evalplus_fence_prefix_ids(tokenizer: "PreTrainedTokenizer") -> List[int]:
+    """Token ids for evalplus closing fence ``\\n```\\n`` (prefix match for truncate)."""
+    for text in ("\n```\n", "```\n"):
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if ids:
+            return ids
+    return []
+
+
+def _truncate_at_subseq(token_ids: List[int], needle: Sequence[int]) -> int:
+    """Return cut length at start of first ``needle`` occurrence, or len(token_ids)."""
+    if not needle or len(token_ids) < len(needle):
+        return len(token_ids)
+    n = len(needle)
+    for i in range(len(token_ids) - n + 1):
+        if list(token_ids[i : i + n]) == list(needle):
+            return i + n
+    return len(token_ids)
+
+
+def _count_decoded_gen_tokens(
+    token_ids: Sequence[int],
+    pad_token_id: int,
+    mask_token_id: int,
+    eos_token_ids: Set[int],
+) -> int:
+    """Count non-pad/non-mask tokens before first EOS (evalplus-style effective length)."""
+    count = 0
+    for tok in token_ids:
+        t = int(tok)
+        if t in eos_token_ids:
+            break
+        if t in (int(pad_token_id), int(mask_token_id)):
+            continue
+        count += 1
+    return count
+
+
 def _truncate_ids_like_sglang_stop(
     token_ids: List[int],
     stop_ids: Set[int],
     finish_reason: Optional[dict],
     opening_prefix_ids: Optional[List[int]],
+    fence_prefix_ids: Optional[List[int]] = None,
 ) -> List[int]:
     """Mirror ``output_ids_through_stop``: cut at first stop token; trim tail re-openings."""
     cut = len(token_ids)
     fr_type = (finish_reason or {}).get("type")
     if fr_type == "stop":
         # Engine already applied output_ids_through_stop.
-        return token_ids
+        cut = len(token_ids)
+    else:
+        for j, tok in enumerate(token_ids):
+            if int(tok) in stop_ids:
+                cut = j + 1
+                break
 
-    for j, tok in enumerate(token_ids):
-        if int(tok) in stop_ids:
-            cut = j + 1
-            break
+    if fence_prefix_ids:
+        cut = min(cut, _truncate_at_subseq(token_ids, fence_prefix_ids))
 
     # Train often ends with finish_reason=length (full max_new_tokens). Val ends earlier on pad.
     if opening_prefix_ids and len(opening_prefix_ids) >= 4:
@@ -116,6 +158,7 @@ def _finalize_dream_response_tensor(
     response_length: int,
     finish_reasons: Optional[List[Optional[dict]]] = None,
     opening_prefix_ids: Optional[List[int]] = None,
+    fence_prefix_ids: Optional[List[int]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Val path: no mask-strip; truncate at stop tokens then right-pad (same as parent SGLangRollout)."""
     from torch.nn.utils.rnn import pad_sequence
@@ -129,6 +172,7 @@ def _finalize_dream_response_tensor(
             stop_ids,
             fr,
             opening_prefix_ids,
+            fence_prefix_ids=fence_prefix_ids,
         )
         rows.append(
             torch.tensor(ids, dtype=response.dtype, device=response.device)
@@ -495,6 +539,8 @@ class SGLangDreamRollout(SGLangRollout):
             for out in merged_output
         ]
         response, rollout_log_probs = _post_process_outputs(self.tokenizer, merged_output)
+        fence_ids = _evalplus_fence_prefix_ids(self.tokenizer) if is_validate else None
+        opening_ids = None if is_validate else self._opening_prefix_ids()
         response, rollout_log_probs = _finalize_dream_response_tensor(
             response,
             rollout_log_probs,
@@ -502,7 +548,8 @@ class SGLangDreamRollout(SGLangRollout):
             self.pad_token_id,
             self.config.response_length,
             finish_reasons=finish_reasons,
-            opening_prefix_ids=self._opening_prefix_ids(),
+            opening_prefix_ids=opening_ids,
+            fence_prefix_ids=fence_ids,
         )
         response = response.to(idx.device)
         if rollout_log_probs is not None:
@@ -519,6 +566,13 @@ class SGLangDreamRollout(SGLangRollout):
         )
         attention_mask_out = torch.cat((attention_mask_repeat, response_attention_mask), dim=-1)
 
+        eos_ids = set(stop_ids)
+        if eos_token_id is not None:
+            if isinstance(eos_token_id, (list, tuple)):
+                eos_ids.update(int(x) for x in eos_token_id)
+            else:
+                eos_ids.add(int(eos_token_id))
+
         rollout_nfe = np.array(
             [
                 normalize_rollout_nfe(
@@ -528,7 +582,18 @@ class SGLangDreamRollout(SGLangRollout):
             ],
             dtype=np.int64,
         )
-        rollout_gen_tokens = response_attention_mask.sum(dim=-1).cpu().numpy().astype(np.int64)
+        rollout_gen_tokens = np.array(
+            [
+                _count_decoded_gen_tokens(
+                    response[i].tolist(),
+                    self.pad_token_id,
+                    self._mask_token_id,
+                    eos_ids,
+                )
+                for i in range(response.size(0))
+            ],
+            dtype=np.int64,
+        )
         _non_tensor_batch["rollout_nfe"] = rollout_nfe
         _non_tensor_batch["rollout_gen_tokens"] = rollout_gen_tokens
 

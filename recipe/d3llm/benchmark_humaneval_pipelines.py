@@ -88,6 +88,7 @@ class WorkerArgs:
     max_prompt_length: int
     max_new_tokens: int
     train_temperature: float
+    val_temperature: float
     threshold: float
     mem_fraction_static: float
     train_seed: int
@@ -97,7 +98,7 @@ class WorkerArgs:
     hf_paths: str = "both"
 
 
-def build_training_aligned_engine(model_path: Path, max_new_tokens: int, threshold: float, mem_fraction: float):
+def build_training_aligned_engine(model_path: Path, max_new_tokens: int, threshold: float, mem_fraction: float, temperature: float = 0.0):
     """Mirror sglang_dream_rollout._init_inference_engine (single-GPU smoke)."""
     from sglang.srt.entrypoints.engine import Engine
 
@@ -109,7 +110,7 @@ def build_training_aligned_engine(model_path: Path, max_new_tokens: int, thresho
         "block_add_threshold": 0.1,
         "decoded_token_threshold": 0.95,
         "block_size": 32,
-        "temperature": 0.0,
+        "temperature": temperature,
         "top_p": 1.0,
         "cache_delay_iter": 32,
         "refresh_interval": 10000,
@@ -138,6 +139,7 @@ def build_training_aligned_engine(model_path: Path, max_new_tokens: int, thresho
 class _BenchArgs:
     def __init__(self, wa: WorkerArgs):
         self.train_temperature = wa.train_temperature
+        self.val_temperature = wa.val_temperature
         self.max_new_tokens = wa.max_new_tokens
         self.train_seed = wa.train_seed
 
@@ -320,7 +322,7 @@ def sglang_gpu_worker(wa: WorkerArgs) -> None:
 
     t0 = time.time()
     engine = build_training_aligned_engine(
-        model_path, wa.max_new_tokens, wa.threshold, wa.mem_fraction_static
+        model_path, wa.max_new_tokens, wa.threshold, wa.mem_fraction_static, temperature=0.0
     )
     try:
         for i, row in enumerate(wa.row_indices):
@@ -338,6 +340,8 @@ def sglang_gpu_worker(wa: WorkerArgs) -> None:
                     "text": text,
                     "raw_text": run_r["raw_text"],
                     "nfe": run_r.get("nfe"),
+                    "gen_tokens": run_r.get("gen_tokens"),
+                    "tpf": run_r.get("tpf"),
                     "finish_reason": run_r.get("finish_reason"),
                     "text_eq_raw": text == run_r["raw_text"],
                     **score_humaneval(gt, text),
@@ -396,8 +400,14 @@ def run_phase(worker_fn, worker_args: list[WorkerArgs], phase_name: str, serial:
 
 
 def _tpf_summary(rows: list[dict[str, Any]], path_name: str) -> dict[str, float]:
+    from verl.utils.reward_score.code_efficiency import normalize_rollout_nfe
+
     tpfs = [r[path_name]["tpf"] for r in rows if path_name in r and "tpf" in r[path_name]]
-    nfes = [r[path_name]["nfe"] for r in rows if path_name in r and "nfe" in r[path_name]]
+    nfes = [
+        normalize_rollout_nfe(r[path_name]["nfe"])
+        for r in rows
+        if path_name in r and "nfe" in r[path_name]
+    ]
     if not tpfs:
         return {}
     return {
@@ -412,7 +422,7 @@ def analyze(rows: list[dict[str, Any]], active_paths: tuple[str, ...] | None = N
     paths = active_paths or PATHS
     n = len(rows)
     pass_rates = {p: sum(1 for r in rows if r.get(p, {}).get("pass")) / n if n else 0.0 for p in paths}
-    tpf_stats = {p: _tpf_summary(rows, p) for p in paths if p.startswith("hf_")}
+    tpf_stats = {p: _tpf_summary(rows, p) for p in paths if p.startswith(("hf_", "sglang_"))}
 
     def cross(a: str, b: str) -> dict[str, int]:
         both = a_only = b_only = neither = 0
@@ -484,6 +494,7 @@ def parse_args():
     p.add_argument("--max-prompt-length", type=int, default=1024)
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--train-temperature", type=float, default=0.2)
+    p.add_argument("--val-temperature", type=float, default=0.0)
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument(
         "--mem-fraction-static",
@@ -559,6 +570,7 @@ def main():
             max_prompt_length=args.max_prompt_length,
             max_new_tokens=args.max_new_tokens,
             train_temperature=args.train_temperature,
+            val_temperature=args.val_temperature,
             threshold=args.threshold,
             mem_fraction_static=args.mem_fraction_static,
             train_seed=args.train_seed,

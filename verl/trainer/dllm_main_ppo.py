@@ -51,6 +51,10 @@ def run_ppo(config) -> None:
             val = os.environ.get(key, "")
             if val:
                 runtime_env["env_vars"][key] = val
+        for key in ("CUDA_HOME", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CXX", "CC"):
+            val = os.environ.get(key, "")
+            if val:
+                runtime_env["env_vars"][key] = val
 
         # Detect if we're in a multi-node cluster environment
         # Check for Ray cluster address from environment or use auto-detection
@@ -70,11 +74,19 @@ def run_ppo(config) -> None:
                 runtime_env=runtime_env,
             )
         else:
-            # Single-node training: start local Ray cluster
-            ray.init(
-                runtime_env=runtime_env,
-                num_cpus=config.ray_init.num_cpus,
-            )
+            # Single-node training: connect to `ray start --head` if present, else start local.
+            ray_address = os.environ.get("RAY_ADDRESS", "auto")
+            try:
+                ray.init(
+                    address=ray_address,
+                    runtime_env=runtime_env,
+                    num_cpus=config.ray_init.num_cpus,
+                )
+            except ConnectionError:
+                ray.init(
+                    runtime_env=runtime_env,
+                    num_cpus=config.ray_init.num_cpus,
+                )
 
 
     runner = TaskRunner.remote()

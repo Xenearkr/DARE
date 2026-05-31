@@ -32,13 +32,15 @@ DARE_SUPPRESS_WARNINGS="ignore:pkg_resources is deprecated:UserWarning,ignore:Th
 export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}${DARE_SUPPRESS_WARNINGS}"
 
 # Prefer active conda env (DARE); system python3 often lacks hydra/sglang deps.
-if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
-  PYTHON="${PYTHON:-${CONDA_PREFIX}/bin/python}"
-elif [[ -x "${HOME}/anaconda3/envs/DARE/bin/python" ]]; then
+if [[ -x "${HOME}/anaconda3/envs/DARE/bin/python" ]]; then
   PYTHON="${PYTHON:-${HOME}/anaconda3/envs/DARE/bin/python}"
+  export CONDA_PREFIX="${CONDA_PREFIX:-${HOME}/anaconda3/envs/DARE}"
+elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+  PYTHON="${PYTHON:-${CONDA_PREFIX}/bin/python}"
 else
   PYTHON="${PYTHON:-python3}"
 fi
+export PATH="$(dirname "${PYTHON}"):${PATH}"
 
 smoke_test=0
 model_path=""
@@ -95,7 +97,8 @@ PY
   fi
   val_files="['${EVALPLUS_SMOKE_VAL_PARQUET}']"
   max_prompt_length=1024
-  max_response_length=1024
+  # Align with d3LLM evalplus: max_new_tokens=512, temperature=0.0 (greedy).
+  max_response_length=512
   batch_size=4
   n_rollout=4
   mc_num=4
@@ -112,8 +115,8 @@ PY
   enable_gradient_checkpointing=False
   smoke_total_training_steps=1
   train_temperature=0.4
-  val_temperature=0.2
-  val_do_sample=True
+  val_temperature=0.0
+  val_do_sample=False
   if [ "$engine" = "sglang" ]; then
     # Leave headroom on 48GB for FSDP state_dict + weight sync beside SGLang static pool.
     sglang_mem_fraction_static=0.32
@@ -160,6 +163,11 @@ if [ "$engine" = "sglang" ]; then
   unset PYTORCH_CUDA_ALLOC_CONF
   export CUDA_HOME="${CONDA_PREFIX:-}"
   export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+  export LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/stubs:${LIBRARY_PATH:-}"
+  if [[ -x "${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-c++" ]]; then
+    export CXX="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-c++"
+    export CC="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-cc"
+  fi
 else
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 fi
@@ -187,7 +195,7 @@ if [ $((mc_num % n_l)) -ne 0 ]; then
 fi
 
 echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node} train_temperature=${train_temperature}"
-echo "[INFO] HumanEval eval: temperature=${val_temperature} top_p=${val_top_p} do_sample=${val_do_sample}"
+echo "[INFO] HumanEval eval: max_response=${max_response_length} temperature=${val_temperature} top_p=${val_top_p} do_sample=${val_do_sample}"
 echo "[INFO] W&B val metric: val-core/humaneval/acc/mean@1; val_before_train=${val_before_train}"
 echo "[INFO] Ensure Dream modeling files exist (once): bash recipe/d3llm/setup_finetune_d3llm_model_code.sh"
 EVALPLUS_TRAIN_PARQUET="data/preprocessed/rl/train/code_evalplus_mix_1.parquet"

@@ -42,6 +42,7 @@ def parse_args():
     p.add_argument("--max-prompt-length", type=int, default=1024)
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--train-temperature", type=float, default=0.2)
+    p.add_argument("--val-temperature", type=float, default=0.0)
     p.add_argument("--train-seed", type=int, default=42)
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--mem-fraction-static", type=float, default=0.32)
@@ -69,7 +70,7 @@ def load_prompt_ids(tokenizer, parquet: Path, row: int, max_prompt_length: int) 
     return ids, text
 
 
-def build_engine(model_path: Path, max_new_tokens: int, threshold: float, mem_fraction: float):
+def build_engine(model_path: Path, max_new_tokens: int, threshold: float, mem_fraction: float, temperature: float = 0.0):
     from sglang.srt.entrypoints.engine import Engine
 
     algo_cfg = {
@@ -77,8 +78,8 @@ def build_engine(model_path: Path, max_new_tokens: int, threshold: float, mem_fr
         "block_add_threshold": 0.1,
         "decoded_token_threshold": 0.95,
         "block_size": 32,
-        "temperature": 0.2,
-        "top_p": 0.95,
+        "temperature": temperature,
+        "top_p": 1.0,
         "cache_delay_iter": 32,
         "refresh_interval": 10000,
         "early_stop": True,
@@ -173,18 +174,22 @@ def run_train_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
 
 def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
     """Mirrors SGLangDreamRollout val: per-sample async_generate + val_kwargs (temp=0)."""
+    from verl.utils.reward_score.code_efficiency import normalize_rollout_nfe
     from verl.workers.rollout.sglang_rollout.sglang_dream_rollout import (
+        _count_decoded_gen_tokens,
         _dream_stop_token_ids,
+        _evalplus_fence_prefix_ids,
         _finalize_dream_response_tensor,
     )
     from verl.workers.rollout.sglang_rollout.sglang_rollout import _post_process_outputs
 
     loop = asyncio.get_event_loop()
     stop_ids = _dream_stop_token_ids(tokenizer, PAD_TOKEN_ID, PAD_TOKEN_ID, MASK_TOKEN_ID)
+    val_temp = float(getattr(args, "val_temperature", 0.0))
     val_kwargs = {
         "n": 1,
-        "top_p": 1.0,
-        "temperature": 0.0,
+        "top_p": 1.0 if val_temp <= 0 else 0.95,
+        "temperature": val_temp,
         "max_new_tokens": args.max_new_tokens,
         "sampling_seed": args.train_seed,
         "stop_token_ids": sorted(stop_ids),
@@ -204,7 +209,7 @@ def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
     raw_ids = raw_resp[0].tolist()
     meta = out.get("meta_info", {}) if isinstance(out, dict) else {}
     fr = meta.get("finish_reason")
-    opening = tokenizer.encode("To solve this problem", add_special_tokens=False)
+    fence_ids = _evalplus_fence_prefix_ids(tokenizer)
     finalized, _ = _finalize_dream_response_tensor(
         raw_resp,
         None,
@@ -212,13 +217,19 @@ def run_val_path(engine, tokenizer, prompt_ids: list[int], args) -> dict:
         PAD_TOKEN_ID,
         args.max_new_tokens,
         finish_reasons=[fr],
-        opening_prefix_ids=opening,
+        opening_prefix_ids=None,
+        fence_prefix_ids=fence_ids,
     )
     finalized_ids = finalized[0].tolist()
+    nfe = normalize_rollout_nfe(meta.get("nfe"))
+    gen_tokens = _count_decoded_gen_tokens(finalized_ids, PAD_TOKEN_ID, MASK_TOKEN_ID, stop_ids)
+    tpf = round(gen_tokens / nfe, 4) if nfe > 0 else 0.0
     return {
         "path": "val_per_sample",
         "sampling": val_kwargs,
         "nfe": meta.get("nfe"),
+        "gen_tokens": gen_tokens,
+        "tpf": tpf,
         "finish_reason": fr,
         "completion_tokens": meta.get("completion_tokens"),
         "raw": ids_stats(raw_ids, "raw"),
