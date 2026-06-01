@@ -121,33 +121,28 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                 
                 logits = self._get_logits(model=self.actor_module, packed_input=packed_perturbed_seq, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, prompt_len=attention_mask[:, :prompt_length].sum(dim=1), cfg_scale=0.0, MASK_TOKEN_ID=self.MASK_TOKEN_ID)  # (1, total_seqlen)
                 
-                # Restore logits for each sample
-                batch_logits = []
+                # Restore logits for each sample; compute CFL per sample to avoid (B, T, V) stack.
                 for b in range(batch_size):
                     start, end = cu_seqlens[b], cu_seqlens[b + 1]
-                    
+
                     logits_b = torch.zeros(seq_length, logits.size(-1), device=device, dtype=logits.dtype)
                     logits_b[attention_mask[b] == 1] = logits[0, start:end]
-                    batch_logits.append(logits_b)
-                    
+
                     mask = cur_mask_indices[b]  # (seq_len,)
-                    loss_per_sample[b, i] = - (F.cross_entropy(logits_b[mask], seq[b][mask], reduction="none") / cur_p_mask[b][mask]).sum()  
+                    loss_per_sample[b, i] = - (F.cross_entropy(logits_b[mask], seq[b][mask], reduction="none") / cur_p_mask[b][mask]).sum()
                     # cross_entropy returns negative log likelihood, - cross_entropy convert it to elbo
 
-                if calculate_cfl:
-                    logits_batch = torch.stack(batch_logits, dim=0)
-                    keep_mask = None
-                    if sample_keep_mask is not None:
-                        keep_mask = sample_keep_mask.to(device=device, dtype=torch.bool)
-                    cfl_losses.append(
-                        compute_cfl_loss(
-                            logits=logits_batch,
-                            labels=seq,
-                            masked_indices=cur_mask_indices,
-                            temperature=cfl_temperature,
-                            sample_keep_mask=keep_mask,
+                    if calculate_cfl:
+                        if sample_keep_mask is not None and not sample_keep_mask[b]:
+                            continue
+                        cfl_losses.append(
+                            compute_cfl_loss(
+                                logits=logits_b,
+                                labels=seq[b],
+                                masked_indices=cur_mask_indices[b],
+                                temperature=cfl_temperature,
+                            )
                         )
-                    )
             log_likelihood = loss_per_sample.sum(dim=1) / mc_num # (batch_size,)
             log_prob = log_likelihood.unsqueeze(-1).expand(-1, response_length) # (batch_size, response_length)
             loss_per_sample = (loss_per_sample / response_length).unsqueeze(-1).expand(-1, -1, response_length).contiguous() # (batch_size, mc_num, response_length)

@@ -51,7 +51,7 @@ def run_ppo(config) -> None:
             val = os.environ.get(key, "")
             if val:
                 runtime_env["env_vars"][key] = val
-        for key in ("CUDA_HOME", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CXX", "CC"):
+        for key in ("CUDA_HOME", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CXX", "CC", "CONDA_PREFIX", "PATH"):
             val = os.environ.get(key, "")
             if val:
                 runtime_env["env_vars"][key] = val

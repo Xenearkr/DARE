@@ -32,8 +32,8 @@ def compute_cfl_loss(
     if masked_indices.sum().item() == 0:
         return logits.sum() * 0.0
 
-    logits_f = logits.float()
-    masked_logits = logits_f[masked_indices]
+    # Index masked positions before fp32 cast to avoid materializing full (B, T, V).
+    masked_logits = logits[masked_indices].float()
     masked_labels = labels[masked_indices]
 
     pred_ids = masked_logits.argmax(dim=-1)

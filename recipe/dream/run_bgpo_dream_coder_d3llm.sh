@@ -31,15 +31,18 @@ export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO="${RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO:
 DARE_SUPPRESS_WARNINGS="ignore:pkg_resources is deprecated:UserWarning,ignore:The pynvml package is deprecated:FutureWarning"
 export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}${DARE_SUPPRESS_WARNINGS}"
 
-# Prefer active conda env (DARE); system python3 often lacks hydra/sglang deps.
-if [[ -x "${HOME}/anaconda3/envs/DARE/bin/python" ]]; then
-  PYTHON="${PYTHON:-${HOME}/anaconda3/envs/DARE/bin/python}"
-  export CONDA_PREFIX="${CONDA_PREFIX:-${HOME}/anaconda3/envs/DARE}"
+# Prefer DARE conda env; ignore an active base/other conda (CONDA_PREFIX mismatch breaks SGLang JIT).
+DARE_ENV="${HOME}/anaconda3/envs/DARE"
+if [[ -x "${DARE_ENV}/bin/python" ]]; then
+  PYTHON="${PYTHON:-${DARE_ENV}/bin/python}"
+  CONDA_PREFIX="${DARE_ENV}"
 elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
   PYTHON="${PYTHON:-${CONDA_PREFIX}/bin/python}"
 else
   PYTHON="${PYTHON:-python3}"
+  CONDA_PREFIX="${CONDA_PREFIX:-}"
 fi
+export CONDA_PREFIX
 export PATH="$(dirname "${PYTHON}"):${PATH}"
 
 smoke_test=0
@@ -163,13 +166,16 @@ fi
 
 if [ "$engine" = "sglang" ]; then
   unset PYTORCH_CUDA_ALLOC_CONF
-  export CUDA_HOME="${CONDA_PREFIX:-}"
-  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
-  export LIBRARY_PATH="${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/stubs:${LIBRARY_PATH:-}"
+  _cuda_rt_lib="${CONDA_PREFIX}/lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
+  _cuda_targets_lib="${CONDA_PREFIX}/targets/x86_64-linux/lib"
+  export CUDA_HOME="${CONDA_PREFIX}"
+  export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${_cuda_rt_lib}:${_cuda_targets_lib}:${LD_LIBRARY_PATH:-}"
+  export LIBRARY_PATH="${CONDA_PREFIX}/lib:${_cuda_rt_lib}:${_cuda_targets_lib}:${LIBRARY_PATH:-}"
   if [[ -x "${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-c++" ]]; then
     export CXX="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-c++"
     export CC="${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-cc"
   fi
+  echo "[INFO] SGLang build env: CONDA_PREFIX=${CONDA_PREFIX} CXX=${CXX:-unset} LIBRARY_PATH=${LIBRARY_PATH}"
 else
   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 fi
