@@ -13,18 +13,24 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 DARE_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(DARE_ROOT))
 sys.path.insert(0, str(DARE_ROOT / "recipe" / "d3llm"))
 
 from evalplus_prompt import (  # noqa: E402
+    build_humaneval_evalplus_row,
+    build_mbpp_evalplus_row,
     convert_row_to_evalplus,
     extract_taco_codeblock,
     format_evalplus_messages,
+    render_decoding_prompt,
     _as_list,
 )
 
+EVALPLUS_ROOT = Path("/home/u-liujc/Codes/d3LLM/utils/utils_DreamCoder/code_eval/evalplus")
 RL_DIR = DARE_ROOT / "data" / "preprocessed" / "rl"
 DEFAULT_TRAIN_OUT = RL_DIR / "train" / "code_evalplus_mix_1.parquet"
 DEFAULT_VAL_OUT = RL_DIR / "test" / "humaneval_evalplus_1.parquet"
+DEFAULT_MBPP_OUT = RL_DIR / "test" / "mbpp_evalplus_1.parquet"
 
 
 def _load_parquet(path: Path) -> List[Dict[str, Any]]:
@@ -170,9 +176,10 @@ def validate_row(row: Dict[str, Any], tokenizer=None) -> List[str]:
     if "```\n" not in user or user.rstrip().endswith("```") is False:
         errors.append("user content missing task ``` fence")
     if row.get("data_source") == "mbpp":
-        if "Your code should pass these tests:" not in user:
+        style = (row.get("extra_info") or {}).get("prompt_style")
+        if style != "evalplus" and "Your code should pass these tests:" not in user:
             errors.append("mbpp user content missing test assertions")
-        if "assert " not in user:
+        if style != "evalplus" and "assert " not in user:
             errors.append("mbpp user content missing assert lines")
     assistant = prompt[1].get("content", "")
     if "Below is a Python script" not in assistant or not assistant.endswith("```python\n"):
@@ -182,12 +189,66 @@ def validate_row(row: Dict[str, Any], tokenizer=None) -> List[str]:
         errors.append("reward_model.ground_truth missing")
     if tokenizer is not None:
         try:
-            text = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, tokenize=False)
+            extra = row.get("extra_info")
+            if hasattr(extra, "to_dict"):
+                extra = extra.to_dict()
+            text = render_decoding_prompt(prompt, tokenizer, extra)
             if "Please provide a self-contained Python script" not in text:
-                errors.append("chat_template output missing instruction prefix")
+                errors.append("decoding prompt missing instruction prefix")
         except Exception as exc:  # pragma: no cover
-            errors.append(f"chat_template failed: {exc}")
+            errors.append(f"render_decoding_prompt failed: {exc}")
     return errors
+
+
+def build_humaneval_evalplus_from_official(*, split: str = "test") -> List[Dict[str, Any]]:
+    import sys
+
+    if str(EVALPLUS_ROOT) not in sys.path:
+        sys.path.insert(0, str(EVALPLUS_ROOT))
+    from evalplus.data import get_human_eval_plus  # noqa: WPS433
+    from evalplus.data.humaneval import get_human_eval  # noqa: WPS433
+
+    he_plus = get_human_eval_plus()
+    he_base = get_human_eval()
+    task_ids = sorted(he_plus.keys(), key=lambda x: int(x.split("/")[-1]))
+    rows: List[Dict[str, Any]] = []
+    for index, task_id in enumerate(task_ids):
+        plus_item = he_plus[task_id]
+        base_item = he_base[task_id]
+        row = build_humaneval_evalplus_row(
+            task_id=task_id,
+            task_prompt=plus_item["prompt"],
+            ground_truth_test=base_item["test"],
+            index=index,
+            split=split,
+        )
+        entry_point = plus_item.get("entry_point") or base_item.get("entry_point")
+        if entry_point:
+            row["extra_info"]["entry_point"] = entry_point
+        rows.append(row)
+    return rows
+
+
+def build_mbpp_evalplus_from_official(*, split: str = "test") -> List[Dict[str, Any]]:
+    import sys
+
+    if str(EVALPLUS_ROOT) not in sys.path:
+        sys.path.insert(0, str(EVALPLUS_ROOT))
+    from evalplus.data import get_mbpp_plus  # noqa: WPS433
+
+    mbpp_plus = get_mbpp_plus()
+    task_ids = sorted(mbpp_plus.keys(), key=lambda x: int(x.split("/")[-1]))
+    rows: List[Dict[str, Any]] = []
+    for index, task_id in enumerate(task_ids):
+        rows.append(
+            build_mbpp_evalplus_row(
+                task_id=task_id,
+                mbpp_item=mbpp_plus[task_id],
+                index=index,
+                split=split,
+            )
+        )
+    return rows
 
 
 def validate_parquet(path: Path, tokenizer=None, sample: int = 5) -> None:
@@ -266,23 +327,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build EvalPlus-aligned code RL parquets")
     parser.add_argument("--train-out", type=Path, default=DEFAULT_TRAIN_OUT)
     parser.add_argument("--val-out", type=Path, default=DEFAULT_VAL_OUT)
+    parser.add_argument("--mbpp-out", type=Path, default=DEFAULT_MBPP_OUT)
     parser.add_argument("--competition-cap", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model-path", type=str, default="models/finetune_d3LLM")
     parser.add_argument("--samples-out", type=Path, default=RL_DIR / "train" / "code_evalplus_mix_samples.jsonl")
     parser.add_argument("--sample-uids", type=str, default="208,669,150,356,414")
     parser.add_argument("--skip-tokenizer-check", action="store_true")
+    parser.add_argument("--skip-train", action="store_true")
     args = parser.parse_args()
 
-    print("Building EvalPlus val (humaneval)...")
-    val_rows = convert_parquet(RL_DIR / "test" / "humaneval_1.parquet", split="test")
-    for i, r in enumerate(val_rows):
-        r["extra_info"]["index"] = i
+    print("Building EvalPlus val (humaneval from official EvalPlus)...")
+    val_rows = build_humaneval_evalplus_from_official(split="test")
     _write_parquet(val_rows, args.val_out)
 
-    print("Building EvalPlus train mix...")
-    train_rows = build_train_mix(competition_cap=args.competition_cap, seed=args.seed)
-    _write_parquet(train_rows, args.train_out)
+    print("Building EvalPlus val (mbpp from official MBPP+)...")
+    mbpp_rows = build_mbpp_evalplus_from_official(split="test")
+    _write_parquet(mbpp_rows, args.mbpp_out)
+
+    train_rows: List[Dict[str, Any]] = []
+    if not args.skip_train:
+        print("Building EvalPlus train mix...")
+        train_rows = build_train_mix(competition_cap=args.competition_cap, seed=args.seed)
+        _write_parquet(train_rows, args.train_out)
 
     tokenizer = None
     if not args.skip_tokenizer_check:
@@ -296,16 +363,21 @@ def main() -> None:
             print(f"[WARN] tokenizer load failed ({exc}); skipping chat_template check")
 
     validate_parquet(args.val_out, tokenizer=tokenizer)
-    validate_parquet(args.train_out, tokenizer=tokenizer)
+    validate_parquet(args.mbpp_out, tokenizer=tokenizer)
+    if train_rows:
+        validate_parquet(args.train_out, tokenizer=tokenizer)
 
-    sample_uids = [int(x.strip()) for x in args.sample_uids.split(",") if x.strip()]
-    dump_review_samples(train_rows, args.samples_out, uids=sample_uids, per_bucket=2)
+    if train_rows:
+        sample_uids = [int(x.strip()) for x in args.sample_uids.split(",") if x.strip()]
+        dump_review_samples(train_rows, args.samples_out, uids=sample_uids, per_bucket=2)
 
     summary = {
-        "train_out": str(args.train_out),
+        "train_out": str(args.train_out) if train_rows else None,
         "val_out": str(args.val_out),
+        "mbpp_out": str(args.mbpp_out),
         "train_rows": len(train_rows),
         "val_rows": len(val_rows),
+        "mbpp_rows": len(mbpp_rows),
     }
     print(json.dumps(summary, indent=2))
 

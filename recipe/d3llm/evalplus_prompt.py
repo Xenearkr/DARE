@@ -6,14 +6,15 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-# d3LLM evalplus/prepare_instruct_prompts.py + provider/utility.py (run_code_eval.sh dream_coder)
-INSTRUCTION_PREFIX = (
-    "Please provide a self-contained Python script that solves the following problem "
-    "in a markdown code block:"
-)
-RESPONSE_PREFIX = (
-    "Below is a Python script with a self-contained function that solves the problem "
-    "and passes corresponding tests:"
+from verl.utils.dataset.evalplus_chat_prompt import (  # noqa: F401
+    EVALPLUS_MAGIC_SPLITTER,
+    INSTRUCTION_PREFIX,
+    RESPONSE_PREFIX,
+    extract_task_body_from_user_content,
+    is_evalplus_prompt,
+    make_evalplus_raw_chat_prompt,
+    make_evalplus_raw_chat_prompt_from_messages,
+    render_decoding_prompt,
 )
 
 HUMANEVAL_LEGACY_PREFIX = "Complete the following python code:\n"
@@ -26,6 +27,83 @@ MBPP_TASK_AND_TESTS_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+
+def normalize_humaneval115_prompt(prompt: str) -> str:
+    """Match d3LLM/EvalPlus HumanEval/115 import order (import math before def)."""
+    if "import math\n" in prompt and not prompt.lstrip().startswith("import math"):
+        return "import math\n" + prompt.replace("import math\n", "", 1)
+    return prompt
+
+
+def parse_mbpp_plus_prompt(prompt_field: str) -> Tuple[str, List[str]]:
+    """Split MBPP+ ``prompt`` field into task description and assert lines."""
+    text = prompt_field.strip().strip('"').strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    asserts = [ln for ln in lines if ln.startswith("assert ")]
+    task_lines = [ln for ln in lines if not ln.startswith("assert ")]
+    task = task_lines[0] if task_lines else ""
+    if not task and lines:
+        task = lines[0]
+    return task.strip(), asserts
+
+
+def build_humaneval_evalplus_row(
+    *,
+    task_id: str,
+    task_prompt: str,
+    ground_truth_test: str,
+    index: int,
+    split: str,
+) -> Dict[str, Any]:
+    task_body = normalize_humaneval115_prompt(task_prompt.strip())
+    return {
+        "data_source": "humaneval",
+        "prompt": format_evalplus_messages(task_body, include_assistant_prefix=True),
+        "reward_model": {"style": "rule", "ground_truth": ground_truth_test},
+        "extra_info": {
+            "split": split,
+            "index": index,
+            "task": "code",
+            "prompt_style": "evalplus",
+            "evalplus_task_id": task_id,
+        },
+    }
+
+
+def build_mbpp_evalplus_row(
+    *,
+    task_id: str,
+    mbpp_item: Dict[str, Any],
+    index: int,
+    split: str,
+) -> Dict[str, Any]:
+    # EvalPlus codegen passes task["prompt"] verbatim to make_raw_chat_prompt.
+    task_body = mbpp_item["prompt"].strip()
+    assertion = (mbpp_item.get("assertion") or "").strip()
+    tests = [ln.strip() for ln in assertion.splitlines() if ln.strip()] if assertion else []
+    if not tests:
+        _, tests = parse_mbpp_plus_prompt(mbpp_item["prompt"])
+    entry_point = mbpp_item.get("entry_point")
+    if not entry_point and tests:
+        m = re.search(r"assert\s+(\w+)", tests[0])
+        if m:
+            entry_point = m.group(1)
+    mbpp_num = int(task_id.split("/")[-1]) if "/" in task_id else index
+    return {
+        "data_source": "mbpp",
+        "prompt": format_evalplus_messages(task_body, include_assistant_prefix=True),
+        "reward_model": {"style": "rule", "ground_truth": json.dumps(tests)},
+        "extra_info": {
+            "split": split,
+            "index": index,
+            "task": "code",
+            "prompt_style": "evalplus",
+            "evalplus_task_id": task_id,
+            "mbpp_task_id": mbpp_num,
+            "entry_point": entry_point,
+        },
+    }
 
 
 def _mbpp_user_messages(prompt: Any) -> List[Dict[str, str]]:
@@ -115,6 +193,14 @@ def extract_task_body_from_row(row: Dict[str, Any]) -> Optional[str]:
     if not prompt:
         return None
 
+    extra_info = row.get("extra_info") or {}
+    if hasattr(extra_info, "to_dict"):
+        extra_info = extra_info.to_dict()
+    if is_evalplus_prompt(prompt, extra_info):
+        users = [m for m in prompt if m.get("role") == "user"]
+        if users:
+            return extract_task_body_from_user_content(users[-1].get("content", ""))
+
     if data_source == "mbpp":
         parsed = extract_mbpp_task_and_tests(row)
         if parsed:
@@ -175,6 +261,10 @@ def convert_row_to_evalplus(row: Dict[str, Any], *, index: int, split: str) -> O
         task_body = extract_task_body_from_row(row)
         if not task_body:
             return None
+        if data_source in {"humaneval", "humanevalplus"}:
+            extra_index = extra_info.get("index")
+            if extra_index == 115:
+                task_body = normalize_humaneval115_prompt(task_body)
 
     new_row = {
         "data_source": data_source,
@@ -185,6 +275,7 @@ def convert_row_to_evalplus(row: Dict[str, Any], *, index: int, split: str) -> O
     new_row["extra_info"]["split"] = split
     new_row["extra_info"]["index"] = index
     new_row["extra_info"]["prompt_style"] = "evalplus"
+    new_row["extra_info"]["task"] = extra_info.get("task") or "code"
     if entry_point:
         new_row["extra_info"]["entry_point"] = entry_point
     return new_row

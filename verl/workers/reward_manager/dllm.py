@@ -113,7 +113,8 @@ class DLLMRewardManager(DAPORewardManager):
             elif hasattr(extra_info, "item"):
                 extra_info = extra_info.item()
             extra_info = dict(extra_info)
-            extra_info.setdefault("task", "code")
+            if not extra_info.get("task"):
+                extra_info["task"] = "code"
             extra_info["rollout_nfe"] = nfe
             extra_info["rollout_gen_tokens"] = gen_tokens
             extra_info["tpf"] = tpf

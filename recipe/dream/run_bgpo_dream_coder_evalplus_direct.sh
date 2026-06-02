@@ -1,11 +1,11 @@
 #!/bin/bash
-# BGPO code RL for d3LLM Dream-Coder (HF or SGLang multiblock rollout).
-# model.name=dream (no d3llm_dream); path points to finetune_d3LLM weights.
+# BGPO direct validity test: train on EvalPlus HumanEval+MBPP+ (overfit-style sanity check).
+# max_response_length=512 (aligned with d3LLM evalplus).
 #
 # Usage:
-#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke              # default engine: sglang
-#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --smoke --engine hf
-#   bash recipe/dream/run_bgpo_dream_coder_d3llm.sh --engine sglang
+#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke
+#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke --engine hf
+#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --engine sglang
 set -euo pipefail
 set -x
 
@@ -26,12 +26,10 @@ export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 export HF_HUB_OFFLINE=1
 export TORCHDYNAMO_DISABLE=1
 
-# Suppress known noisy third-party warnings in long training logs.
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO="${RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO:-0}"
 DARE_SUPPRESS_WARNINGS="ignore:pkg_resources is deprecated:UserWarning,ignore:The pynvml package is deprecated:FutureWarning"
 export PYTHONWARNINGS="${PYTHONWARNINGS:+$PYTHONWARNINGS,}${DARE_SUPPRESS_WARNINGS}"
 
-# Prefer DARE conda env; ignore an active base/other conda (CONDA_PREFIX mismatch breaks SGLang JIT).
 DARE_ENV="${HOME}/anaconda3/envs/DARE"
 if [[ -x "${DARE_ENV}/bin/python" ]]; then
   PYTHON="${PYTHON:-${DARE_ENV}/bin/python}"
@@ -68,13 +66,12 @@ model=dream
 algorithm=bgpo
 model_path=${model_path:-models/finetune_d3LLM}
 task=code
-baseline="${model}-${task}-d3llm-${algorithm}-${engine}"
+baseline="${model}-${task}-d3llm-${algorithm}-${engine}-evalplus-direct"
 
 mask_token_id=151666
 pad_token_id=151643
 block_length=32
 
-# SGLang memory_saver conflicts with expandable_segments; set before ray start.
 sglang_mem_fraction_static=0.45
 sglang_gpu_memory_utilization=0.4
 sglang_attention_backend=fa3
@@ -83,27 +80,54 @@ actor_param_offload=False
 actor_optimizer_offload=False
 enable_activation_offload=False
 
-ORIG_TRAIN_FILES="['data/preprocessed/rl/train/lcbv5-K8_1.parquet','data/preprocessed/rl/train/primeintellect-K8_1.parquet','data/preprocessed/rl/train/taco-K8_1.parquet']"
+HE_EVALPLUS="data/preprocessed/rl/test/humaneval_evalplus_1.parquet"
+MBPP_EVALPLUS="data/preprocessed/rl/test/mbpp_evalplus_1.parquet"
+EVALPLUS_TRAIN_FILES="['${HE_EVALPLUS}','${MBPP_EVALPLUS}']"
+
+ensure_evalplus_parquets() {
+  if [[ -f "${HE_EVALPLUS}" && -f "${MBPP_EVALPLUS}" ]]; then
+    return 0
+  fi
+  echo "[INFO] Building EvalPlus parquets: ${PYTHON} recipe/d3llm/build_evalplus_code_mix.py --skip-train"
+  "${PYTHON}" recipe/d3llm/build_evalplus_code_mix.py --skip-train --skip-tokenizer-check || {
+    echo "[ERROR] Failed to build EvalPlus parquets."
+    exit 1
+  }
+}
+
+build_smoke_subset() {
+  local src="$1"
+  local dst="$2"
+  local n="$3"
+  if [[ -f "${dst}" ]]; then
+    return 0
+  fi
+  echo "[INFO] Building smoke subset (${n} samples): ${dst}"
+  "${PYTHON}" - <<PY
+import pandas as pd
+df = pd.read_parquet("${src}").head(${n})
+extra = df["extra_info"].apply(lambda x: {**(x or {}), "task": (x or {}).get("task") or "code"})
+df = df.copy()
+df["extra_info"] = extra
+df.to_parquet("${dst}", index=False)
+print(f"wrote ${dst}")
+PY
+}
+
+# Always 512 — aligned with d3LLM evalplus max_new_tokens.
+max_response_length=512
+max_prompt_length=1024
 
 if [ "${smoke_test}" -eq 1 ]; then
-  # Override stale single-GPU env left by benchmark scripts (default smoke uses 4 GPUs).
   export CUDA_VISIBLE_DEVICES="${DARE_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-  train_files="${ORIG_TRAIN_FILES}"
-  EVALPLUS_SMOKE_VAL_PARQUET="data/preprocessed/rl/test/humaneval_evalplus_smoke_8.parquet"
-  if [ ! -f "${EVALPLUS_SMOKE_VAL_PARQUET}" ]; then
-    echo "[INFO] Building smoke val subset (8 samples): ${EVALPLUS_SMOKE_VAL_PARQUET}"
-    "${PYTHON}" - <<'PY'
-import pandas as pd
-src = "data/preprocessed/rl/test/humaneval_evalplus_1.parquet"
-dst = "data/preprocessed/rl/test/humaneval_evalplus_smoke_8.parquet"
-pd.read_parquet(src).head(8).to_parquet(dst, index=False)
-print(f"wrote {dst}")
-PY
-  fi
-  val_files="['${EVALPLUS_SMOKE_VAL_PARQUET}']"
-  max_prompt_length=1024
-  # Align with d3LLM evalplus: max_new_tokens=512, temperature=0.0 (greedy).
-  max_response_length=512
+  train_files="${EVALPLUS_TRAIN_FILES}"
+
+  HE_SMOKE_VAL="data/preprocessed/rl/test/humaneval_evalplus_smoke_8.parquet"
+  MBPP_SMOKE_VAL="data/preprocessed/rl/test/mbpp_evalplus_smoke_8.parquet"
+  build_smoke_subset "${HE_EVALPLUS}" "${HE_SMOKE_VAL}" 8
+  build_smoke_subset "${MBPP_EVALPLUS}" "${MBPP_SMOKE_VAL}" 8
+  val_files="['${HE_SMOKE_VAL}','${MBPP_SMOKE_VAL}']"
+
   batch_size=4
   n_rollout=4
   mc_num=4
@@ -112,7 +136,6 @@ PY
   max_num_batched_tokens=4096
   val_batch_size=32
   save_freq=0
-  # HumanEval before/after 1 train step: val_generations/0.jsonl (base) vs 1.jsonl (step1).
   test_freq=1
   val_before_train=True
   total_epoch=1
@@ -123,7 +146,6 @@ PY
   val_temperature=0.0
   val_do_sample=False
   if [ "$engine" = "sglang" ]; then
-    # Leave headroom on 48GB for FSDP state_dict + weight sync beside SGLang static pool.
     sglang_mem_fraction_static=0.32
     sglang_gpu_memory_utilization=0.32
     sglang_attention_backend=torch_native
@@ -133,12 +155,8 @@ PY
     enable_activation_offload=True
   fi
 else
-  # Full training (aligned with recipe/sdar/run_bgpo_sdar_8b_chat.sh sglang branch).
-  train_files="${ORIG_TRAIN_FILES}"
-  val_files="['data/preprocessed/rl/test/humaneval_evalplus_1.parquet']"
-  max_prompt_length=1024
-  # Dream d3LLM multiblock: keep 512 (SDAR code full uses 1536; too costly per-sample here).
-  max_response_length=768
+  train_files="${EVALPLUS_TRAIN_FILES}"
+  val_files="${HE_EVALPLUS}"
   batch_size=8
   n_rollout=4
   mc_num=8
@@ -152,8 +170,10 @@ else
   total_epoch=1
   trainer_logger='["console","wandb"]'
   enable_gradient_checkpointing=True
+  train_temperature=0.4
+  val_temperature=0.0
+  val_do_sample=False
   if [ "$engine" = "sglang" ]; then
-    echo "[INFO] SGLang full run: using smoke-style inference mem + activation offload"
     sglang_mem_fraction_static=0.32
     sglang_gpu_memory_utilization=0.32
     sglang_attention_backend=torch_native
@@ -184,23 +204,18 @@ num_diffusion_steps=${max_response_length}
 val_num_diffusion_steps=${max_response_length}
 lr=5e-7
 ppo_micro_batch_size_per_gpu=1
-# Train rollout temperature (smoke block may override).
 train_temperature="${train_temperature:-0.4}"
-# Keep validation slightly cooler for stable HumanEval monitoring.
 val_temperature="${val_temperature:-0.0}"
 val_top_p="${val_top_p:-1.0}"
 val_do_sample="${val_do_sample:-False}"
 
-# Certainty-Forcing Loss (d3LLM distill alignment)
 enable_cfl=True
-cfl_coef=0.05
+cfl_coef=0.1
 cfl_temperature=0.5
 cfl_gate_positive_adv_only=False
 if [ "${smoke_test}" -eq 1 ]; then
-  # Smoke: gate A — all rollout samples, verify plumbing and metrics.
   cfl_gate_passed_only=False
 else
-  # Full: gate B — only passed rollouts (requires token_level_scores).
   cfl_gate_passed_only=True
 fi
 
@@ -215,19 +230,15 @@ if [ $((mc_num % n_l)) -ne 0 ]; then
   exit 1
 fi
 
+ensure_evalplus_parquets
+
 echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node} train_temperature=${train_temperature}"
+echo "[INFO] Direct EvalPlus train: ${HE_EVALPLUS} + ${MBPP_EVALPLUS} (542 samples)"
+echo "[INFO] max_response_length=${max_response_length} (train+val, aligned with d3LLM evalplus)"
 echo "[INFO] CFL: enable=${enable_cfl} coef=${cfl_coef} temperature=${cfl_temperature} gate_passed=${cfl_gate_passed_only}"
-echo "[INFO] HumanEval eval: max_response=${max_response_length} temperature=${val_temperature} top_p=${val_top_p} do_sample=${val_do_sample}"
-echo "[INFO] W&B val metric: val-core/humaneval/acc/mean@1; val_before_train=${val_before_train}"
+echo "[INFO] W&B metrics: val-core/humaneval/acc/mean@1, val-core/mbpp/acc/mean@1"
 echo "[INFO] Ensure Dream modeling files exist (once): bash recipe/d3llm/setup_finetune_d3llm_model_code.sh"
-EVALPLUS_VAL_PARQUET="data/preprocessed/rl/test/humaneval_evalplus_1.parquet"
-if [[ ! -f "${EVALPLUS_VAL_PARQUET}" ]]; then
-  echo "[INFO] Building EvalPlus val parquet: ${PYTHON} recipe/d3llm/build_evalplus_code_mix.py"
-  "${PYTHON}" recipe/d3llm/build_evalplus_code_mix.py || {
-    echo "[ERROR] Failed to build EvalPlus val parquet."
-    exit 1
-  }
-fi
+
 ray stop --force || true
 rm -rf /tmp/ray 2>/dev/null || true
 ray start --head --node-ip-address=127.0.0.1 --port=6379 \
@@ -242,14 +253,13 @@ log_dir=./logs/${WANDB_PROJECT}/${exp_name}
 mkdir -p "${ckpt_dir}" "${log_dir}"
 export DREAM_ROLLOUT_VERBOSE="${DREAM_ROLLOUT_VERBOSE:-1}"
 export DREAM_ROLLOUT_LOG_DIR="${DREAM_ROLLOUT_LOG_DIR:-${log_dir}/rollout_debug}"
-# Each DP rank writes to rollout_debug/rank{N}.rollout.log (set DREAM_ROLLOUT_LOG_RANK=N to restrict).
 unset DREAM_ROLLOUT_LOG_RANK
 val_generations_dir="${log_dir}/val_generations"
 mkdir -p "${DREAM_ROLLOUT_LOG_DIR}" "${val_generations_dir}"
-echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR} (per-rank rank0..rank$((n_gpus_per_node - 1)).rollout.log)"
+echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR}"
 if [ "${smoke_test}" -eq 1 ]; then
-  echo "[INFO] Smoke val: val_before_train=True test_freq=1 steps=1"
-  echo "[INFO] HumanEval dumps: ${val_generations_dir}/0.jsonl (pre-train) -> ${val_generations_dir}/1.jsonl (post step1)"
+  echo "[INFO] Smoke: val_before_train=True test_freq=1 steps=1"
+  echo "[INFO] Val dumps: ${val_generations_dir}/0.jsonl (pre-train) -> ${val_generations_dir}/1.jsonl (post step1)"
 fi
 echo "[INFO] WANDB_MODE=${WANDB_MODE} project=${WANDB_PROJECT} WANDB_DIR=${WANDB_DIR:-${log_dir}/wandb}"
 
@@ -267,7 +277,6 @@ if [ "$engine" = "sglang" ]; then
   )
 fi
 
-# Per-run WANDB_DIR; force cloud sync when logger includes wandb (do not inherit offline).
 export WANDB_DIR="${log_dir}/wandb"
 mkdir -p "${WANDB_DIR}"
 if [[ "${trainer_logger}" == *wandb* ]]; then

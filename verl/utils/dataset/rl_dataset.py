@@ -145,10 +145,17 @@ class RLHFDataset(Dataset):
 
         # filter out too long prompts
         if self.filter_overlong_prompts:
+            from verl.utils.dataset.evalplus_chat_prompt import prompt_token_length
+
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
             self.dataframe = self.dataframe.filter(
-                lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                lambda doc: prompt_token_length(
+                    doc[prompt_key],
+                    tokenizer,
+                    doc.get("extra_info"),
+                )
+                <= self.max_prompt_length,
                 num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
@@ -226,7 +233,15 @@ class RLHFDataset(Dataset):
             row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            from verl.utils.dataset.evalplus_chat_prompt import render_decoding_prompt
+
+            extra_info = row_dict.get("extra_info")
+            raw_prompt = render_decoding_prompt(
+                messages,
+                self.tokenizer,
+                extra_info,
+                add_generation_prompt=True,
+            )
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
