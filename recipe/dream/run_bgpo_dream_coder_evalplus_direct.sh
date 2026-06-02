@@ -164,10 +164,10 @@ else
   ppo_max_token_len_per_gpu=3072
   max_num_batched_tokens=6144
   val_batch_size=32
-  save_freq=20
+  save_freq=40
   test_freq=10
   val_before_train=True
-  total_epoch=1
+  total_epoch=4
   trainer_logger='["console","wandb"]'
   enable_gradient_checkpointing=True
   train_temperature=0.4

@@ -79,62 +79,61 @@ def extract_code_from_model(model_response: str):
     return None
 
 
+_LEGACY_MBPP_PATTERNS = [
+    r"\[BEGIN\]\s*'(.*)'\s*\[DONE\]",
+    r"BEGIN\s*'(.*)'\s*\[DONE\]",
+    r"\[BEGIN\]\s*'(.*)'\s*DONE",
+    r"BEGIN\s*'(.*)'\s*DONE",
+    r"\[BEGIN\]\s*'(.*)\s*\[DONE\]",
+    r"BEGIN\s*'(.*)\s*\[DONE\]",
+    r"\[BEGIN\]\s*'(.*)\s*DONE",
+    r"BEGIN\s*'(.*)\s*DONE",
+    r"\[BEGIN\]\s*(.*)\s*\[DONE\]",
+    r"BEGIN\s*(.*)\s*\[DONE\]",
+    r"\[BEGIN\]\s*(.*)\s*DONE",
+    r"BEGIN\s*(.*)\s*DONE",
+    r"\[BEGIN\]\s*'(.*)",
+    r"\[BEGIN\](.*)",
+    r"'(.*)'\s*\[DONE\]",
+]
+
+
+def _extract_legacy_mbpp_code(text: str) -> str | None:
+    """OpenCompass / lm_eval MBPP ([BEGIN] ... [DONE]) completion format."""
+    body = text
+    for pattern in _LEGACY_MBPP_PATTERNS:
+        match = re.search(pattern, body, re.DOTALL)
+        if match:
+            body = match.group(1)
+            break
+    else:
+        return None
+
+    body = body.split("```")[0]
+    body = re.split(r"'?\s*\[?DONE\]?", body)[0]
+    body = body.replace("\\_", "_").strip()
+    if not body or len(body) < 10:
+        return None
+    return body
+
+
 def extract_code_from_model_mbpp(model_response: str):
     """
-    Extracts the code from MBPP model response using patterns similar to OpenCompass MBPPEvaluator.
-    This function handles various MBPP-specific response formats including [BEGIN]/[DONE] markers.
+    Extract Python code from MBPP model output.
 
-    Parameters:
-        model_response (str): The text output from the LLM for MBPP dataset.
-
-    Returns:
-        str: The extracted code, or None if no code is found.
+    EvalPlus / Dream-Coder instruct uses the same assistant-prefix continuation
+    decode as HumanEval (opening ```python in prompt; response is raw code,
+    optionally with a trailing ```). Legacy OpenCompass MBPP formats fall back
+    to [BEGIN]/[DONE] patterns.
     """
-    patterns = [
-        r"\[BEGIN\]\s*'(.*)'\s*\[DONE\]",
-        r"BEGIN\s*'(.*)'\s*\[DONE\]",
-        r"\[BEGIN\]\s*'(.*)'\s*DONE",
-        r"BEGIN\s*'(.*)'\s*DONE",
-        r"\[BEGIN\]\s*'(.*)\s*\[DONE\]",
-        r"BEGIN\s*'(.*)\s*\[DONE\]",
-        r"\[BEGIN\]\s*'(.*)\s*DONE",
-        r"BEGIN\s*'(.*)\s*DONE",
-        r'\[BEGIN\]\s*(.*)\s*\[DONE\]',
-        r'BEGIN\s*(.*)\s*\[DONE\]',
-        r'\[BEGIN\]\s*(.*)\s*DONE',
-        r'BEGIN\s*(.*)\s*DONE',
-        r'```python\s*(.*)\s*```',
-        r'```\s*(.*)\s*```',
-        r'```python\s*(.*)\s*$',
-        r'```\s*(.*)\s*$',
-        r'(.*)\s*```.*',
-        r"\[BEGIN\]\s*'(.*)",
-        r'\[BEGIN\](.*)',
-        r"'(.*)'\s*\[DONE\]",
-    ]
-    
-    text = model_response
-    for p in patterns:
-        try:
-            match = re.search(p, text, re.DOTALL)
-        except TimeoutError:
-            match = None
-
-        if match:
-            text = match.group(1)
-            break
-    
-    # Additional cleanup
-    text = text.split('```')[0]
-    text = re.split(r"'?\s*\[?DONE\]?", text)[0]
-    text = text.replace('\\_', '_')
-    text = text.strip()
-    
-    # Return None if no meaningful code is found
-    if not text or len(text.strip()) < 10:  # Minimum length check
+    if not model_response or not model_response.strip():
         return None
-        
-    return text
+
+    code = extract_code_from_model(model_response)
+    if code:
+        return code
+
+    return _extract_legacy_mbpp_code(model_response)
 
 
 def clean_code_main_block(code: str) -> str:
