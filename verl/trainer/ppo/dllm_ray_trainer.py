@@ -253,11 +253,11 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
-                    if self.config.algorithm.name in ["d1", "coupled-grpo", "bgpo", "ebpo", "spg"]:
+                    if self.config.algorithm.name in ["d1", "coupled-grpo", "bgpo", "bgpo-cj", "ebpo", "spg"]:
                         with _timer("forward_process", timing_raw):
                             forward_batch_output = self.actor_rollout_wg.forward_process(batch)
                         batch = batch.union(forward_batch_output)
-                        if self.config.algorithm.name in ["bgpo", "ebpo"]:
+                        if self.config.algorithm.name in ["bgpo", "bgpo-cj", "ebpo"]:
                             # recompute old_log_probs
                             with _timer("old_log_prob", timing_raw):
                                 old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -270,7 +270,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 old_log_prob.batch.pop("old_entropys")
                                 batch = batch.union(old_log_prob)
 
-                                if self.config.algorithm.name == "bgpo" and "rollout_log_probs" in batch.batch.keys():
+                                if self.config.algorithm.name in ("bgpo", "bgpo-cj") and "rollout_log_probs" in batch.batch.keys():
                                     # TODO: we may want to add diff of probs too.
                                     rollout_old_log_probs = batch.batch["rollout_log_probs"]
                                     actor_old_log_probs = batch.batch["old_log_probs"]

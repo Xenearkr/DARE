@@ -399,6 +399,64 @@ def _forward_process_bgpo(batch, attention_mask, prompt_len, t=None, eps=1e-3, M
     return noisy_batch, mask_indices, p_mask
 
 
+def _forward_process_bgpo_cj(batch, attention_mask, prompt_len, t=None, eps=1e-3, MASK_TOKEN_ID=126336):
+    """AR-prefix mask for bgpo-cj: same ELBO weighting as BGPO, suffix mask from one random split."""
+    b, seq_len = batch.shape
+
+    response_mask = attention_mask.bool().clone()
+    response_mask[:prompt_len] = False
+    response_indices = torch.where(response_mask)[0]
+    target_len = response_mask.sum().item()
+    assert target_len >= 1, "bgpo-cj requires at least one valid response token"
+
+    mask_indices = torch.zeros((b, seq_len), dtype=torch.bool, device=batch.device)
+    p_mask = torch.zeros((b, seq_len), dtype=torch.float32, device=batch.device)
+    for i in range(b):
+        split = torch.randint(0, target_len, (1,), device=batch.device).item()
+        mask_pos = response_indices[split:]
+        mask_indices[i, mask_pos] = True
+        x_i = target_len - split
+        p_mask[i, :] = x_i / target_len
+
+    noisy_batch = torch.where(mask_indices, MASK_TOKEN_ID, batch)
+    return noisy_batch, mask_indices, p_mask
+
+
+def summarize_bgpo_cj_mask_batch(mask_indices, attention_mask, prompt_len, p_mask, max_samples=4):
+    """Summarize AR-prefix masks for logging; verify suffix is contiguous."""
+    batch_size = mask_indices.shape[0]
+    samples = []
+    all_suffix_ok = True
+    for i in range(min(batch_size, max_samples)):
+        resp_valid = attention_mask[i].bool().clone()
+        resp_valid[:prompt_len] = False
+        idx = torch.where(resp_valid)[0]
+        target_len = int(idx.numel())
+        if target_len == 0:
+            samples.append({"target_len": 0, "split": 0, "masked": 0, "p_mask": 0.0, "suffix_contiguous": True})
+            continue
+        m = mask_indices[i, idx]
+        masked = int(m.sum().item())
+        if masked == 0:
+            samples.append(
+                {"target_len": target_len, "split": target_len, "masked": 0, "p_mask": 0.0, "suffix_contiguous": True}
+            )
+            continue
+        split = int((~m).sum().item())
+        suffix_ok = bool((~m[:split]).all() and m[split:].all())
+        all_suffix_ok = all_suffix_ok and suffix_ok
+        samples.append(
+            {
+                "target_len": target_len,
+                "split": split,
+                "masked": masked,
+                "p_mask": float(p_mask[i, idx[0]].item()),
+                "suffix_contiguous": suffix_ok,
+            }
+        )
+    return {"samples": samples, "all_suffix_contiguous": all_suffix_ok, "batch_size": batch_size}
+
+
 def _forward_process_ebpo(batch, attention_mask, prompt_len, block_length=32, t=None, eps=1e-3, MASK_TOKEN_ID=126336):
     """
     Forward process for EBPO.

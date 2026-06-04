@@ -1,10 +1,10 @@
 #!/bin/bash
-# BGPO direct validity test: train on EvalPlus HumanEval+MBPP+ (overfit-style sanity check).
-# max_response_length=512 (aligned with d3LLM evalplus).
+# BGPO / bgpo-cj on EvalPlus HumanEval+MBPP (direct overfit sanity).
+# bgpo-cj: only forward_process uses AR-prefix suffix mask; actor/rollout/eval same as BGPO.
 #
 # Usage:
-#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke
-#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke --engine hf
+#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke --algorithm bgpo-cj --engine sglang
+#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke --algorithm bgpo --engine sglang
 #   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --engine sglang
 set -euo pipefail
 set -x
@@ -45,16 +45,24 @@ export PATH="$(dirname "${PYTHON}"):${PATH}"
 
 smoke_test=0
 model_path=""
+algorithm=bgpo
 engine=sglang
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --model_path) model_path="$2"; shift 2 ;;
     --engine) engine="$2"; shift 2 ;;
+    --algorithm) algorithm="$2"; shift 2 ;;
     --smoke) smoke_test=1; shift ;;
     *) echo "[WARN] Unknown arg: $1"; shift ;;
   esac
 done
+
+valid_algorithms=(bgpo bgpo-cj)
+if [[ ! " ${valid_algorithms[*]} " =~ " ${algorithm} " ]]; then
+  echo "[ERROR] Invalid algorithm '${algorithm}'. Supported: ${valid_algorithms[*]}"
+  exit 1
+fi
 
 valid_engines=(hf sglang)
 if [[ ! " ${valid_engines[*]} " =~ " ${engine} " ]]; then
@@ -63,7 +71,6 @@ if [[ ! " ${valid_engines[*]} " =~ " ${engine} " ]]; then
 fi
 
 model=dream
-algorithm=bgpo
 model_path=${model_path:-models/finetune_d3LLM}
 task=code
 baseline="${model}-${task}-d3llm-${algorithm}-${engine}-evalplus-direct"
@@ -139,21 +146,14 @@ if [ "${smoke_test}" -eq 1 ]; then
   test_freq=1
   val_before_train=True
   total_epoch=1
-  trainer_logger='["console","wandb"]'
+  trainer_logger='["console"]'
   enable_gradient_checkpointing=False
   smoke_total_training_steps=1
+  log_val_generations=8
+  export WANDB_MODE=offline
   train_temperature=0.4
   val_temperature=0.0
   val_do_sample=False
-  if [ "$engine" = "sglang" ]; then
-    sglang_mem_fraction_static=0.32
-    sglang_gpu_memory_utilization=0.32
-    sglang_attention_backend=torch_native
-    sglang_disable_cuda_graph=True
-    actor_param_offload=True
-    actor_optimizer_offload=True
-    enable_activation_offload=True
-  fi
 else
   train_files="${EVALPLUS_TRAIN_FILES}"
   val_files="${HE_EVALPLUS}"
@@ -173,16 +173,19 @@ else
   train_temperature=0.4
   val_temperature=0.0
   val_do_sample=False
-  if [ "$engine" = "sglang" ]; then
-    sglang_mem_fraction_static=0.32
-    sglang_gpu_memory_utilization=0.32
-    sglang_attention_backend=torch_native
-    sglang_disable_cuda_graph=True
-    actor_param_offload=True
-    actor_optimizer_offload=True
-    enable_activation_offload=True
-  fi
 fi
+
+if [ "$engine" = "sglang" ]; then
+  sglang_mem_fraction_static=0.32
+  sglang_gpu_memory_utilization=0.32
+  sglang_attention_backend=torch_native
+  sglang_disable_cuda_graph=True
+  actor_param_offload=True
+  actor_optimizer_offload=True
+  enable_activation_offload=True
+fi
+
+log_val_generations=${log_val_generations:-0}
 
 if [ "$engine" = "sglang" ]; then
   unset PYTORCH_CUDA_ALLOC_CONF
@@ -210,7 +213,7 @@ val_top_p="${val_top_p:-1.0}"
 val_do_sample="${val_do_sample:-False}"
 
 enable_cfl=True
-cfl_coef=0.1
+cfl_coef=0.01
 cfl_temperature=0.5
 cfl_gate_positive_adv_only=False
 if [ "${smoke_test}" -eq 1 ]; then
@@ -232,6 +235,9 @@ fi
 
 ensure_evalplus_parquets
 
+if [ "${algorithm}" = "bgpo-cj" ]; then
+  echo "[INFO] bgpo-cj: AR-prefix suffix mask in forward_process (same actor/ELBO as BGPO)"
+fi
 echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node} train_temperature=${train_temperature}"
 echo "[INFO] Direct EvalPlus train: ${HE_EVALPLUS} + ${MBPP_EVALPLUS} (542 samples)"
 echo "[INFO] max_response_length=${max_response_length} (train+val, aligned with d3LLM evalplus)"
@@ -258,8 +264,8 @@ val_generations_dir="${log_dir}/val_generations"
 mkdir -p "${DREAM_ROLLOUT_LOG_DIR}" "${val_generations_dir}"
 echo "[INFO] Rollout debug: DREAM_ROLLOUT_VERBOSE=${DREAM_ROLLOUT_VERBOSE} log_dir=${DREAM_ROLLOUT_LOG_DIR}"
 if [ "${smoke_test}" -eq 1 ]; then
-  echo "[INFO] Smoke: val_before_train=True test_freq=1 steps=1"
-  echo "[INFO] Val dumps: ${val_generations_dir}/0.jsonl (pre-train) -> ${val_generations_dir}/1.jsonl (post step1)"
+  echo "[INFO] Smoke: val_before_train=${val_before_train} test_freq=${test_freq} steps=${smoke_total_training_steps:-epoch}"
+  echo "[INFO] Val dumps: ${val_generations_dir}/1.jsonl (post step1, no pre-train val)"
 fi
 echo "[INFO] WANDB_MODE=${WANDB_MODE} project=${WANDB_PROJECT} WANDB_DIR=${WANDB_DIR:-${log_dir}/wandb}"
 
@@ -279,7 +285,7 @@ fi
 
 export WANDB_DIR="${log_dir}/wandb"
 mkdir -p "${WANDB_DIR}"
-if [[ "${trainer_logger}" == *wandb* ]]; then
+if [[ "${trainer_logger}" == *wandb* && "${WANDB_MODE:-online}" != "offline" ]]; then
   export WANDB_MODE=online
 fi
 
@@ -380,6 +386,7 @@ echo "[INFO] PYTHON=${PYTHON}"
   trainer.save_freq=${save_freq} \
   trainer.test_freq=${test_freq} \
   trainer.total_epochs=${total_epoch} \
+  trainer.log_val_generations=${log_val_generations} \
   +trainer.validation_data_dir="${val_generations_dir}" \
   ${smoke_total_training_steps:+trainer.total_training_steps=${smoke_total_training_steps}} \
   custom_reward_function.path="verl/utils/reward_score/__init__.py" \

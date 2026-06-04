@@ -619,7 +619,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.llada_dp_actor_coupled_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'cj-grpo':
                 from verl.workers.actor.llada_dp_actor_cj_grpo import DLLMDataParallelPPOActor
-            elif self.config.algorithm.name == 'bgpo':
+            elif self.config.algorithm.name in ('bgpo', 'bgpo-cj'):
                 from verl.workers.actor.llada_dp_actor_bgpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'd1':
                 from verl.workers.actor.llada_dp_actor_d1 import DLLMDataParallelPPOActor
@@ -633,7 +633,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 raise NotImplementedError
 
         elif self.config.model.name == 'llada2':
-            if self.config.algorithm.name == 'bgpo':
+            if self.config.algorithm.name in ('bgpo', 'bgpo-cj'):
                 from verl.workers.actor.llada2_dp_actor_bgpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'ebpo':
                 from verl.workers.actor.llada2_dp_actor_ebpo import DLLMDataParallelPPOActor
@@ -647,7 +647,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.dream_dp_actor_coupled_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'cj-grpo':
                 from verl.workers.actor.dream_dp_actor_cj_grpo import DLLMDataParallelPPOActor
-            elif self.config.algorithm.name == 'bgpo':
+            elif self.config.algorithm.name in ('bgpo', 'bgpo-cj'):
                 from verl.workers.actor.dream_dp_actor_bgpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'd1':
                 from verl.workers.actor.dream_dp_actor_d1 import DLLMDataParallelPPOActor
@@ -661,7 +661,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 raise NotImplementedError
 
         elif self.config.model.name == 'sdar':
-            if self.config.algorithm.name == 'bgpo':
+            if self.config.algorithm.name in ('bgpo', 'bgpo-cj'):
                 from verl.workers.actor.sdar_dp_actor_bgpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'ebpo':
                 from verl.workers.actor.sdar_dp_actor_ebpo import DLLMDataParallelPPOActor
@@ -874,7 +874,7 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
         MASK_TOKEN_ID = self.actor_module_fsdp.config.mask_token_id
 
         # select _forward_process according to algorithm
-        if self.config.algorithm.name in ["d1", "bgpo", "ebpo", "coupled-grpo", "vrpo"]:
+        if self.config.algorithm.name in ["d1", "bgpo", "bgpo-cj", "ebpo", "coupled-grpo", "vrpo"]:
             if self.config.algorithm.name == "d1":
                 assert n_l == mc_num == 1, "d1 method requires n_l == mc_num == 1"
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_d1 as _forward_process
@@ -883,6 +883,8 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_coupled_grpo as _forward_process
             elif self.config.algorithm.name == "bgpo":
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_bgpo as _forward_process
+            elif self.config.algorithm.name == "bgpo-cj":
+                from verl.trainer.ppo.dllm_core_algos import _forward_process_bgpo_cj as _forward_process
             elif self.config.algorithm.name == "ebpo":
                 from verl.trainer.ppo.dllm_core_algos import _forward_process_ebpo as _forward_process
             elif self.config.algorithm.name == "vrpo":
@@ -930,6 +932,28 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 perturbed_seq = torch.stack(all_perturbed_seqs, dim=0)  # (batch_size, mc_num, seq_len)
                 mask_indices = torch.stack(all_mask_indices, dim=0)  # (batch_size, mc_num, seq_len)
                 p_mask = torch.stack(all_p_mask, dim=0)  # (batch_size, mc_num, seq_len)
+
+            if self.config.algorithm.name == "bgpo-cj" and not getattr(self, "_bgpo_cj_mask_logged", False):
+                from verl.trainer.ppo.dllm_core_algos import summarize_bgpo_cj_mask_batch
+
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                stats = summarize_bgpo_cj_mask_batch(
+                    mask_indices=mask_indices[:, 0, :],
+                    attention_mask=attention_mask,
+                    prompt_len=prompt_len,
+                    p_mask=p_mask[:, 0, :],
+                )
+                print(
+                    f"[bgpo-cj][RANK{rank}] AR-prefix mask forward_process active "
+                    f"(prefix unmask / suffix mask, BGPO ELBO+p_mask). stats={stats}",
+                    flush=True,
+                )
+                logger.info(
+                    "[bgpo-cj][RANK%s] AR-prefix mask forward_process active stats=%s",
+                    rank,
+                    stats,
+                )
+                self._bgpo_cj_mask_logged = True
               
         elif self.config.algorithm.name == "spg":
             from verl.trainer.ppo.dllm_core_algos import _forward_process_spg as _forward_process
