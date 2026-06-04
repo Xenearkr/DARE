@@ -221,6 +221,15 @@ class SGLangDreamRollout(SGLangRollout):
         self._decoded_token_threshold = config.get("d3llm_decoded_token_threshold", 0.95)
         self._per_sample_seed = bool(config.get("per_sample_seed", True))
         self._base_seed = int(config.get("base_seed", 42))
+        # Parent sets self.tokenizer only after _init_inference_engine; keep ref for algo_cfg.
+        self._dream_tokenizer = tokenizer
+
+        if self._dllm_algorithm == "FullAttnMultiBlock":
+            from verl.workers.rollout.sglang_rollout.sglang_dream_dllm_patch import (
+                apply_dream_full_attn_multi_block_patch,
+            )
+
+            apply_dream_full_attn_multi_block_patch()
 
         logger.info(
             "SGLangDreamRollout: algorithm=%s mask=%s block_length=%s threshold=%s",
@@ -314,6 +323,8 @@ class SGLangDreamRollout(SGLangRollout):
                 "cache_delay_iter": int(self.config.get("d3llm_cache_delay_iter", 32)),
                 "refresh_interval": int(self.config.get("d3llm_refresh_interval", 10000)),
                 "early_stop": bool(self.config.get("d3llm_early_stop", True)),
+                # Mask tokenizer-OOD ids only during T>0 sampling (not val argmax).
+                "decodable_vocab_size": len(self._dream_tokenizer),
             }
             with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
                 yaml.safe_dump(algo_cfg, f)

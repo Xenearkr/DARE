@@ -371,13 +371,18 @@ class DLLMDataParallelPPOActor(DataParallelPPOActor):
                             call_fn_name="update_policy",
                         )
                         print(f"\nloss_per_sample: {loss_per_example[0, 0, 0]}")
+
+                        # Policy loss only on masked forward-process positions (BGPO ELBO support).
+                        pg_loss_mask = mask_indices[:, i, -response_length:].float() * response_mask
+                        if pg_loss_mask.sum().item() == 0:
+                            pg_loss_mask = response_mask
                         
                         # Compute policy loss
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss_bgpo(
                             old_l_theta=old_loss_per_sample[:, i, :],  # (bsz, response_length)
                             l_theta=loss_per_example[:, 0, :],  # (bsz, response_length)
                             advantages=advantages,
-                            response_mask=response_mask,
+                            response_mask=pg_loss_mask,
                             cliprange=clip_ratio,
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,

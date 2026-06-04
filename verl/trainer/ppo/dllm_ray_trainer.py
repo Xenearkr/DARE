@@ -227,7 +227,18 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
 
                                 del gen_baseline_batch, gen_baseline_output
 
-                        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                        batch_len = len(batch.batch)
+                        if "index" in batch.non_tensor_batch:
+                            grpo_uids = np.asarray(batch.non_tensor_batch["index"], dtype=object).astype(str)
+                        else:
+                            extra = batch.non_tensor_batch.get("extra_info")
+                            grpo_uids = np.empty(batch_len, dtype=object)
+                            for _i in range(batch_len):
+                                ei = extra[_i] if extra is not None else None
+                                if hasattr(ei, "item"):
+                                    ei = ei.item()
+                                grpo_uids[_i] = str((ei or {}).get("index", _i))
+                        batch.non_tensor_batch["uid"] = grpo_uids
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)
