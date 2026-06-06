@@ -647,7 +647,9 @@ class DLLMActorRolloutRefWorker(ActorRolloutRefWorker):
                 from verl.workers.actor.dream_dp_actor_coupled_grpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'cj-grpo':
                 from verl.workers.actor.dream_dp_actor_cj_grpo import DLLMDataParallelPPOActor
-            elif self.config.algorithm.name in ('bgpo', 'bgpo-cj'):
+            elif self.config.algorithm.name in ('bgpo', 'bgpo-cj', 'ebpo'):
+                # Dream EBPO reuses BGPO actor: _forward_process_ebpo restricts masks to one block;
+                # token-level ELBO + compute_policy_loss_bgpo already match EBPO for full-attn Dream.
                 from verl.workers.actor.dream_dp_actor_bgpo import DLLMDataParallelPPOActor
             elif self.config.algorithm.name == 'd1':
                 from verl.workers.actor.dream_dp_actor_d1 import DLLMDataParallelPPOActor

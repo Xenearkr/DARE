@@ -1,10 +1,13 @@
 #!/bin/bash
-# BGPO / bgpo-cj on EvalPlus HumanEval+MBPP (direct overfit sanity).
-# bgpo-cj: only forward_process uses AR-prefix suffix mask; actor/rollout/eval same as BGPO.
+# BGPO / bgpo-cj / EBPO on EvalPlus HumanEval+MBPP (direct overfit sanity).
+# bgpo-cj: forward_process uses AR-prefix suffix mask; actor/rollout/eval same as BGPO.
+# ebpo: forward_process masks inside one random block (block_length); actor/rollout/eval same as BGPO.
 #
 # Usage:
 #   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke --algorithm bgpo-cj --engine sglang
 #   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke --algorithm bgpo --engine sglang
+#   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --smoke --algorithm ebpo --engine sglang
+#   bash recipe/dream/run_ebpo_dream_coder_evalplus_direct.sh --smoke --engine sglang
 #   bash recipe/dream/run_bgpo_dream_coder_evalplus_direct.sh --engine sglang
 set -euo pipefail
 set -x
@@ -60,7 +63,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-valid_algorithms=(bgpo bgpo-cj)
+valid_algorithms=(bgpo bgpo-cj ebpo)
 if [[ ! " ${valid_algorithms[*]} " =~ " ${algorithm} " ]]; then
   echo "[ERROR] Invalid algorithm '${algorithm}'. Supported: ${valid_algorithms[*]}"
   exit 1
@@ -256,6 +259,8 @@ ensure_evalplus_parquets
 
 if [ "${algorithm}" = "bgpo-cj" ]; then
   echo "[INFO] bgpo-cj: AR-prefix suffix mask in forward_process (same actor/ELBO as BGPO)"
+elif [ "${algorithm}" = "ebpo" ]; then
+  echo "[INFO] ebpo: block-level random mask in forward_process (block_length=${block_length}, same Dream actor as BGPO)"
 fi
 echo "[INFO] engine=${engine} smoke=${smoke_test} GPUs=${n_gpus_per_node} train_temperature=${train_temperature}"
 echo "[INFO] Direct EvalPlus train: ${HE_EVALPLUS} + ${MBPP_EVALPLUS} (542 samples)"

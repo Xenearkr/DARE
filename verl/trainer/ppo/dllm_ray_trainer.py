@@ -281,7 +281,7 @@ class DLLMRayPPOTrainer(RayPPOTrainer):
                                 old_log_prob.batch.pop("old_entropys")
                                 batch = batch.union(old_log_prob)
 
-                                if self.config.algorithm.name in ("bgpo", "bgpo-cj") and "rollout_log_probs" in batch.batch.keys():
+                                if self.config.algorithm.name in ("bgpo", "bgpo-cj", "ebpo") and "rollout_log_probs" in batch.batch.keys():
                                     # TODO: we may want to add diff of probs too.
                                     rollout_old_log_probs = batch.batch["rollout_log_probs"]
                                     actor_old_log_probs = batch.batch["old_log_probs"]
