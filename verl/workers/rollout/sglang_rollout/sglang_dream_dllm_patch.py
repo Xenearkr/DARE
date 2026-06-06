@@ -47,6 +47,12 @@ def apply_dream_full_attn_multi_block_patch() -> None:
             "FullAttnMultiBlock must not clip logits on greedy/val argmax; update "
             "third_party/sglang full_attn_multi_block.py (_mask_undecodable_logits)."
         )
+    fam_source = inspect.getsource(fam_mod)
+    if "handle_early_stop" not in fam_source:
+        raise RuntimeError(
+            "FullAttnMultiBlock must include d3LLM handle_early_stop; update "
+            "third_party/sglang full_attn_multi_block.py."
+        )
 
     _PATCH_APPLIED = True
     logger.info("Dream FullAttnMultiBlock temperature sampling is active")

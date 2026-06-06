@@ -44,6 +44,7 @@ export CONDA_PREFIX
 export PATH="$(dirname "${PYTHON}"):${PATH}"
 
 smoke_test=0
+val_only=0
 model_path=""
 algorithm=bgpo
 engine=sglang
@@ -54,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --engine) engine="$2"; shift 2 ;;
     --algorithm) algorithm="$2"; shift 2 ;;
     --smoke) smoke_test=1; shift ;;
+    --val-only) val_only=1; shift ;;
     *) echo "[WARN] Unknown arg: $1"; shift ;;
   esac
 done
@@ -173,6 +175,23 @@ else
   train_temperature=0.4
   val_temperature=0.0
   val_do_sample=False
+fi
+
+if [ "${val_only}" -eq 1 ]; then
+  val_files="${HE_EVALPLUS}"
+  train_files="${HE_EVALPLUS}"
+  batch_size=4
+  n_rollout=1
+  mc_num=4
+  n_l=4
+  val_batch_size=32
+  val_before_train=True
+  total_epoch=1
+  trainer_logger='["console"]'
+  enable_gradient_checkpointing=False
+  export WANDB_MODE=offline
+  log_val_generations=164
+  echo "[INFO] Val-only: 164 HumanEval EvalPlus, no training"
 fi
 
 if [ "$engine" = "sglang" ]; then
@@ -379,7 +398,7 @@ echo "[INFO] PYTHON=${PYTHON}"
   trainer.project_name=${WANDB_PROJECT} \
   trainer.experiment_name=${exp_name} \
   trainer.val_before_train=${val_before_train} \
-  +trainer.val_only=False \
+  +trainer.val_only=$([ "${val_only}" -eq 1 ] && echo True || echo False) \
   trainer.n_gpus_per_node=${n_gpus_per_node} \
   trainer.nnodes=1 \
   trainer.default_local_dir=${ckpt_dir} \

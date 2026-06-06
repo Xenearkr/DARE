@@ -107,7 +107,7 @@ def _count_decoded_gen_tokens(
     mask_token_id: int,
     eos_token_ids: Set[int],
 ) -> int:
-    """Count non-pad/non-mask tokens before first EOS (evalplus-style effective length)."""
+    """Legacy token-id counter (kept for non-EvalPlus paths)."""
     count = 0
     for tok in token_ids:
         t = int(tok)
@@ -117,6 +117,15 @@ def _count_decoded_gen_tokens(
             continue
         count += 1
     return count
+
+
+def _count_gen_tokens_like_evalplus_dllm(tokenizer, response_text: str) -> int:
+    """Match d3LLM ``evalplus/provider/dllm.py`` TPF token counting."""
+    from verl.utils.reward_score.evalplus_integration import (
+        count_gen_tokens_like_evalplus_dllm,
+    )
+
+    return count_gen_tokens_like_evalplus_dllm(tokenizer, response_text)
 
 
 def _truncate_ids_like_sglang_stop(
@@ -232,11 +241,13 @@ class SGLangDreamRollout(SGLangRollout):
             apply_dream_full_attn_multi_block_patch()
 
         logger.info(
-            "SGLangDreamRollout: algorithm=%s mask=%s block_length=%s threshold=%s",
+            "SGLangDreamRollout: algorithm=%s mask=%s block_length=%s threshold=%s "
+            "early_stop_default=%s (train+val share per_sample rollout: early_stop, evalplus TPF)",
             self._dllm_algorithm,
             self._mask_token_id,
             self._block_length,
             self._threshold,
+            bool(config.get("d3llm_early_stop", True)),
         )
 
         super().__init__(
@@ -323,6 +334,11 @@ class SGLangDreamRollout(SGLangRollout):
                 "cache_delay_iter": int(self.config.get("d3llm_cache_delay_iter", 32)),
                 "refresh_interval": int(self.config.get("d3llm_refresh_interval", 10000)),
                 "early_stop": bool(self.config.get("d3llm_early_stop", True)),
+                "eos_token_id": int(
+                    self._dream_tokenizer.eos_token_id
+                    if self._dream_tokenizer.eos_token_id is not None
+                    else self.pad_token_id
+                ),
                 # Mask tokenizer-OOD ids only during T>0 sampling (not val argmax).
                 "decodable_vocab_size": len(self._dream_tokenizer),
             }
@@ -577,13 +593,6 @@ class SGLangDreamRollout(SGLangRollout):
         )
         attention_mask_out = torch.cat((attention_mask_repeat, response_attention_mask), dim=-1)
 
-        eos_ids = set(stop_ids)
-        if eos_token_id is not None:
-            if isinstance(eos_token_id, (list, tuple)):
-                eos_ids.update(int(x) for x in eos_token_id)
-            else:
-                eos_ids.add(int(eos_token_id))
-
         rollout_nfe = np.array(
             [
                 normalize_rollout_nfe(
@@ -595,11 +604,12 @@ class SGLangDreamRollout(SGLangRollout):
         )
         rollout_gen_tokens = np.array(
             [
-                _count_decoded_gen_tokens(
-                    response[i].tolist(),
-                    self.pad_token_id,
-                    self._mask_token_id,
-                    eos_ids,
+                _count_gen_tokens_like_evalplus_dllm(
+                    self.tokenizer,
+                    self.tokenizer.decode(
+                        response[i].tolist(),
+                        skip_special_tokens=True,
+                    ),
                 )
                 for i in range(response.size(0))
             ],

@@ -312,7 +312,7 @@ def humaneval_check_correctness(test: str, code: str, entry_point: str = None, t
     except SyntaxError:
         num_test_cases = test.count("assert ")
     
-    # For HumanEval, we need to append a call to the check function since the test code only defines check() but doesn't call it
+    # For HumanEval, append a call to check() (test defines check but does not call it).
     if entry_point:
         test += f"\n\n# Execute the tests\ncheck({entry_point})"
     else:
@@ -320,12 +320,6 @@ def humaneval_check_correctness(test: str, code: str, entry_point: str = None, t
         if func_match:
             func_name = func_match.group(1)
             test += f"\n\n# Execute the tests\ncheck({func_name})"
-    
-    # For HumanEval, we need to append a call to the check function since the test code only defines check() but doesn't call it
-    func_match = re.search(r"def\s+(\w+)\s*\(", code)  # extract function name from the code
-    if func_match:
-        func_name = func_match.group(1)
-        test += f"\n\n# Execute the tests\ncheck({func_name})"
         
     succ, output = humanevalplus_run_test(code, test, timeout_per_test * num_test_cases)
     
@@ -460,7 +454,21 @@ class RewardCodeFn:
             )
 
         if dataset_name == "mbpp":
-            model_code = extract_code_from_model_mbpp(model_response)
+            entry_point = task_info.get("entry_point")
+            if entry_point:
+                from .evalplus_integration import extract_evalplus_code_for_scoring
+
+                model_code = extract_evalplus_code_for_scoring(model_response, entry_point)
+            else:
+                model_code = extract_code_from_model_mbpp(model_response)
+        elif dataset_name == "humaneval":
+            entry_point = task_info.get("entry_point")
+            if entry_point:
+                from .evalplus_integration import extract_evalplus_code_for_scoring
+
+                model_code = extract_evalplus_code_for_scoring(model_response, entry_point)
+            else:
+                model_code = extract_code_from_model(model_response)
         else:
             model_code = extract_code_from_model(model_response)
         # print("extract code:", model_code)
@@ -491,7 +499,10 @@ class RewardCodeFn:
             is_correct, test_details = mbpp_check_correctness(tests, model_code)
             # print("mbpp test_details:", test_details)
         elif dataset_name == "humaneval":
-            is_correct, test_details = humaneval_check_correctness(tests, model_code)
+            entry_point = task_info.get("entry_point")
+            is_correct, test_details = humaneval_check_correctness(
+                tests, model_code, entry_point=entry_point
+            )
             # # print("humaneval test_details:", test_details)
             
             # # Use OpenCompass HumanEval evaluator
